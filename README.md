@@ -121,6 +121,66 @@ bash launcher.sh restore /path/to/snapshot.db
 Stop ingest, verify the backup, replace the live DB, and keep the previous DB as
 a rollback file.
 
+## Migration Archives
+
+`migration.py` exports and imports the runtime state needed to move an Ubuntu
+22.04 deployment to another checkout of this server. It does not package source
+code or `.venv`; clone/update the repo first, then import the archive. The
+archive contains secrets from env files, so `export` writes it with mode `0600`
+on POSIX systems and you should store/transfer it as a secret.
+
+Create an archive:
+
+```bash
+python3 migration.py export /path/to/hnreader-migration.tar.gz
+```
+
+Inspect what an archive contains:
+
+```bash
+python3 migration.py inspect /path/to/hnreader-migration.tar.gz
+```
+
+Import on the target server:
+
+```bash
+python3 migration.py import /path/to/hnreader-migration.tar.gz --yes
+bash launcher.sh restart
+bash launcher.sh doctor
+```
+
+Import is a full replacement. It stops the hnreader systemd services when
+available (and aborts if a loaded unit cannot be stopped), removes the target
+checkout's managed env/data/log state, then copies the archived state in.
+Imported `.env*` and external AI config files are set to owner-only mode on
+POSIX systems. After that, `launcher.sh restart` regenerates
+`/etc/hnreader/server.env`, rewrites systemd units, fixes runtime directory
+ownership, and starts from the imported database. Keep the archive until
+`launcher.sh doctor` passes; import is destructive and does not create a local
+rollback copy of the replaced runtime directories.
+
+Archive coverage:
+
+- Included: `.env`, `.env.local`, `.env.*.local` from the project/server dirs.
+- Included: the directory containing `HNREADER_DB_PATH` (default `data/`),
+  including cloud-sync JSON output, alert outbox/cache files, and DB backups.
+- Included: `HNREADER_LOG_DIR` (default `logs/`).
+- Included when they are configured outside the DB directory:
+  `HNREADER_CLOUD_SYNC_OUTPUT_DIR`, `HNREADER_ALERT_OUTBOX_PATH`,
+  `HNREADER_AI_CONFIG_STATUS_CACHE_PATH`, and external files named by
+  `HNREADER_AI_CONFIG_FILE`.
+- Included only with `--include-service-env`: the generated service env file
+  (default `/etc/hnreader/server.env`). Normal migrations do not need this
+  because `launcher.sh restart` recreates it from `.env.local`.
+- Excluded: SQLite `-wal`/`-shm`/`-journal` sidecars. The live DB is copied with
+  SQLite's online backup API so `hnreader.db` in the archive is self-contained.
+- Excluded: transient `*.pid`, `*.lock`, and `supervisor.stop` files.
+
+If the deployment uses non-default absolute paths in `.env.local`
+(`HNREADER_DB_PATH`, `HNREADER_LOG_DIR`, or related paths), the import restores
+state to those paths from the archive. Make sure the target host should use the
+same paths before running `launcher.sh restart`.
+
 ```bash
 bash launcher.sh stop
 ```
