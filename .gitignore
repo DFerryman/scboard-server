@@ -49,6 +49,9 @@ secret.*
 .tmp-tests/
 tmp-tests2/
 
+# ===== Launcher-generated local PYTHONPATH bridge =====
+.launcher-pythonpath/
+
 # ===== Editor / IDE / OS =====
 .idea/
 .vscode/

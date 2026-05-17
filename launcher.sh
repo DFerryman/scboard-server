@@ -1086,36 +1086,34 @@ prompt_value() {
   local __var_name="$1"
   local prompt="$2"
   local default="${3:-}"
-  local value
   require_tty_for_prompt
   if [[ -n "$default" ]]; then
-    read -r -p "${prompt} [${default}]: " value
-    value="${value:-$default}"
+    read -r -p "${prompt} [${default}]: " "$__var_name"
+    if [[ -z "${!__var_name}" ]]; then
+      printf -v "$__var_name" '%s' "$default"
+    fi
   else
-    read -r -p "${prompt}: " value
+    read -r -p "${prompt}: " "$__var_name"
   fi
-  printf -v "$__var_name" '%s' "$value"
 }
 
 prompt_secret_value() {
   local __var_name="$1"
   local prompt="$2"
-  local value
   require_tty_for_prompt
-  read -r -s -p "${prompt}: " value
+  read -r -s -p "${prompt}: " "$__var_name"
   printf '\n'
-  printf -v "$__var_name" '%s' "$value"
 }
 
 prompt_required() {
   local __var_name="$1"
   local prompt="$2"
   local default="${3:-}"
-  local value
+  local required_value
   while true; do
-    prompt_value value "$prompt" "$default"
-    if [[ -n "$value" ]]; then
-      printf -v "$__var_name" '%s' "$value"
+    prompt_value required_value "$prompt" "$default"
+    if [[ -n "$required_value" ]]; then
+      printf -v "$__var_name" '%s' "$required_value"
       return
     fi
     echo "This value is required."
