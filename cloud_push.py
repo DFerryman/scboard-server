@@ -2,8 +2,8 @@
 
 Business publish (:func:`push_read_model`):
     1. ping          - connectivity + signature liveness check
-    2. writeBatch    - write stories in batches; the first batch also carries
-                       topics and digests
+    2. writeBatch    - write topics / digests / stories in byte-limited
+                       batches
     3. switchMeta    - atomically switch meta.currentVersion (the mini program
                        can read the new version from this point on)
 
@@ -43,6 +43,8 @@ Env vars (required, for CLI):
 Env vars (optional, for CLI):
     HNREADER_CLOUD_PUSH_BATCH_SIZE / HNREADER_CLOUD_BATCH_SIZE  stories per
                                 batch, default 50
+    HNREADER_CLOUD_PUSH_MAX_BODY_BYTES  max writeBatch request body size,
+                                default 80000
 """
 from __future__ import annotations
 
@@ -73,6 +75,10 @@ log = logging.getLogger(__name__)
 
 TS_TOLERANCE_MS = 60 * 1000
 DEFAULT_TIMEOUT_SECONDS = 120
+# CloudBase documents a 100KB limit for text cloud-function request bodies.
+# Keep headroom for JSON formatting and gateway accounting instead of riding
+# the exact edge.
+DEFAULT_WRITE_BATCH_MAX_BODY_BYTES = 80_000
 # Minimum wall-time budget required before starting a single HTTP call.
 # A push with a deadline_at must abort cleanly at a phase boundary rather
 # than start a call that has nowhere near enough time to complete.
@@ -405,13 +411,21 @@ def _request_target(parsed: urllib.parse.SplitResult) -> str:
     return path
 
 
+def _payload_json_bytes(payload: dict) -> bytes:
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _payload_size_bytes(payload: dict) -> int:
+    return len(_payload_json_bytes(payload))
+
+
 def _post(url: str, secret: str, payload: dict, *, timeout: int) -> dict:
     try:
         url, pinned_ip = _validate_cloud_push_url_with_pinned_ip(url)
     except CloudPushUrlError as exc:
         return {"ok": False, "error": str(exc)}
 
-    body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    body_bytes = _payload_json_bytes(payload)
     ts, nonce, sig = _sign(secret, body_bytes)
     parsed = urllib.parse.urlsplit(url)
     conn: Optional[_PinnedHTTPSConnection] = None
@@ -527,11 +541,189 @@ def _chunks(items: List[dict], size: int) -> Iterable[List[dict]]:
         yield items[i:i + size]
 
 
+def _write_batch_payload(
+    *,
+    current_version: int,
+    stories: Optional[List[dict]] = None,
+    topics: Optional[List[dict]] = None,
+    digests: Optional[List[dict]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "action": "writeBatch",
+        "syncVersion": current_version,
+        "stories": stories or [],
+    }
+    if topics is not None:
+        payload["topics"] = topics
+    if digests is not None:
+        payload["digests"] = digests
+    return payload
+
+
+def _doc_id_for_error(doc: dict) -> str:
+    doc_id = doc.get("_id") if isinstance(doc, dict) else None
+    return str(doc_id or "<missing _id>")
+
+
+def _chunk_write_batch_docs(
+    *,
+    current_version: int,
+    field: str,
+    docs: List[dict],
+    max_docs: int,
+    max_body_bytes: int,
+) -> List[Dict[str, Any]]:
+    payloads: List[Dict[str, Any]] = []
+    chunk: List[dict] = []
+
+    for doc in docs:
+        candidate = chunk + [doc]
+        candidate_payload = _write_batch_payload(
+            current_version=current_version,
+            **{field: candidate},
+        )
+        candidate_size = _payload_size_bytes(candidate_payload)
+
+        if candidate_size <= max_body_bytes and len(candidate) <= max_docs:
+            chunk = candidate
+            continue
+
+        if chunk:
+            payloads.append(
+                _write_batch_payload(
+                    current_version=current_version,
+                    **{field: chunk},
+                )
+            )
+            chunk = []
+
+        single_payload = _write_batch_payload(
+            current_version=current_version,
+            **{field: [doc]},
+        )
+        single_size = _payload_size_bytes(single_payload)
+        if single_size > max_body_bytes:
+            raise CloudPushError(
+                f"single {field} doc {_doc_id_for_error(doc)} makes a "
+                f"writeBatch payload of {single_size} bytes, exceeding "
+                f"HNREADER_CLOUD_PUSH_MAX_BODY_BYTES={max_body_bytes}; "
+                "reduce the cloud document size or move this payload through "
+                "cloud storage / a finer-grained cloud protocol"
+            )
+        chunk = [doc]
+
+    if chunk:
+        payloads.append(
+            _write_batch_payload(
+                current_version=current_version,
+                **{field: chunk},
+            )
+        )
+    return payloads
+
+
+def _write_batch_payloads(
+    *,
+    current_version: int,
+    stories: List[dict],
+    topics: List[dict],
+    digests: List[dict],
+    batch_size: int,
+    max_body_bytes: int,
+) -> List[Dict[str, Any]]:
+    if batch_size <= 0:
+        raise CloudPushError(f"batch_size must be >= 1 (got {batch_size})")
+    if max_body_bytes <= 0:
+        raise CloudPushError(
+            f"HNREADER_CLOUD_PUSH_MAX_BODY_BYTES must be >= 1 "
+            f"(got {max_body_bytes})"
+        )
+
+    payloads: List[Dict[str, Any]] = []
+    remaining_stories = list(stories)
+
+    # Preserve the original cloud protocol shape when it fits: the first
+    # writeBatch carries topics + digests and as many complete story docs as
+    # fit. This avoids truncation while staying compatible with the deployed
+    # pushSync implementation that already accepts the old first-batch layout.
+    first_story_chunk: List[dict] = []
+    first_payload = _write_batch_payload(
+        current_version=current_version,
+        stories=first_story_chunk,
+        topics=topics,
+        digests=digests,
+    )
+    if _payload_size_bytes(first_payload) <= max_body_bytes:
+        while remaining_stories and len(first_story_chunk) < batch_size:
+            candidate = first_story_chunk + [remaining_stories[0]]
+            candidate_payload = _write_batch_payload(
+                current_version=current_version,
+                stories=candidate,
+                topics=topics,
+                digests=digests,
+            )
+            if _payload_size_bytes(candidate_payload) > max_body_bytes:
+                break
+            first_story_chunk = candidate
+            remaining_stories.pop(0)
+
+        payloads.append(
+            _write_batch_payload(
+                current_version=current_version,
+                stories=first_story_chunk,
+                topics=topics,
+                digests=digests,
+            )
+        )
+    else:
+        # Rare fallback: if topics+digests alone exceed the request limit,
+        # split each collection without dropping fields. Single oversized docs
+        # fail locally with a clear error instead of being truncated.
+        for field, docs in (("topics", topics), ("digests", digests)):
+            payloads.extend(
+                _chunk_write_batch_docs(
+                    current_version=current_version,
+                    field=field,
+                    docs=docs,
+                    max_docs=batch_size,
+                    max_body_bytes=max_body_bytes,
+                )
+            )
+
+    if remaining_stories:
+        payloads.extend(
+            _chunk_write_batch_docs(
+                current_version=current_version,
+                field="stories",
+                docs=remaining_stories,
+                max_docs=batch_size,
+                max_body_bytes=max_body_bytes,
+            )
+        )
+
+    if not payloads:
+        empty_payload = {
+            "action": "writeBatch",
+            "syncVersion": current_version,
+            "stories": [],
+        }
+        empty_size = _payload_size_bytes(empty_payload)
+        if empty_size > max_body_bytes:
+            raise CloudPushError(
+                f"empty writeBatch payload is {empty_size} bytes, exceeding "
+                f"HNREADER_CLOUD_PUSH_MAX_BODY_BYTES={max_body_bytes}"
+            )
+        payloads.append(empty_payload)
+
+    return payloads
+
+
 def push_read_model(
     *,
     url: str,
     secret: str,
     batch_size: int = 50,
+    max_body_bytes: int = DEFAULT_WRITE_BATCH_MAX_BODY_BYTES,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     source_dir: Optional[Path] = None,
     deadline_at: Optional[float] = None,
@@ -582,6 +774,14 @@ def push_read_model(
     _validate_versioned_docs("stories", stories, current_version)
     _validate_versioned_docs("topics", topics, current_version)
     _validate_versioned_docs("digests", digests, current_version)
+    write_batch_payloads = _write_batch_payloads(
+        current_version=current_version,
+        stories=stories,
+        topics=topics,
+        digests=digests,
+        batch_size=batch_size,
+        max_body_bytes=max_body_bytes,
+    )
 
     # The manifest covers business collections only. Stale cleanup of the
     # dashboard collections is delegated to cleanupOld (keepVersions); it no
@@ -610,21 +810,9 @@ def push_read_model(
 
     # ---------- 2. writeBatch ----------
     sent = {"stories": 0, "topics": 0, "digests": 0}
-    first = True
-    # Guarantee at least one iteration so topics/digests are still sent
-    # (even when stories is empty)
-    chunks = list(_chunks(stories, batch_size)) or [[]]
-    for chunk in chunks:
+    for payload in write_batch_payloads:
         _abort_if_insufficient(deadline_at, phase="writeBatch")
-        payload: Dict[str, Any] = {
-            "action": "writeBatch",
-            "syncVersion": current_version,
-            "stories": chunk,
-        }
-        if first:
-            payload["topics"] = topics
-            payload["digests"] = digests
-            first = False
+        payload_bytes = _payload_size_bytes(payload)
         r = _post(
             url, secret, payload,
             timeout=_next_call_timeout(deadline_at, timeout_seconds),
@@ -634,8 +822,9 @@ def push_read_model(
         for k in sent:
             sent[k] += int(r.get(k, 0) or 0)
         log.info(
-            "[push] writeBatch chunk: stories+%s topics+%s digests+%s",
+            "[push] writeBatch chunk: stories+%s topics+%s digests+%s bytes=%s/%s",
             r.get("stories", 0), r.get("topics", 0), r.get("digests", 0),
+            payload_bytes, max_body_bytes,
         )
 
     # ---------- 3. switchMeta ----------
@@ -807,9 +996,23 @@ def main() -> None:
     except ValueError:
         _print_console(f"[push] invalid batch size: {batch_raw}", file=sys.stderr)
         sys.exit(2)
+    max_body_raw = os.environ.get("HNREADER_CLOUD_PUSH_MAX_BODY_BYTES") \
+        or str(DEFAULT_WRITE_BATCH_MAX_BODY_BYTES)
+    try:
+        max_body_bytes = int(max_body_raw)
+    except ValueError:
+        _print_console(
+            f"[push] invalid max body bytes: {max_body_raw}", file=sys.stderr
+        )
+        sys.exit(2)
 
     try:
-        stats = push_read_model(url=url, secret=secret, batch_size=batch_size)
+        stats = push_read_model(
+            url=url,
+            secret=secret,
+            batch_size=batch_size,
+            max_body_bytes=max_body_bytes,
+        )
     except CloudPushError as exc:
         _print_console(f"[push] FAILED: {exc}", file=sys.stderr)
         sys.exit(1)

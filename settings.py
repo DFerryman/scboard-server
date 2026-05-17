@@ -1046,6 +1046,16 @@ CLOUD_PUSH_BATCH_SIZE = _require_int_range(
     min_value=1,
     max_value=1000,
 )
+CLOUD_PUSH_MAX_BODY_BYTES = _require_int_range(
+    "HNREADER_CLOUD_PUSH_MAX_BODY_BYTES",
+    _env_int(
+        "HNREADER_CLOUD_PUSH_MAX_BODY_BYTES",
+        80000,
+        fallback="HACKERMINI_CLOUD_PUSH_MAX_BODY_BYTES",
+    ),
+    min_value=1024,
+    max_value=6 * 1024 * 1024,
+)
 CLOUD_SYNC_TIMEOUT_SECONDS = _require_int_range(
     "HNREADER_CLOUD_SYNC_TIMEOUT_SECONDS",
     _env_int(

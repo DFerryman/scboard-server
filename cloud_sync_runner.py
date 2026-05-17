@@ -225,6 +225,7 @@ def run_business_once(
             url=settings.CLOUD_PUSH_URL,
             secret=settings.CLOUD_PUSH_SECRET,
             batch_size=settings.CLOUD_PUSH_BATCH_SIZE,
+            max_body_bytes=settings.CLOUD_PUSH_MAX_BODY_BYTES,
             timeout_seconds=effective_timeout,
             deadline_at=deadline_at,
         )

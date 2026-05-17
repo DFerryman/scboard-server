@@ -8171,6 +8171,92 @@ class CloudPushDeadlineBehavior(unittest.TestCase):
 
         self.assertIn("required JSONL file missing", str(ctx.exception))
 
+    def test_writebatch_splits_by_actual_payload_bytes(self):
+        from . import cloud_push
+
+        src = self._write_read_model()
+        stories = [
+            {
+                "_id": f"1:{i}",
+                "id": i,
+                "syncVersion": 1,
+                "titleZh": f"story {i}",
+                "aiSummary": "x" * 30000,
+            }
+            for i in range(1, 6)
+        ]
+        (src / "stories.jsonl").write_text(
+            "".join(json.dumps(s, ensure_ascii=False) + "\n" for s in stories),
+            encoding="utf-8",
+        )
+
+        payloads = []
+
+        def fake_post(_url, _secret, payload, *, timeout):
+            payloads.append(payload)
+            return {
+                "ok": True,
+                "stories": len(payload.get("stories") or []),
+                "topics": len(payload.get("topics") or []),
+                "digests": len(payload.get("digests") or []),
+            }
+
+        with patch.object(cloud_push, "_post", side_effect=fake_post):
+            stats = cloud_push.push_read_model(
+                url="https://8.8.8.8/pushSync",
+                secret=VALID_CLOUD_PUSH_SECRET,
+                source_dir=src,
+                batch_size=50,
+                max_body_bytes=50000,
+            )
+
+        write_batches = [p for p in payloads if p.get("action") == "writeBatch"]
+        self.assertGreater(len(write_batches), 1)
+        self.assertEqual(stats["stories"], 5)
+        sent_ids = [
+            story["_id"]
+            for payload in write_batches
+            for story in (payload.get("stories") or [])
+        ]
+        self.assertEqual(sent_ids, [s["_id"] for s in stories])
+        self.assertTrue(
+            all(
+                story.get("aiSummary") == "x" * 30000
+                for payload in write_batches
+                for story in (payload.get("stories") or [])
+            )
+        )
+        for payload in write_batches:
+            self.assertLessEqual(cloud_push._payload_size_bytes(payload), 50000)
+
+    def test_single_oversized_writebatch_doc_fails_before_http(self):
+        from . import cloud_push
+
+        src = self._write_read_model()
+        story = {
+            "_id": "1:oversized",
+            "id": 1,
+            "syncVersion": 1,
+            "aiSummary": "x" * 70000,
+        }
+        (src / "stories.jsonl").write_text(
+            json.dumps(story, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        with patch.object(cloud_push, "_post") as post:
+            with self.assertRaises(cloud_push.CloudPushError) as ctx:
+                cloud_push.push_read_model(
+                    url="https://8.8.8.8/pushSync",
+                    secret=VALID_CLOUD_PUSH_SECRET,
+                    source_dir=src,
+                    max_body_bytes=40000,
+                )
+
+        post.assert_not_called()
+        self.assertIn("single stories doc 1:oversized", str(ctx.exception))
+        self.assertIn("HNREADER_CLOUD_PUSH_MAX_BODY_BYTES=40000", str(ctx.exception))
+
     def test_per_call_timeout_clamped_to_remaining_budget(self):
         from . import cloud_push
 
