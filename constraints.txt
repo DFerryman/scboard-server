@@ -1,0 +1,21 @@
+# Pinned versions known-good for hnreader (sync-only deployment).
+#
+# Regenerate with the project venv after a clean upgrade:
+#   .venv/bin/pip install -U -r server/requirements.txt
+#   .venv/bin/pip freeze | grep -E '^(pydantic|pydantic_core|annotated-types|typing[-_].*)' > server/constraints.txt
+#
+# Install for production uses both files together so requirements.txt stays
+# the source of truth for what we depend on, and this file is the source of
+# truth for which exact versions were validated:
+#
+#   .venv/bin/pip install -r server/requirements.txt -c server/constraints.txt
+#
+# All transitive deps below ship with pydantic itself (no extras). Optional
+# pydantic extras like ``[email]`` are NOT used by the server code, so
+# email-validator / dnspython / idna are intentionally absent.
+
+pydantic==2.12.5
+pydantic_core==2.41.5
+annotated-types==0.7.0
+typing-inspection==0.4.2
+typing_extensions==4.15.0

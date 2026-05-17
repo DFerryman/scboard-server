@@ -1,0 +1,64 @@
+# .gitignore for the hnreader backend standalone repo.
+# All ignore rules are self-contained; paths are relative to the repo root.
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# ===== Runtime data (generated at runtime by server.db.init_db / ingest) =====
+# data/ is entirely runtime state: SQLite, pid, lock, cloud-sync output
+data/
+.cloud-sync-output/
+logs/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.pid
+*.lock
+*.err
+*.bak
+
+# ===== Logs =====
+*.log
+
+# ===== Test coverage output =====
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# ===== Environment variables and secrets (.env.example stays tracked) =====
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secret.*
+
+# ===== Local debug / temp test dirs =====
+.tmp-tests/
+tmp-tests2/
+
+# ===== Editor / IDE / OS =====
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# oh-my-codex runtime state
+.omx/

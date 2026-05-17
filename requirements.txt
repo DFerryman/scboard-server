@@ -1,0 +1,12 @@
+# Runtime dependencies for the sync-only server.
+#
+# Pair this with ``server/constraints.txt`` for reproducible installs:
+#   .venv/bin/pip install -r server/requirements.txt -c server/constraints.txt
+#
+# Bounds rationale:
+# - pydantic 2.10 is the oldest line we've validated against; lower bound
+#   prevents accidental install of 2.0-2.9 (which had behaviour drift around
+#   validators and serialization).
+# - <3 keeps the major version locked; pydantic 3 will be a breaking change
+#   when it lands and must be re-validated.
+pydantic>=2.10,<3

@@ -1,0 +1,822 @@
+"""Push the read model to cloud DB via pushSync.
+
+Business publish (:func:`push_read_model`):
+    1. ping          - connectivity + signature liveness check
+    2. writeBatch    - write stories in batches; the first batch also carries
+                       topics and digests
+    3. switchMeta    - atomically switch meta.currentVersion (the mini program
+                       can read the new version from this point on)
+
+Dashboard publish (:func:`push_dashboard`, called independently):
+    1. writeDashboard - write summary + recent ingest runs + recent cloud sync
+                        runs in a single call
+
+Cleanup (:func:`cleanup_old`, after the business publish):
+    cleanupOld - delete old data where syncVersion NOT IN [current, previous],
+                 covering the stories / topics / hn_dashboard_* run collections.
+
+Why they are split: the business publish and the dashboard publish are
+decoupled so that:
+    - the dashboard summary never overwrites the cloud copy before the
+      business switchMeta (when a business push half-fails, the cloud summary
+      does not "get ahead of" the business collections)
+    - the dashboard projection can read this round's final cloud_sync_runs
+      state instead of always lagging one round behind
+    - when the dashboard publish fails, the local cloud_sync_runs is marked
+      warning while business reads are unaffected
+
+Module entry point::
+
+    from server.cloud_push import push_read_model, push_dashboard, CloudPushError
+    business_stats = push_read_model(url=..., secret=..., batch_size=50)
+    dashboard_stats = push_dashboard(url=..., secret=..., sync_version=v)
+
+CLI entry point (reads credentials from environment variables)::
+
+    python -m server.cloud_push
+
+Env vars (required, for CLI):
+    HNREADER_CLOUD_PUSH_URL     HTTP trigger URL for pushSync
+    HNREADER_CLOUD_PUSH_SECRET  shared HMAC secret (must match the cloud
+                                function's PUSH_SECRET)
+
+Env vars (optional, for CLI):
+    HNREADER_CLOUD_PUSH_BATCH_SIZE / HNREADER_CLOUD_BATCH_SIZE  stories per
+                                batch, default 50
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import http.client
+import ipaddress
+import json
+import logging
+import os
+import re
+import secrets
+import socket
+import ssl
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from . import dashboard_projection
+from .cloud_sync import default_output_dir
+from .http_client import PROBE_RESPONSE_MAX_BYTES, ResponseTooLargeError, read_limited
+from .logging_config import configure_logging
+
+
+log = logging.getLogger(__name__)
+
+TS_TOLERANCE_MS = 60 * 1000
+DEFAULT_TIMEOUT_SECONDS = 120
+# Minimum wall-time budget required before starting a single HTTP call.
+# A push with a deadline_at must abort cleanly at a phase boundary rather
+# than start a call that has nowhere near enough time to complete.
+_MIN_PER_CALL_SECONDS = 10
+
+
+def _console_text(text: str, stream) -> str:
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        text.encode(encoding)
+        return text
+    except LookupError:
+        return text
+    except UnicodeEncodeError:
+        return text.encode(encoding, errors="backslashreplace").decode(encoding)
+
+
+def _print_console(text: str, *, file=None) -> None:
+    stream = file or sys.stdout
+    print(_console_text(str(text), stream), file=stream)
+
+
+class CloudPushError(RuntimeError):
+    """Raised when push_read_model fails at any of ping / writeBatch / switchMeta.
+
+    A cleanupOld failure is not fatal; it only logs a warning."""
+
+
+class CloudPushUrlError(CloudPushError):
+    """Raised when ``HNREADER_CLOUD_PUSH_URL`` fails validation.
+
+    In the sync-only architecture the push URL is the critical outbound path
+    the server initiates, so any unsafe target (loopback / private /
+    link-local / cloud metadata / non-https / carrying userinfo / carrying a
+    query) must be rejected immediately. This prevents the read model and the
+    HMAC signature from being sent to an unintended address, or a temporary
+    token leaking into the journal via the query string.
+    """
+
+
+class CloudPushSecretError(CloudPushError):
+    """``HNREADER_CLOUD_PUSH_SECRET`` is missing or too weak."""
+
+
+def _redacted_url_for_log(url: str) -> str:
+    """Return ``scheme://host[:port]/path`` for logging; drop userinfo / query / fragment.
+
+    Logs go to journald in production and end up indexed downstream. Even
+    after ``validate_cloud_push_url`` rejects userinfo/query/fragment, some
+    callers log URLs before validation (or with intermediate variants). Be
+    defensive: strip anything that isn't structural so a journal scrape never
+    bleeds credentials a future regression might let through.
+
+    Malformed ports (``https://host:bad/x``) make ``parsed.port`` raise
+    ``ValueError``; treat that as "unsafe to log" rather than crashing the
+    caller — a logging helper must never become the source of an outage.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "<malformed-url>"
+    host = (parsed.hostname or "").strip()
+    if not host:
+        return "<malformed-url>"
+    try:
+        port = parsed.port
+    except ValueError:
+        return "<malformed-url>"
+    netloc = f"{host}:{port}" if port else host
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, netloc, parsed.path, "", "")
+    )
+
+
+# Outbound targets blocked by default: outbound is only allowed to public
+# HTTPS, never to the internal network or a cloud metadata service.
+_BLOCKED_HOSTNAMES = frozenset({
+    "localhost",
+    "ip6-localhost",
+    "ip6-loopback",
+    "metadata",  # short name of the GCP / OCI metadata service
+    "metadata.google.internal",
+    "metadata.goog",
+})
+
+_CGNAT_IPV4_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+_CLOUD_PUSH_SECRET_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _resolve_cloud_push_host(host: str) -> str:
+    """Resolve ``host`` and return one allowed address, failing closed on any deny."""
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (socket.gaierror, socket.herror, OSError) as exc:
+        raise CloudPushUrlError(
+            f"CLOUD_PUSH_URL host {host!r} could not be resolved: {exc}"
+        ) from exc
+    pinned_ip: Optional[str] = None
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        addr = str(sockaddr[0])
+        try:
+            ip = ipaddress.ip_address(addr.split("%", 1)[0])
+        except ValueError:
+            continue
+        if _is_blocked_ip(ip):
+            raise CloudPushUrlError(
+                f"CLOUD_PUSH_URL host {host!r} resolves to disallowed address {addr}"
+            )
+        if pinned_ip is None:
+            pinned_ip = addr.split("%", 1)[0]
+    if pinned_ip is None:
+        raise CloudPushUrlError(
+            f"CLOUD_PUSH_URL host {host!r} did not resolve to an IP address"
+        )
+    return pinned_ip
+
+
+def _is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
+    if isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_IPV4_NETWORK:
+        return True
+    if not ip.is_global:
+        return True
+    if isinstance(ip, ipaddress.IPv4Address):
+        # AWS / Azure / OCI / DigitalOcean / Alicloud and others all expose
+        # instance metadata on 169.254.169.254. ipaddress.is_link_local
+        # already covers it, but keep the explicit note.
+        if ip == ipaddress.IPv4Address("169.254.169.254"):
+            return True
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip == ipaddress.IPv6Address("fd00:ec2::254"):  # AWS IMDS over IPv6
+            return True
+    return False
+
+
+def _validate_cloud_push_url_with_pinned_ip(url: str) -> Tuple[str, str]:
+    """Reject any push URL that could become an SSRF or credential-bleed risk.
+
+    Returns the URL on success. Raises :class:`CloudPushUrlError` otherwise so
+    callers fail fast rather than silently fall through to ``urllib`` (which
+    happily resolves and posts to ``http://169.254.169.254`` etc.).
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise CloudPushUrlError("CLOUD_PUSH_URL is empty")
+    clean = url.strip()
+    parsed = urllib.parse.urlsplit(clean)
+    if parsed.scheme.lower() != "https":
+        raise CloudPushUrlError(
+            f"CLOUD_PUSH_URL must use https (got scheme={parsed.scheme!r})"
+        )
+    if parsed.username or parsed.password:
+        # userinfo in the URL would be signed and sent along with the
+        # request; no credentials should ever be put here.
+        raise CloudPushUrlError(
+            "CLOUD_PUSH_URL must not include userinfo (user:pass@host)"
+        )
+    if parsed.fragment:
+        raise CloudPushUrlError("CLOUD_PUSH_URL must not contain a fragment")
+    if parsed.query:
+        # A cloud function trigger URL should not carry a query; operators
+        # sometimes stuff a temporary token into the query (?token=...),
+        # which would be written verbatim into the journal/log and cause an
+        # unexpected credential leak. If authentication is genuinely needed,
+        # put it in the signed headers, not the URL.
+        raise CloudPushUrlError(
+            "CLOUD_PUSH_URL must not contain a query string"
+        )
+    try:
+        # ``urllib.parse`` lazily validates the port: ``urlsplit`` accepts
+        # ``https://host:bad/path``, but the first ``parsed.port`` access
+        # raises ValueError. Trigger that here so callers fail with a
+        # CloudPushUrlError before ever reaching the HTTP request.
+        parsed.port  # type: ignore[union-attr]
+    except ValueError as exc:
+        raise CloudPushUrlError(
+            f"CLOUD_PUSH_URL has invalid port: {exc}"
+        ) from exc
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise CloudPushUrlError("CLOUD_PUSH_URL is missing a host")
+    if host in _BLOCKED_HOSTNAMES:
+        raise CloudPushUrlError(
+            f"CLOUD_PUSH_URL host {host!r} is on the blocked-host list"
+        )
+    try:
+        literal_ip = ipaddress.ip_address(host)
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None:
+        if _is_blocked_ip(literal_ip):
+            raise CloudPushUrlError(
+                f"CLOUD_PUSH_URL points to disallowed address {host}"
+            )
+        pinned_ip = str(literal_ip)
+    else:
+        pinned_ip = _resolve_cloud_push_host(host)
+    return clean, pinned_ip
+
+
+def validate_cloud_push_url(url: str) -> str:
+    """Reject any push URL that could become an SSRF or credential-bleed risk."""
+    clean, _pinned_ip = _validate_cloud_push_url_with_pinned_ip(url)
+    return clean
+
+
+def validate_cloud_push_secret(secret: str) -> str:
+    """Require the documented 32-byte random HMAC key encoded as 64 hex chars."""
+    if not isinstance(secret, str) or not secret.strip():
+        raise CloudPushSecretError("CLOUD_PUSH_SECRET is empty")
+    clean = secret.strip()
+    if not _CLOUD_PUSH_SECRET_RE.fullmatch(clean):
+        raise CloudPushSecretError(
+            "CLOUD_PUSH_SECRET must be 64 hexadecimal characters "
+            "(generate with: python -c \"import secrets; print(secrets.token_hex(32))\")"
+        )
+    return clean
+
+
+def _budget_remaining(deadline_at: Optional[float]) -> Optional[float]:
+    if deadline_at is None:
+        return None
+    return float(deadline_at) - time.time()
+
+
+def _next_call_timeout(
+    deadline_at: Optional[float], configured: int
+) -> int:
+    """Per-call HTTP timeout clamped to the remaining wall-time budget.
+
+    Floored at ``_MIN_PER_CALL_SECONDS`` so we never pass a useless
+    1-second timeout into urllib; the caller must check budget via
+    :func:`_abort_if_insufficient` before invoking the call.
+    """
+    remaining = _budget_remaining(deadline_at)
+    if remaining is None:
+        return max(_MIN_PER_CALL_SECONDS, configured)
+    return max(_MIN_PER_CALL_SECONDS, min(configured, int(remaining)))
+
+
+def _abort_if_insufficient(
+    deadline_at: Optional[float],
+    *,
+    phase: str,
+    min_required: int = _MIN_PER_CALL_SECONDS,
+) -> None:
+    """Raise :class:`CloudPushError` if too little wall time remains.
+
+    Called at every phase boundary so the supervisor never kills us
+    mid-HTTP-call: we surrender cleanly before starting a call we
+    cannot finish.
+    """
+    remaining = _budget_remaining(deadline_at)
+    if remaining is None:
+        return
+    if remaining < min_required:
+        raise CloudPushError(
+            f"deadline reached before {phase}: "
+            f"{remaining:.1f}s remain, need >={min_required}s"
+        )
+
+
+def _require_env(name: str) -> str:
+    v = os.environ.get(name, "").strip()
+    if not v:
+        _print_console(f"[push] env var {name} is required", file=sys.stderr)
+        sys.exit(2)
+    return v
+
+
+def _sign(secret: str, body_bytes: bytes) -> tuple[str, str, str]:
+    ts = str(int(time.time() * 1000))
+    nonce = secrets.token_hex(16)
+    body_hash = hashlib.sha256(body_bytes).hexdigest()
+    sig = hmac.new(
+        secret.encode("utf-8"),
+        f"{ts}.{nonce}.{body_hash}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return ts, nonce, sig
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Connect to a validated IP while verifying the original hostname."""
+
+    def __init__(
+        self,
+        host: str,
+        *,
+        pinned_ip: str,
+        port: int,
+        timeout: int,
+    ) -> None:
+        super().__init__(
+            host,
+            port=port,
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        sock = socket.create_connection(
+            (self._pinned_ip, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        try:
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        except Exception:
+            sock.close()
+            raise
+
+
+def _host_header_value(parsed: urllib.parse.SplitResult) -> str:
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = parsed.port
+    if port is not None and port != 443:
+        return f"{host}:{port}"
+    return host
+
+
+def _request_target(parsed: urllib.parse.SplitResult) -> str:
+    path = parsed.path or "/"
+    if parsed.query:
+        return f"{path}?{parsed.query}"
+    return path
+
+
+def _post(url: str, secret: str, payload: dict, *, timeout: int) -> dict:
+    try:
+        url, pinned_ip = _validate_cloud_push_url_with_pinned_ip(url)
+    except CloudPushUrlError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ts, nonce, sig = _sign(secret, body_bytes)
+    parsed = urllib.parse.urlsplit(url)
+    conn: Optional[_PinnedHTTPSConnection] = None
+    try:
+        conn = _PinnedHTTPSConnection(
+            parsed.hostname or "",
+            pinned_ip=pinned_ip,
+            port=parsed.port or 443,
+            timeout=timeout,
+        )
+        conn.request(
+            "POST",
+            _request_target(parsed),
+            body=body_bytes,
+            headers={
+                "Host": _host_header_value(parsed),
+                "Content-Type": "application/json; charset=utf-8",
+                "x-push-ts": ts,
+                "x-push-nonce": nonce,
+                "x-push-signature": sig,
+            },
+        )
+        resp = conn.getresponse()
+        raw = read_limited(resp, PROBE_RESPONSE_MAX_BYTES).decode(
+            "utf-8", errors="replace"
+        )
+        status = resp.status
+    except ResponseTooLargeError as e:
+        return {"ok": False, "error": f"response too large: {e}"}
+    except (
+        TimeoutError,
+        socket.timeout,
+        http.client.HTTPException,
+        OSError,
+    ) as e:
+        return {"ok": False, "error": f"network error: {e}"}
+    finally:
+        if conn is not None:
+            conn.close()
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"ok": False, "statusCode": status, "raw": raw[:500]}
+    if status != 200 and "statusCode" not in data:
+        data["statusCode"] = status
+    return data
+
+
+def _load_jsonl(path: Path) -> List[dict]:
+    out: List[dict] = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+def _load_required_jsonl(path: Path) -> List[dict]:
+    if not path.exists():
+        raise CloudPushError(f"required JSONL file missing: {path}")
+    try:
+        return _load_jsonl(path)
+    except (OSError, ValueError) as exc:
+        raise CloudPushError(f"required JSONL file unreadable: {path}: {exc}")
+
+
+def _assert_versioned_doc(doc: dict, version: int, collection: str) -> None:
+    doc_id = doc.get("_id") if isinstance(doc, dict) else None
+    if not doc_id or not str(doc_id).startswith(f"{version}:"):
+        raise CloudPushError(
+            f"{collection} doc _id={doc_id!r} not in syncVersion={version}"
+        )
+    if doc.get("syncVersion") != version:
+        raise CloudPushError(
+            f"{collection} doc _id={doc_id!r} has syncVersion="
+            f"{doc.get('syncVersion')!r}, expected {version}"
+        )
+
+
+def _validate_versioned_docs(
+    collection: str, docs: Iterable[dict], version: int
+) -> None:
+    for doc in docs:
+        _assert_versioned_doc(doc, version, collection)
+
+
+def _load_dashboard_summary(out_dir: Path) -> Dict[str, Any]:
+    """Read the dashboard summary doc;raise if missing/corrupt.
+
+    Dashboard publish is its own action — by the time we call it the
+    projection must have produced a valid summary. A missing or unreadable
+    file means the build step is broken,not "OK, just skip", so we fail
+    fast and let the caller record a warning.
+    """
+    path = out_dir / dashboard_projection.DASHBOARD_SUMMARY_FILE
+    if not path.exists():
+        raise CloudPushError(f"dashboard summary missing: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CloudPushError(f"dashboard summary unreadable: {path}: {exc}")
+    if not isinstance(data, dict):
+        raise CloudPushError(f"dashboard summary is not a JSON object: {path}")
+    return data
+
+
+def _chunks(items: List[dict], size: int) -> Iterable[List[dict]]:
+    if size <= 0:
+        size = len(items)
+    for i in range(0, len(items), max(1, size)):
+        yield items[i:i + size]
+
+
+def push_read_model(
+    *,
+    url: str,
+    secret: str,
+    batch_size: int = 50,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    source_dir: Optional[Path] = None,
+    deadline_at: Optional[float] = None,
+) -> dict:
+    """Business publish: push stories / topics / digests / meta to the cloud DB.
+
+    ``deadline_at`` is a wall-clock deadline that the entire push must
+    finish by. Each phase boundary checks the remaining budget and aborts
+    with :class:`CloudPushError` before starting an HTTP call that would
+    not have time to complete; individual call timeouts are clamped to
+    the remaining budget so a single phase never overruns it. The trailing
+    ``cleanupOld`` is non-fatal and skipped silently when budget runs out
+    (its work will be picked up on the next round).
+
+    Dashboard collections are out of scope for this function -- the caller
+    invokes :func:`push_dashboard` separately, only after this function
+    returns ok and the local cloud_sync_runs has reached its final state.
+
+    Returns:
+        A stats dict containing ``syncVersion`` / ``previousVersion`` /
+        ``stories`` / ``topics`` / ``digests`` / ``cleanup``. stories/topics/
+        digests are the counts the cloud confirmed it wrote.
+
+    Raises:
+        CloudPushError: any of ping / writeBatch / switchMeta failed, the
+            deadline was exhausted before switchMeta, or meta.json is missing.
+        A cleanupOld failure only logs a warning and does not raise; cleanup
+        is skipped when the deadline is exhausted.
+    """
+    out_dir = source_dir or default_output_dir()
+
+    if not (out_dir / "meta.json").exists():
+        raise CloudPushError(
+            f"cloud-sync output does not exist ({out_dir}/meta.json); "
+            "call cloud_sync.build_read_model() or `python -m server.cloud_sync` first"
+        )
+
+    # SSRF / misconfiguration safeguard: gate the URL before any HMAC signing.
+    url = validate_cloud_push_url(url)
+    secret = validate_cloud_push_secret(secret)
+
+    meta = json.loads((out_dir / "meta.json").read_text(encoding="utf-8"))
+    stories = _load_required_jsonl(out_dir / "stories.jsonl")
+    topics = _load_required_jsonl(out_dir / "topics.jsonl")
+    digests = _load_required_jsonl(out_dir / "digests.jsonl")
+    current_version = int(meta["currentVersion"])
+    previous_version = meta.get("previousVersion")
+    _validate_versioned_docs("stories", stories, current_version)
+    _validate_versioned_docs("topics", topics, current_version)
+    _validate_versioned_docs("digests", digests, current_version)
+
+    # The manifest covers business collections only. Stale cleanup of the
+    # dashboard collections is delegated to cleanupOld (keepVersions); it no
+    # longer goes through the cleanupByManifest path inside switchMeta.
+    manifest: Dict[str, Any] = {
+        "stories": [str(doc["_id"]) for doc in stories if doc.get("_id")],
+        "topics": [str(doc["_id"]) for doc in topics if doc.get("_id")],
+        "digests": [str(doc["_id"]) for doc in digests if doc.get("_id")],
+    }
+
+    log.info(
+        "[push] target version=%d previous=%s stories=%d topics=%d digests=%d url=%s",
+        current_version, previous_version,
+        len(stories), len(topics), len(digests), _redacted_url_for_log(url),
+    )
+
+    # ---------- 1. ping ----------
+    _abort_if_insufficient(deadline_at, phase="ping")
+    r = _post(
+        url, secret, {"action": "ping"},
+        timeout=_next_call_timeout(deadline_at, timeout_seconds),
+    )
+    if not r.get("ok"):
+        raise CloudPushError(f"ping failed: {r}")
+    log.info("[push] ping ok: %s", r)
+
+    # ---------- 2. writeBatch ----------
+    sent = {"stories": 0, "topics": 0, "digests": 0}
+    first = True
+    # Guarantee at least one iteration so topics/digests are still sent
+    # (even when stories is empty)
+    chunks = list(_chunks(stories, batch_size)) or [[]]
+    for chunk in chunks:
+        _abort_if_insufficient(deadline_at, phase="writeBatch")
+        payload: Dict[str, Any] = {
+            "action": "writeBatch",
+            "syncVersion": current_version,
+            "stories": chunk,
+        }
+        if first:
+            payload["topics"] = topics
+            payload["digests"] = digests
+            first = False
+        r = _post(
+            url, secret, payload,
+            timeout=_next_call_timeout(deadline_at, timeout_seconds),
+        )
+        if not r.get("ok"):
+            raise CloudPushError(f"writeBatch failed: {r}")
+        for k in sent:
+            sent[k] += int(r.get(k, 0) or 0)
+        log.info(
+            "[push] writeBatch chunk: stories+%s topics+%s digests+%s",
+            r.get("stories", 0), r.get("topics", 0), r.get("digests", 0),
+        )
+
+    # ---------- 3. switchMeta ----------
+    # Aborting here is preferable to starting a switchMeta that gets killed
+    # mid-flight — without switchMeta the partial batches stay invisible.
+    _abort_if_insufficient(deadline_at, phase="switchMeta")
+    switch_meta_payload: Dict[str, Any] = {
+        "currentVersion": current_version,
+        "previousVersion": previous_version,
+        "feedCounts": meta["feedCounts"],
+        "publishedAt": meta.get("publishedAt"),
+        "manifest": manifest,
+    }
+    r = _post(
+        url, secret,
+        {"action": "switchMeta", "meta": switch_meta_payload},
+        timeout=_next_call_timeout(deadline_at, timeout_seconds),
+    )
+    if not r.get("ok"):
+        raise CloudPushError(f"switchMeta failed: {r}")
+    log.info("[push] switchMeta ok: %s", r)
+
+    # ---------- 4. cleanupOld (non-fatal) ----------
+    # keepVersions=[current, previous] -- keep only two generations in the
+    # cloud, which both allows rollback and sweeps away the partial residue
+    # of a few half-failed rounds in between (v17/18/19 partials are cleaned
+    # up together once v20 is ok).
+    cleanup_result: dict = {"skipped": True}
+    keep_versions: List[int] = [current_version]
+    if previous_version and int(previous_version) >= 1 and int(previous_version) != current_version:
+        keep_versions.append(int(previous_version))
+    remaining = _budget_remaining(deadline_at)
+    if remaining is not None and remaining < _MIN_PER_CALL_SECONDS:
+        log.info(
+            "[push] cleanupOld skipped: only %.1fs remain (need >=%ds); "
+            "next round will retry", remaining, _MIN_PER_CALL_SECONDS,
+        )
+        cleanup_result = {"skipped": "deadline"}
+    else:
+        r = _post(
+            url, secret,
+            {"action": "cleanupOld", "keepVersions": keep_versions},
+            timeout=_next_call_timeout(deadline_at, timeout_seconds),
+        )
+        cleanup_result = r
+        if not r.get("ok"):
+            log.warning("[push] cleanupOld failed (non-fatal): %s", r)
+        else:
+            log.info("[push] cleanupOld ok: %s", r)
+
+    return {
+        "syncVersion": current_version,
+        "previousVersion": previous_version,
+        "stories": sent["stories"],
+        "topics": sent["topics"],
+        "digests": sent["digests"],
+        "cleanup": cleanup_result,
+    }
+
+
+def push_dashboard(
+    *,
+    url: str,
+    secret: str,
+    sync_version: int,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    source_dir: Optional[Path] = None,
+    deadline_at: Optional[float] = None,
+) -> dict:
+    """Dashboard publish: push hn_dashboard_summary / ingest_runs / cloud_sync_runs.
+
+    Must only be called after :func:`push_read_model` returns ok and the local
+    ``cloud_sync_runs`` has written this round's final state, so the dashboard
+    summary reflects this round's real result (rather than a ``running`` state
+    that is always one round behind).
+
+    A missing or corrupt file raises :class:`CloudPushError` directly --
+    the dashboard publish is a deterministic artifact, so a missing file
+    means the build stage is broken; do not silently skip.
+
+    Returns:
+        A stats dict containing ``syncVersion`` / ``dashboardSummary`` /
+        ``dashboardIngestRuns`` / ``dashboardCloudSyncRuns``; the last three
+        are the counts the cloud confirmed it wrote.
+
+    Raises:
+        CloudPushError: a dashboard file is missing/corrupt, or
+            writeDashboard failed.
+    """
+    out_dir = source_dir or default_output_dir()
+    url = validate_cloud_push_url(url)
+    secret = validate_cloud_push_secret(secret)
+
+    summary = _load_dashboard_summary(out_dir)
+    if summary.get("_id") not in (None, "summary"):
+        raise CloudPushError(
+            f"dashboard summary _id must be 'summary': {summary.get('_id')!r}"
+        )
+    if summary.get("syncVersion") is not None:
+        try:
+            summary_version = int(summary.get("syncVersion"))
+        except (TypeError, ValueError) as exc:
+            raise CloudPushError(
+                f"dashboard summary syncVersion is invalid: "
+                f"{summary.get('syncVersion')!r}"
+            ) from exc
+        if summary_version != int(sync_version):
+            raise CloudPushError(
+                f"dashboard summary syncVersion={summary.get('syncVersion')!r}, "
+                f"expected {int(sync_version)}"
+            )
+
+    ingest_runs = _load_required_jsonl(
+        out_dir / dashboard_projection.DASHBOARD_INGEST_RUNS_FILE
+    )
+    cloud_sync_runs = _load_required_jsonl(
+        out_dir / dashboard_projection.DASHBOARD_CLOUD_SYNC_RUNS_FILE
+    )
+    _validate_versioned_docs(
+        "hn_dashboard_ingest_runs", ingest_runs, int(sync_version)
+    )
+    _validate_versioned_docs(
+        "hn_dashboard_cloud_sync_runs", cloud_sync_runs, int(sync_version)
+    )
+
+    log.info(
+        "[push-dashboard] target version=%d summary=1 ingest=%d cloud_sync=%d url=%s",
+        int(sync_version), len(ingest_runs), len(cloud_sync_runs),
+        _redacted_url_for_log(url),
+    )
+
+    _abort_if_insufficient(deadline_at, phase="writeDashboard")
+    payload: Dict[str, Any] = {
+        "action": "writeDashboard",
+        "syncVersion": int(sync_version),
+        "dashboardSummary": summary,
+    }
+    if ingest_runs:
+        payload["dashboardIngestRuns"] = ingest_runs
+    if cloud_sync_runs:
+        payload["dashboardCloudSyncRuns"] = cloud_sync_runs
+    r = _post(
+        url, secret, payload,
+        timeout=_next_call_timeout(deadline_at, timeout_seconds),
+    )
+    if not r.get("ok"):
+        raise CloudPushError(f"writeDashboard failed: {r}")
+    log.info("[push-dashboard] writeDashboard ok: %s", r)
+
+    return {
+        "syncVersion": int(sync_version),
+        "dashboardSummary": int(r.get("dashboardSummary", 0) or 0),
+        "dashboardIngestRuns": int(r.get("dashboardIngestRuns", 0) or 0),
+        "dashboardCloudSyncRuns": int(r.get("dashboardCloudSyncRuns", 0) or 0),
+    }
+
+
+def main() -> None:
+    """CLI: read credentials from environment variables, call push_read_model, print the result."""
+    configure_logging(verbose=False)
+    url = _require_env("HNREADER_CLOUD_PUSH_URL")
+    secret = _require_env("HNREADER_CLOUD_PUSH_SECRET")
+    # Prefer HNREADER_CLOUD_PUSH_BATCH_SIZE (new name), fall back to HNREADER_CLOUD_BATCH_SIZE (old name)
+    batch_raw = os.environ.get("HNREADER_CLOUD_PUSH_BATCH_SIZE") \
+        or os.environ.get("HNREADER_CLOUD_BATCH_SIZE") \
+        or "50"
+    try:
+        batch_size = int(batch_raw)
+    except ValueError:
+        _print_console(f"[push] invalid batch size: {batch_raw}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        stats = push_read_model(url=url, secret=secret, batch_size=batch_size)
+    except CloudPushError as exc:
+        _print_console(f"[push] FAILED: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    _print_console("[push] all done")
+    _print_console(json.dumps(stats, ensure_ascii=True, indent=2))
+
+
+if __name__ == "__main__":
+    main()
