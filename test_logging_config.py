@@ -107,7 +107,7 @@ class DailyLoggingConfigTest(unittest.TestCase):
         launcher = Path(__file__).with_name("launcher.sh").read_text(encoding="utf-8")
 
         self.assertIn(
-            'HNREADER_LOG_DIR="${HNREADER_LOG_DIR:-${PROJECT_DIR}/server/logs}"',
+            'HNREADER_LOG_DIR="${HNREADER_LOG_DIR:-${SERVER_DIR}/logs}"',
             launcher,
         )
         self.assertIn('$(env_line HNREADER_LOG_DIR "$HNREADER_LOG_DIR")', launcher)
@@ -121,6 +121,49 @@ class DailyLoggingConfigTest(unittest.TestCase):
             2,
         )
         self.assertIn('_rw_property_args rw_args "$db_dir" "$HNREADER_LOG_DIR"', launcher)
+
+
+class LauncherUbuntuBootstrapContractTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.launcher = Path(__file__).with_name("launcher.sh").read_text(
+            encoding="utf-8"
+        )
+
+    def test_default_command_runs_ubuntu_bootstrap(self) -> None:
+        self.assertIn("bootstrap     guided first-run setup for Ubuntu 22.04", self.launcher)
+        self.assertIn('case "${1:-bootstrap}" in', self.launcher)
+        self.assertIn("bootstrap)\n    bootstrap_ubuntu22", self.launcher)
+
+    def test_bootstrap_installs_ubuntu_system_dependencies_and_venv(self) -> None:
+        self.assertIn("bootstrap_ubuntu22()", self.launcher)
+        self.assertIn("require_ubuntu_2204", self.launcher)
+        self.assertIn("install_system_dependencies", self.launcher)
+        self.assertIn("apt-get update", self.launcher)
+        self.assertIn(
+            "apt-get install -y python3 python3-venv python3-pip git curl ufw sqlite3 acl",
+            self.launcher,
+        )
+        self.assertIn("ensure_virtualenv", self.launcher)
+        self.assertIn('"$PYTHON_BIN" -m pip install -r "$REQUIREMENTS_FILE" -c "$CONSTRAINTS_FILE"', self.launcher)
+        self.assertIn("ensure_project_read_access", self.launcher)
+
+    def test_bootstrap_guides_required_configuration_into_env_local(self) -> None:
+        self.assertIn("run_interactive_config_wizard()", self.launcher)
+        self.assertIn("HNREADER_AI_PROVIDER=none", self.launcher)
+        self.assertIn("HNREADER_CLOUD_SYNC_ENABLED=1", self.launcher)
+        self.assertIn("HNREADER_CLOUD_PUSH_URL=", self.launcher)
+        self.assertIn("HNREADER_CLOUD_PUSH_SECRET=", self.launcher)
+        self.assertIn("HNREADER_ADMIN_EMAIL_ENABLED=false", self.launcher)
+        self.assertIn("chmod 600 \"$PROJECT_ENV_FILE\"", self.launcher)
+
+    def test_launcher_supports_direct_server_checkout_layout(self) -> None:
+        self.assertIn("SERVER_DIR=", self.launcher)
+        self.assertIn("SERVER_MODULE=", self.launcher)
+        self.assertIn("REQUIREMENTS_FILE=", self.launcher)
+        self.assertIn("CONSTRAINTS_FILE=", self.launcher)
+        self.assertIn("PYTHONPATH_ROOT=", self.launcher)
+        self.assertIn("Environment=PYTHONPATH=${PYTHONPATH_ROOT}", self.launcher)
+        self.assertIn("ExecStart=${PYTHON_BIN} -m ${SERVER_MODULE}.ingest --loop", self.launcher)
 
 
 if __name__ == "__main__":

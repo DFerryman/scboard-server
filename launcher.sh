@@ -3,8 +3,8 @@ set -euo pipefail
 
 # HN Reader production service manager (sync-only).
 #
-# Run `bash server/launcher.sh help` for the full command list.
-# Edit the configuration block below before first production use.
+# Run `bash launcher.sh` on Ubuntu 22.04 for guided first-run setup.
+# Run `bash launcher.sh help` for the full command list.
 #
 # Sync-only mode:
 #   Production runs only db init + the ingest supervisor. Each ingest finalize
@@ -30,7 +30,25 @@ set -euo pipefail
 #   group membership, or o+rx). The DB directory is still chowned below.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+if [[ -f "${SCRIPT_DIR}/ingest.py" && -f "${SCRIPT_DIR}/__init__.py" ]]; then
+  SERVER_DIR="${SERVER_DIR:-${SCRIPT_DIR}}"
+  if [[ "$(basename "$SCRIPT_DIR")" == "server" ]]; then
+    DEFAULT_PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+    DEFAULT_PYTHONPATH_ROOT="$DEFAULT_PROJECT_DIR"
+  else
+    DEFAULT_PROJECT_DIR="$SCRIPT_DIR"
+    DEFAULT_PYTHONPATH_ROOT="${SCRIPT_DIR}/.launcher-pythonpath"
+  fi
+elif [[ -f "${SCRIPT_DIR}/server/ingest.py" && -f "${SCRIPT_DIR}/server/__init__.py" ]]; then
+  DEFAULT_PROJECT_DIR="$SCRIPT_DIR"
+  SERVER_DIR="${SERVER_DIR:-${SCRIPT_DIR}/server}"
+  DEFAULT_PYTHONPATH_ROOT="$DEFAULT_PROJECT_DIR"
+else
+  echo "ERROR: cannot locate the hnreader server package from ${SCRIPT_DIR}" >&2
+  echo "       Put launcher.sh next to ingest.py, or in a project root that contains server/." >&2
+  exit 1
+fi
 
 load_env_file() {
   local f
@@ -51,12 +69,22 @@ load_env_file() {
 }
 
 PROJECT_DIR="${PROJECT_DIR:-${DEFAULT_PROJECT_DIR}}"
-load_env_file "${PROJECT_DIR}/.env.local"
-load_env_file "${SCRIPT_DIR}/.env.local"
+PROJECT_ENV_FILE="${PROJECT_ENV_FILE:-${PROJECT_DIR}/.env.local}"
+SERVER_ENV_FILE="${SERVER_ENV_FILE:-${SERVER_DIR}/.env.local}"
+load_env_file "$PROJECT_ENV_FILE"
+load_env_file "$SERVER_ENV_FILE"
 
 # ---------- Deployment paths / service identity ----------
 
 PROJECT_DIR="${PROJECT_DIR:-${DEFAULT_PROJECT_DIR}}"
+SERVER_DIR="${SERVER_DIR:-${PROJECT_DIR}/server}"
+SERVER_MODULE="${SERVER_MODULE:-server}"
+PYTHONPATH_ROOT="${PYTHONPATH_ROOT:-${DEFAULT_PYTHONPATH_ROOT}}"
+PROJECT_ENV_FILE="${PROJECT_ENV_FILE:-${PROJECT_DIR}/.env.local}"
+SERVER_ENV_FILE="${SERVER_ENV_FILE:-${SERVER_DIR}/.env.local}"
+REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-${SERVER_DIR}/requirements.txt}"
+CONSTRAINTS_FILE="${CONSTRAINTS_FILE:-${SERVER_DIR}/constraints.txt}"
+LAUNCHER_PATH="${LAUNCHER_PATH:-${SCRIPT_DIR}/launcher.sh}"
 APP_USER="${APP_USER:-hnreader}"
 APP_GROUP="${APP_GROUP:-${APP_USER}}"
 SERVICE_PREFIX="${SERVICE_PREFIX:-hnreader}"
@@ -67,8 +95,8 @@ PYTHON_BIN="${PYTHON_BIN:-${PROJECT_DIR}/.venv/bin/python}"
 
 # ---------- Core runtime env ----------
 
-HNREADER_DB_PATH="${HNREADER_DB_PATH:-${PROJECT_DIR}/server/data/hnreader.db}"
-HNREADER_LOG_DIR="${HNREADER_LOG_DIR:-${PROJECT_DIR}/server/logs}"
+HNREADER_DB_PATH="${HNREADER_DB_PATH:-${SERVER_DIR}/data/hnreader.db}"
+HNREADER_LOG_DIR="${HNREADER_LOG_DIR:-${SERVER_DIR}/logs}"
 HNREADER_APP_VERSION="${HNREADER_APP_VERSION:-1.0.0}"
 
 # ---------- Cloud sync (sync-only: the only outbound channel) ----------
@@ -204,9 +232,10 @@ usage() {
   cat <<EOF
 HN Reader production service manager (sync-only).
 
-Usage: bash server/launcher.sh <command>
+Usage: bash launcher.sh <command>
 
 Commands:
+  bootstrap     guided first-run setup for Ubuntu 22.04
   install   write env + units, enable and start services
   start     alias for install
   restart   write env + units, restart services
@@ -237,8 +266,14 @@ Sync-only mode:
   dashboard data from the hn_dashboard_* collections; the server no longer
   listens on any HTTP port.
 
-Edit the configuration block at the top of the script before first
-production use. All variables can also be overridden via the environment.
+First deployment on Ubuntu 22.04:
+  Clone the server, cd into it, then run:
+    bash launcher.sh
+
+The default command is bootstrap. It installs Ubuntu packages, creates the
+Python virtualenv, guides config into .env.local, installs systemd units, and
+starts the sync-only services. All variables can also be overridden via the
+environment or .env.local.
 EOF
 }
 
@@ -286,14 +321,26 @@ env_line() {
   printf '%s=%s\n' "$key" "$(quote_env "$value")"
 }
 
+ensure_pythonpath_bridge() {
+  if [[ "$PYTHONPATH_ROOT" != "${PROJECT_DIR}/.launcher-pythonpath" ]]; then
+    return
+  fi
+  mkdir -p "$PYTHONPATH_ROOT"
+  if [[ -e "${PYTHONPATH_ROOT}/${SERVER_MODULE}" ]]; then
+    return
+  fi
+  ln -s "$SERVER_DIR" "${PYTHONPATH_ROOT}/${SERVER_MODULE}"
+}
+
 resolve_python() {
   if [[ -x "$PYTHON_BIN" ]]; then
+    ensure_pythonpath_bridge
     return
   fi
   echo "ERROR: PYTHON_BIN is not executable: ${PYTHON_BIN}" >&2
-  echo "       Create the project virtualenv first, e.g.:" >&2
+  echo "       Run 'bash launcher.sh bootstrap' to create it, or run manually:" >&2
   echo "         python3 -m venv ${PROJECT_DIR}/.venv" >&2
-  echo "         ${PROJECT_DIR}/.venv/bin/pip install -r ${PROJECT_DIR}/server/requirements.txt -c ${PROJECT_DIR}/server/constraints.txt" >&2
+  echo "         ${PROJECT_DIR}/.venv/bin/pip install -r ${REQUIREMENTS_FILE} -c ${CONSTRAINTS_FILE}" >&2
   echo "       Or set PYTHON_BIN to a Python interpreter that has the project deps installed." >&2
   exit 1
 }
@@ -306,6 +353,7 @@ python_env_args() {
     ai_config_file_for_python="$PROJECT_DIR/.hnreader-ai-check-env-missing"
   fi
   _out_array=(
+    "PYTHONPATH=$PYTHONPATH_ROOT"
     "HNREADER_DB_PATH=$HNREADER_DB_PATH"
     "HNREADER_LOG_DIR=$HNREADER_LOG_DIR"
     "HNREADER_APP_VERSION=$HNREADER_APP_VERSION"
@@ -378,6 +426,33 @@ prepare_runtime_dirs() {
   fi
 }
 
+ensure_project_read_access() {
+  if [[ "$APP_USER" == "root" ]]; then
+    return
+  fi
+  case "$PROJECT_DIR" in
+    /home/*)
+      ;;
+    *)
+      return
+      ;;
+  esac
+  if ! command -v setfacl >/dev/null 2>&1; then
+    echo "WARNING: ${PROJECT_DIR} is under /home, but setfacl is unavailable." >&2
+    echo "         Install the acl package or move the repo to /opt/hnreader or /srv/hnreader." >&2
+    return
+  fi
+
+  echo "Granting ${APP_USER} read/traverse ACL for project path under /home."
+  run_root setfacl -R -m "u:${APP_USER}:rX" "$PROJECT_DIR"
+  local parent
+  parent="$(dirname "$PROJECT_DIR")"
+  while [[ "$parent" != "/" && "$parent" != "/home" ]]; do
+    run_root setfacl -m "u:${APP_USER}:x" "$parent"
+    parent="$(dirname "$parent")"
+  done
+}
+
 validate_cloud_sync_config() {
   local enabled
   enabled="$(printf '%s' "$HNREADER_CLOUD_SYNC_ENABLED" | tr '[:upper:]' '[:lower:]')"
@@ -428,9 +503,9 @@ validate_ai_config() {
     echo "       Replace sk-REPLACE_WITH_YOUR_DEEPSEEK_API_KEY or disable RealAiAgent." >&2
     exit 1
   fi
-  if ! run_python_module_current_config server.ops ai-check --no-probe --quiet; then
+  if ! run_python_module_current_config "${SERVER_MODULE}.ops" ai-check --no-probe --quiet; then
     echo "ERROR: AI config failed Python validation." >&2
-    echo "       Run 'bash server/launcher.sh ai-check --no-probe' for details." >&2
+    echo "       Run 'bash ${LAUNCHER_PATH} ai-check --no-probe' for details." >&2
     exit 1
   fi
 }
@@ -464,10 +539,10 @@ validate_admin_alert_config() {
 write_env_file() {
   echo "Writing env file: ${ENV_FILE}"
   write_root_file "$ENV_FILE" 0640 <<EOF
-# Generated by ${PROJECT_DIR}/server/launcher.sh
-# Edit the script configuration block, then run:
-#   bash server/launcher.sh env      # AI-only changes hot-load next round
-#   bash server/launcher.sh restart  # non-AI runtime changes
+# Generated by ${LAUNCHER_PATH}
+# Edit ${PROJECT_ENV_FILE}, then run:
+#   bash ${LAUNCHER_PATH} env      # AI-only changes hot-load next round
+#   bash ${LAUNCHER_PATH} restart  # non-AI runtime changes
 
 $(env_line HNREADER_DB_PATH "$HNREADER_DB_PATH")
 $(env_line HNREADER_LOG_DIR "$HNREADER_LOG_DIR")
@@ -561,7 +636,8 @@ User=${APP_USER}
 Group=${APP_GROUP}
 WorkingDirectory=${PROJECT_DIR}
 EnvironmentFile=-${ENV_FILE}
-ExecStart=${PYTHON_BIN} -c "from server import db; db.init_db()"
+Environment=PYTHONPATH=${PYTHONPATH_ROOT}
+ExecStart=${PYTHON_BIN} -c "from ${SERVER_MODULE} import db; db.init_db()"
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
@@ -593,7 +669,8 @@ User=${APP_USER}
 Group=${APP_GROUP}
 WorkingDirectory=${PROJECT_DIR}
 EnvironmentFile=-${ENV_FILE}
-ExecStart=${PYTHON_BIN} -m server.ingest --loop
+Environment=PYTHONPATH=${PYTHONPATH_ROOT}
+ExecStart=${PYTHON_BIN} -m ${SERVER_MODULE}.ingest --loop
 Restart=always
 RestartSec=10
 TimeoutStopSec=${INGEST_STOP_TIMEOUT_SECONDS}
@@ -638,6 +715,7 @@ install_files() {
   validate_ai_config
   validate_admin_alert_config
   ensure_user
+  ensure_project_read_access
   prepare_runtime_dirs
   write_env_file
   write_db_init_service
@@ -703,21 +781,21 @@ disable_services() {
 write_env_only() {
   if [[ ! -f "${SYSTEMD_DIR}/${DB_INIT_SERVICE}" || ! -f "${SYSTEMD_DIR}/${INGEST_SERVICE}" ]]; then
     echo "ERROR: core systemd units not found under ${SYSTEMD_DIR}." >&2
-    echo "       Run 'bash server/launcher.sh install' first." >&2
+    echo "       Run 'bash ${LAUNCHER_PATH} install' first." >&2
     exit 1
   fi
   validate_cloud_sync_config
   validate_ai_config
   validate_admin_alert_config
   write_env_file
-  echo "Wrote ${ENV_FILE}. Run 'bash server/launcher.sh restart' to apply."
+  echo "Wrote ${ENV_FILE}. Run 'bash ${LAUNCHER_PATH} restart' to apply."
 }
 
 reset_failed_jobs() {
   if [[ ! -f "${SYSTEMD_DIR}/${DB_INIT_SERVICE}" \
         || ! -f "${SYSTEMD_DIR}/${INGEST_SERVICE}" ]]; then
     echo "ERROR: systemd units not found under ${SYSTEMD_DIR}." >&2
-    echo "       Run 'bash server/launcher.sh install' first." >&2
+    echo "       Run 'bash ${LAUNCHER_PATH} install' first." >&2
     exit 1
   fi
   resolve_python
@@ -739,7 +817,7 @@ reset_failed_jobs() {
     "${rw_args[@]}" \
     --property=NoNewPrivileges=yes \
     --property=PrivateTmp=yes \
-    -- "$PYTHON_BIN" -m server.ingest --reset-failed
+    -- env PYTHONPATH="$PYTHONPATH_ROOT" "$PYTHON_BIN" -m "${SERVER_MODULE}.ingest" --reset-failed
 }
 
 # Build a deduplicated list of ``--property=ReadWritePaths=<dir>`` flags into
@@ -796,24 +874,24 @@ backup_db() {
       "${rw_args[@]}" \
       --property=NoNewPrivileges=yes \
       --property=PrivateTmp=yes \
-      -- "$PYTHON_BIN" -m server.db_backup backup "$dst"
+      -- env PYTHONPATH="$PYTHONPATH_ROOT" "$PYTHON_BIN" -m "${SERVER_MODULE}.db_backup" backup "$dst"
   else
     # No installed units yet (fresh dev box). Run inline; the DB file is
     # owned by the current user in that case.
-    HNREADER_DB_PATH="$HNREADER_DB_PATH" \
-      "$PYTHON_BIN" -m server.db_backup backup "$dst"
+    PYTHONPATH="$PYTHONPATH_ROOT" HNREADER_DB_PATH="$HNREADER_DB_PATH" \
+      "$PYTHON_BIN" -m "${SERVER_MODULE}.db_backup" backup "$dst"
   fi
 
   echo "Backup written: ${dst}"
   echo "Recommended: verify the file integrity once more before relying on it:"
-  echo "  bash server/launcher.sh verify-file ${dst}"
+  echo "  bash ${LAUNCHER_PATH} verify-file ${dst}"
 }
 
 restore_db() {
   local src="${1:-}"
   if [[ -z "$src" ]]; then
     echo "ERROR: restore requires a backup file path." >&2
-    echo "       Usage: bash server/launcher.sh restore <path>" >&2
+    echo "       Usage: bash ${LAUNCHER_PATH} restore <path>" >&2
     exit 1
   fi
   if [[ ! -f "$src" ]]; then
@@ -848,10 +926,10 @@ restore_db() {
       "${rw_args[@]}" \
       --property=NoNewPrivileges=yes \
       --property=PrivateTmp=yes \
-      -- "$PYTHON_BIN" -m server.db_backup restore "$src"
+      -- env PYTHONPATH="$PYTHONPATH_ROOT" "$PYTHON_BIN" -m "${SERVER_MODULE}.db_backup" restore "$src"
   else
-    HNREADER_DB_PATH="$HNREADER_DB_PATH" \
-      "$PYTHON_BIN" -m server.db_backup restore "$src"
+    PYTHONPATH="$PYTHONPATH_ROOT" HNREADER_DB_PATH="$HNREADER_DB_PATH" \
+      "$PYTHON_BIN" -m "${SERVER_MODULE}.db_backup" restore "$src"
   fi
 }
 
@@ -877,30 +955,393 @@ verify_db() {
       "${rw_args[@]}" \
       --property=NoNewPrivileges=yes \
       --property=PrivateTmp=yes \
-      -- env HNREADER_DB_PATH="$target" "$PYTHON_BIN" -m server.db_backup verify
+      -- env PYTHONPATH="$PYTHONPATH_ROOT" HNREADER_DB_PATH="$target" "$PYTHON_BIN" -m "${SERVER_MODULE}.db_backup" verify
   else
-    HNREADER_DB_PATH="$target" \
-      "$PYTHON_BIN" -m server.db_backup verify
+    PYTHONPATH="$PYTHONPATH_ROOT" HNREADER_DB_PATH="$target" \
+      "$PYTHON_BIN" -m "${SERVER_MODULE}.db_backup" verify
   fi
 }
 
 ai_check() {
-  run_python_module server.ops ai-check "${@:1}"
+  run_python_module "${SERVER_MODULE}.ops" ai-check "${@:1}"
 }
 
 doctor() {
-  run_python_module server.ops doctor "${@:1}"
+  run_python_module "${SERVER_MODULE}.ops" doctor "${@:1}"
 }
 
 repair() {
-  run_python_module server.ops repair "${@:1}"
+  run_python_module "${SERVER_MODULE}.ops" repair "${@:1}"
 }
 
 metrics() {
-  run_python_module server.ingest --metrics
+  run_python_module "${SERVER_MODULE}.ingest" --metrics
 }
 
-case "${1:-start}" in
+require_tty_for_prompt() {
+  if [[ ! -t 0 ]]; then
+    echo "ERROR: interactive configuration needs a TTY." >&2
+    echo "       Run 'bash ${LAUNCHER_PATH} bootstrap' in an SSH terminal, or create ${PROJECT_ENV_FILE} first." >&2
+    exit 1
+  fi
+}
+
+prompt_value() {
+  local __var_name="$1"
+  local prompt="$2"
+  local default="${3:-}"
+  local value
+  require_tty_for_prompt
+  if [[ -n "$default" ]]; then
+    read -r -p "${prompt} [${default}]: " value
+    value="${value:-$default}"
+  else
+    read -r -p "${prompt}: " value
+  fi
+  printf -v "$__var_name" '%s' "$value"
+}
+
+prompt_secret_value() {
+  local __var_name="$1"
+  local prompt="$2"
+  local value
+  require_tty_for_prompt
+  read -r -s -p "${prompt}: " value
+  printf '\n'
+  printf -v "$__var_name" '%s' "$value"
+}
+
+prompt_required() {
+  local __var_name="$1"
+  local prompt="$2"
+  local default="${3:-}"
+  local value
+  while true; do
+    prompt_value value "$prompt" "$default"
+    if [[ -n "$value" ]]; then
+      printf -v "$__var_name" '%s' "$value"
+      return
+    fi
+    echo "This value is required."
+  done
+}
+
+prompt_yes_no() {
+  local __var_name="$1"
+  local prompt="$2"
+  local default="${3:-no}"
+  local suffix value normalized
+  require_tty_for_prompt
+  if [[ "$default" == "yes" ]]; then
+    suffix="[Y/n]"
+  else
+    suffix="[y/N]"
+  fi
+  while true; do
+    read -r -p "${prompt} ${suffix}: " value
+    value="${value:-$default}"
+    normalized="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+    case "$normalized" in
+      y|yes)
+        printf -v "$__var_name" '%s' "yes"
+        return
+        ;;
+      n|no)
+        printf -v "$__var_name" '%s' "no"
+        return
+        ;;
+    esac
+    echo "Please answer yes or no."
+  done
+}
+
+json_string() {
+  python3 -c 'import json, sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' "$1"
+}
+
+build_single_ai_config_json() {
+  local name="$1"
+  local api_key="$2"
+  local model="$3"
+  local base_url="$4"
+  local balance_url="$5"
+  printf '[{"name":%s,"api_key":%s,"model":%s,"base_url":%s,"balance_url":%s,"timeout_seconds":120,"max_concurrent_requests":1,"max_output_tokens":8000}]' \
+    "$(json_string "$name")" \
+    "$(json_string "$api_key")" \
+    "$(json_string "$model")" \
+    "$(json_string "$base_url")" \
+    "$(json_string "$balance_url")"
+}
+
+require_ubuntu_2204() {
+  if [[ "${HNREADER_ALLOW_NON_UBUNTU:-}" == "1" ]]; then
+    return
+  fi
+  if [[ ! -r /etc/os-release ]]; then
+    echo "ERROR: cannot verify OS; this bootstrap targets Ubuntu 22.04." >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "22.04" ]]; then
+    echo "ERROR: this bootstrap targets Ubuntu 22.04; detected ${PRETTY_NAME:-unknown}." >&2
+    echo "       Set HNREADER_ALLOW_NON_UBUNTU=1 only if you accept the risk." >&2
+    exit 1
+  fi
+}
+
+install_system_dependencies() {
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "ERROR: apt-get not found; this bootstrap is for Ubuntu 22.04." >&2
+    exit 1
+  fi
+  echo "Installing Ubuntu system dependencies..."
+  run_root apt-get update
+  run_root apt-get install -y python3 python3-venv python3-pip git curl ufw sqlite3 acl
+}
+
+ensure_virtualenv() {
+  if [[ ! -f "$REQUIREMENTS_FILE" || ! -f "$CONSTRAINTS_FILE" ]]; then
+    echo "ERROR: dependency files not found:" >&2
+    echo "       ${REQUIREMENTS_FILE}" >&2
+    echo "       ${CONSTRAINTS_FILE}" >&2
+    exit 1
+  fi
+  if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "Creating Python virtualenv: ${PROJECT_DIR}/.venv"
+    python3 -m venv "${PROJECT_DIR}/.venv"
+  fi
+  ensure_pythonpath_bridge
+  echo "Installing Python dependencies..."
+  "$PYTHON_BIN" -m pip install --upgrade pip
+  "$PYTHON_BIN" -m pip install -r "$REQUIREMENTS_FILE" -c "$CONSTRAINTS_FILE"
+}
+
+write_project_env_from_answers() {
+  local ai_provider="$1"
+  local ai_configs="$2"
+  local cloud_enabled="$3"
+  local cloud_url="$4"
+  local cloud_secret="$5"
+  local email_enabled="$6"
+  local email_to="$7"
+  local smtp_host="$8"
+  local smtp_port="$9"
+  local smtp_username="${10}"
+  local smtp_from="${11}"
+  local smtp_password="${12}"
+  local smtp_starttls="${13}"
+  local smtp_ssl="${14}"
+
+  echo "Writing guided config: ${PROJECT_ENV_FILE}"
+  umask 077
+  cat >"$PROJECT_ENV_FILE" <<EOF
+# Generated by launcher.sh bootstrap.
+# Edit this file, then run: bash ${LAUNCHER_PATH} restart
+#
+# Fallback examples kept here for reference:
+# HNREADER_AI_PROVIDER=none
+# HNREADER_CLOUD_SYNC_ENABLED=1
+# HNREADER_CLOUD_PUSH_URL=
+# HNREADER_CLOUD_PUSH_SECRET=
+# HNREADER_ADMIN_EMAIL_ENABLED=false
+
+HNREADER_AI_PROVIDER=${ai_provider}
+HNREADER_AI_CONFIGS=${ai_configs}
+HNREADER_AI_CONFIG_FILE=${ENV_FILE}
+
+HNREADER_CLOUD_SYNC_ENABLED=${cloud_enabled}
+HNREADER_CLOUD_PUSH_URL=${cloud_url}
+HNREADER_CLOUD_PUSH_SECRET=${cloud_secret}
+
+HNREADER_ADMIN_EMAIL_ENABLED=${email_enabled}
+HNREADER_ADMIN_EMAIL_TO=${email_to}
+HNREADER_SMTP_HOST=${smtp_host}
+HNREADER_SMTP_PORT=${smtp_port}
+HNREADER_SMTP_USERNAME=${smtp_username}
+HNREADER_SMTP_FROM=${smtp_from}
+HNREADER_SMTP_PASSWORD=${smtp_password}
+HNREADER_SMTP_STARTTLS=${smtp_starttls}
+HNREADER_SMTP_SSL=${smtp_ssl}
+EOF
+  chmod 600 "$PROJECT_ENV_FILE"
+}
+
+run_interactive_config_wizard() {
+  local rewrite_config="yes"
+  if [[ -f "$PROJECT_ENV_FILE" ]]; then
+    prompt_yes_no rewrite_config "Config file ${PROJECT_ENV_FILE} already exists. Keep it unchanged" "yes"
+    if [[ "$rewrite_config" == "yes" ]]; then
+      echo "Keeping existing ${PROJECT_ENV_FILE}."
+      load_env_file "$PROJECT_ENV_FILE"
+      return
+    fi
+  fi
+
+  echo
+  echo "HN Reader first-run config wizard"
+  echo "Values are written to ${PROJECT_ENV_FILE} with mode 600."
+
+  local enable_ai ai_provider ai_configs
+  local ai_name ai_api_key ai_model ai_base_url ai_balance_url
+  prompt_yes_no enable_ai "Enable AI enrichment now" "no"
+  if [[ "$enable_ai" == "yes" ]]; then
+    ai_provider="enabled"
+    prompt_value ai_name "AI provider display name" "DeepSeek"
+    prompt_secret_value ai_api_key "AI API key"
+    while [[ -z "$ai_api_key" ]]; do
+      echo "AI API key is required when AI enrichment is enabled."
+      prompt_secret_value ai_api_key "AI API key"
+    done
+    prompt_value ai_model "AI model" "deepseek-v4-flash"
+    prompt_value ai_base_url "AI OpenAI-compatible base URL" "https://api.deepseek.com"
+    prompt_value ai_balance_url "AI balance/status URL" "https://api.deepseek.com/user/balance"
+    ai_configs="$(build_single_ai_config_json "$ai_name" "$ai_api_key" "$ai_model" "$ai_base_url" "$ai_balance_url")"
+  else
+    ai_provider="none"
+    ai_configs=""
+  fi
+
+  local enable_cloud cloud_enabled cloud_url cloud_secret generate_secret
+  prompt_yes_no enable_cloud "Enable WeChat cloud sync after each ingest round" "yes"
+  if [[ "$enable_cloud" == "yes" ]]; then
+    cloud_enabled="1"
+    prompt_required cloud_url "pushSync HTTPS trigger URL"
+    prompt_secret_value cloud_secret "PUSH_SECRET / HNREADER_CLOUD_PUSH_SECRET (64 hex; leave blank to generate)"
+    while [[ ! "$cloud_secret" =~ ^[0-9A-Fa-f]{64}$ ]]; do
+      if [[ -n "$cloud_secret" ]]; then
+        echo "Cloud push secret must be exactly 64 hexadecimal characters."
+      fi
+      prompt_yes_no generate_secret "Generate a new 64-hex secret now" "yes"
+      if [[ "$generate_secret" == "yes" ]]; then
+        cloud_secret="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+        echo "Generated cloud secret. Set the same value as PUSH_SECRET on the pushSync cloud function:"
+        echo "$cloud_secret"
+      else
+        prompt_secret_value cloud_secret "PUSH_SECRET / HNREADER_CLOUD_PUSH_SECRET (64 hex)"
+      fi
+    done
+  else
+    cloud_enabled="0"
+    cloud_url=""
+    cloud_secret=""
+  fi
+
+  local enable_email email_enabled email_to smtp_host smtp_port smtp_username smtp_from smtp_password smtp_starttls smtp_ssl
+  prompt_yes_no enable_email "Enable admin alert email now" "no"
+  if [[ "$enable_email" == "yes" ]]; then
+    email_enabled="true"
+    prompt_required email_to "Admin alert recipient email"
+    prompt_value smtp_host "SMTP host" "smtp.163.com"
+    prompt_value smtp_port "SMTP port" "465"
+    prompt_value smtp_username "SMTP username" "$email_to"
+    prompt_value smtp_from "SMTP from address" "$smtp_username"
+    prompt_secret_value smtp_password "SMTP password / client authorization code"
+    while [[ -n "$smtp_username" && -z "$smtp_password" ]]; do
+      echo "SMTP password is required when SMTP username is set."
+      prompt_secret_value smtp_password "SMTP password / client authorization code"
+    done
+    prompt_value smtp_ssl "Use SMTP SSL" "true"
+    prompt_value smtp_starttls "Use SMTP STARTTLS" "false"
+  else
+    email_enabled="false"
+    email_to=""
+    smtp_host="smtp.163.com"
+    smtp_port="465"
+    smtp_username=""
+    smtp_from=""
+    smtp_password=""
+    smtp_starttls="false"
+    smtp_ssl="true"
+  fi
+
+  write_project_env_from_answers \
+    "$ai_provider" "$ai_configs" \
+    "$cloud_enabled" "$cloud_url" "$cloud_secret" \
+    "$email_enabled" "$email_to" "$smtp_host" "$smtp_port" \
+    "$smtp_username" "$smtp_from" "$smtp_password" "$smtp_starttls" "$smtp_ssl"
+
+  HNREADER_AI_PROVIDER="$ai_provider"
+  HNREADER_AI_CONFIGS="$ai_configs"
+  HNREADER_AI_CONFIG_FILE="$ENV_FILE"
+  HNREADER_CLOUD_SYNC_ENABLED="$cloud_enabled"
+  HNREADER_CLOUD_PUSH_URL="$cloud_url"
+  HNREADER_CLOUD_PUSH_SECRET="$cloud_secret"
+  HNREADER_ADMIN_EMAIL_ENABLED="$email_enabled"
+  HNREADER_ADMIN_EMAIL_TO="$email_to"
+  HNREADER_SMTP_HOST="$smtp_host"
+  HNREADER_SMTP_PORT="$smtp_port"
+  HNREADER_SMTP_USERNAME="$smtp_username"
+  HNREADER_SMTP_FROM="$smtp_from"
+  HNREADER_SMTP_PASSWORD="$smtp_password"
+  HNREADER_SMTP_STARTTLS="$smtp_starttls"
+  HNREADER_SMTP_SSL="$smtp_ssl"
+}
+
+configure_ufw_interactive() {
+  local enable_ufw
+  prompt_yes_no enable_ufw "Configure UFW now (allow OpenSSH only; no HTTP ports)" "no"
+  if [[ "$enable_ufw" != "yes" ]]; then
+    return
+  fi
+  run_root ufw allow OpenSSH
+  run_root ufw --force enable
+  run_root ufw status
+}
+
+configure_backup_timer_interactive() {
+  local enable_timer
+  prompt_yes_no enable_timer "Install a daily 03:00 SQLite backup timer" "no"
+  if [[ "$enable_timer" != "yes" ]]; then
+    return
+  fi
+  write_root_file "${SYSTEMD_DIR}/${SERVICE_PREFIX}-backup.service" 0644 <<EOF
+[Unit]
+Description=HN Reader daily SQLite backup
+After=${DB_INIT_SERVICE}
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash ${LAUNCHER_PATH} backup
+EOF
+  write_root_file "${SYSTEMD_DIR}/${SERVICE_PREFIX}-backup.timer" 0644 <<EOF
+[Unit]
+Description=Run HN Reader backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  run_root systemctl daemon-reload
+  run_root systemctl enable --now "${SERVICE_PREFIX}-backup.timer"
+  run_root systemctl list-timers "${SERVICE_PREFIX}-backup.timer" --no-pager || true
+}
+
+bootstrap_ubuntu22() {
+  require_ubuntu_2204
+  install_system_dependencies
+  ensure_virtualenv
+  run_interactive_config_wizard
+  start_services
+  configure_ufw_interactive
+  configure_backup_timer_interactive
+  cat <<EOF
+
+Bootstrap finished. Useful commands:
+  bash ${LAUNCHER_PATH} status
+  bash ${LAUNCHER_PATH} logs
+  bash ${LAUNCHER_PATH} doctor
+  bash ${LAUNCHER_PATH} backup
+EOF
+}
+
+case "${1:-bootstrap}" in
+  bootstrap)
+    bootstrap_ubuntu22
+    ;;
   install|start)
     start_services
     ;;
