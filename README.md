@@ -17,7 +17,7 @@ configuration, writes systemd units, and starts the sync-only service.
 
 During the guided setup you will be asked for:
 
-- AI config, or `none` to use fallback output.
+- One or more AI configs, or `none` to use fallback output.
 - WeChat `pushSync` HTTP trigger URL and `PUSH_SECRET`.
 - Optional admin alert email settings.
 - Optional UFW setup. It allows only OpenSSH; this server exposes no HTTP port.

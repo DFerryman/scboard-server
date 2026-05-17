@@ -1153,18 +1153,33 @@ json_string() {
   python3 -c 'import json, sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' "$1"
 }
 
-build_single_ai_config_json() {
+build_ai_config_object_json() {
   local name="$1"
   local api_key="$2"
   local model="$3"
   local base_url="$4"
   local balance_url="$5"
-  printf '[{"name":%s,"api_key":%s,"model":%s,"base_url":%s,"balance_url":%s,"timeout_seconds":120,"max_concurrent_requests":1,"max_output_tokens":8000}]' \
+  printf '{"name":%s,"api_key":%s,"model":%s,"base_url":%s,"balance_url":%s,"timeout_seconds":120,"max_concurrent_requests":1,"max_output_tokens":8000}' \
     "$(json_string "$name")" \
     "$(json_string "$api_key")" \
     "$(json_string "$model")" \
     "$(json_string "$base_url")" \
     "$(json_string "$balance_url")"
+}
+
+build_ai_configs_json() {
+  local first=1
+  local config
+  printf '['
+  for config in "$@"; do
+    if (( first )); then
+      first=0
+    else
+      printf ','
+    fi
+    printf '%s' "$config"
+  done
+  printf ']'
 }
 
 require_ubuntu_2204() {
@@ -1277,20 +1292,36 @@ run_interactive_config_wizard() {
   echo "Values are written to ${PROJECT_ENV_FILE} with mode 600."
 
   local enable_ai ai_provider ai_configs
-  local ai_name ai_api_key ai_model ai_base_url ai_balance_url
   prompt_yes_no enable_ai "Enable AI enrichment now" "no"
   if [[ "$enable_ai" == "yes" ]]; then
     ai_provider="enabled"
-    prompt_value ai_name "AI provider display name" "DeepSeek"
-    prompt_secret_value ai_api_key "AI API key"
-    while [[ -z "$ai_api_key" ]]; do
-      echo "AI API key is required when AI enrichment is enabled."
-      prompt_secret_value ai_api_key "AI API key"
+    local ai_config_objects=()
+    local ai_index=1
+    local add_another_ai="yes"
+    while [[ "$add_another_ai" == "yes" ]]; do
+      local ai_name ai_api_key ai_model ai_base_url ai_balance_url
+      local default_ai_name="DeepSeek"
+      if (( ai_index == 2 )); then
+        default_ai_name="DeepSeek backup"
+      elif (( ai_index > 2 )); then
+        default_ai_name="DeepSeek backup ${ai_index}"
+      fi
+
+      prompt_value ai_name "AI config #${ai_index} display name" "$default_ai_name"
+      prompt_secret_value ai_api_key "AI config #${ai_index} API key"
+      while [[ -z "$ai_api_key" ]]; do
+        echo "AI API key is required when AI enrichment is enabled."
+        prompt_secret_value ai_api_key "AI config #${ai_index} API key"
+      done
+      prompt_value ai_model "AI config #${ai_index} model" "deepseek-v4-flash"
+      prompt_value ai_base_url "AI config #${ai_index} OpenAI-compatible base URL" "https://api.deepseek.com"
+      prompt_value ai_balance_url "AI config #${ai_index} balance/status URL" "https://api.deepseek.com/user/balance"
+      ai_config_objects+=("$(build_ai_config_object_json "$ai_name" "$ai_api_key" "$ai_model" "$ai_base_url" "$ai_balance_url")")
+
+      prompt_yes_no add_another_ai "Add another AI provider/model config" "no"
+      ai_index=$((ai_index + 1))
     done
-    prompt_value ai_model "AI model" "deepseek-v4-flash"
-    prompt_value ai_base_url "AI OpenAI-compatible base URL" "https://api.deepseek.com"
-    prompt_value ai_balance_url "AI balance/status URL" "https://api.deepseek.com/user/balance"
-    ai_configs="$(build_single_ai_config_json "$ai_name" "$ai_api_key" "$ai_model" "$ai_base_url" "$ai_balance_url")"
+    ai_configs="$(build_ai_configs_json "${ai_config_objects[@]}")"
   else
     ai_provider="none"
     ai_configs=""
