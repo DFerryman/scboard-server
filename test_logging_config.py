@@ -112,8 +112,7 @@ class DailyLoggingConfigTest(unittest.TestCase):
         )
         self.assertIn('$(env_line HNREADER_LOG_DIR "$HNREADER_LOG_DIR")', launcher)
         self.assertIn(
-            'run_root mkdir -p "$(dirname "$HNREADER_DB_PATH")" '
-            '"$HNREADER_LOG_DIR" "$ENV_DIR"',
+            'run_root mkdir -p "$db_dir" "$HNREADER_LOG_DIR" "$ENV_DIR"',
             launcher,
         )
         self.assertGreaterEqual(
@@ -121,6 +120,57 @@ class DailyLoggingConfigTest(unittest.TestCase):
             2,
         )
         self.assertIn('_rw_property_args rw_args "$db_dir" "$HNREADER_LOG_DIR"', launcher)
+
+    def test_launcher_guards_recursive_chown_runtime_dirs(self) -> None:
+        launcher = Path(__file__).with_name("launcher.sh").read_text(encoding="utf-8")
+
+        self.assertIn("assert_safe_chown_dir()", launcher)
+        self.assertIn("_DANGEROUS_CHOWN_DIRS=(", launcher)
+        self.assertIn('"/var/lib"', launcher)
+        self.assertIn('"/var/log"', launcher)
+        self.assertIn(
+            'assert_safe_chown_dir "$db_dir" "HNREADER_DB_PATH directory"',
+            launcher,
+        )
+        self.assertIn(
+            'assert_safe_chown_dir "$HNREADER_LOG_DIR" "HNREADER_LOG_DIR"',
+            launcher,
+        )
+
+    def test_launcher_writes_env_file_readable_by_service_group(self) -> None:
+        launcher = Path(__file__).with_name("launcher.sh").read_text(encoding="utf-8")
+
+        self.assertIn("write_root_file_owned()", launcher)
+        self.assertIn(
+            'run_root install -D -m "$mode" -o "$owner" -g "$group" "$tmp" "$target"',
+            launcher,
+        )
+        self.assertIn(
+            'write_root_file_owned "$ENV_FILE" 0640 root "$APP_GROUP"',
+            launcher,
+        )
+        self.assertIn('run_root chmod 0755 "$ENV_DIR"', launcher)
+
+    def test_launcher_runs_full_runtime_validation_before_env_write(self) -> None:
+        launcher = Path(__file__).with_name("launcher.sh").read_text(encoding="utf-8")
+
+        self.assertIn("validate_runtime_config()", launcher)
+        self.assertIn(
+            'run_python_module_current_config "${SERVER_MODULE}.ops" config-check --quiet',
+            launcher,
+        )
+        self.assertLess(
+            launcher.index("validate_runtime_config"),
+            launcher.index("write_env_file"),
+        )
+
+    def test_launcher_disables_backup_timer_with_core_services(self) -> None:
+        launcher = Path(__file__).with_name("launcher.sh").read_text(encoding="utf-8")
+
+        self.assertIn("disable_backup_timer()", launcher)
+        self.assertIn('local backup_timer="${SERVICE_PREFIX}-backup.timer"', launcher)
+        self.assertIn('run_root systemctl disable --now "$backup_timer"', launcher)
+        self.assertIn("disable_backup_timer\n", launcher)
 
 
 class LauncherUbuntuBootstrapContractTest(unittest.TestCase):

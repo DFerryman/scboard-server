@@ -5476,6 +5476,53 @@ class AiAgentStrictBuilder(unittest.TestCase):
         self.assertIn("not valid JSON", status["config_error"])
 
 
+class RuntimeConfigCheck(unittest.TestCase):
+    def _save(self):
+        return (
+            settings.CLOUD_SYNC_ENABLED,
+            settings.CLOUD_PUSH_URL,
+            settings.CLOUD_PUSH_SECRET,
+        )
+
+    def _restore(self, saved) -> None:
+        (
+            settings.CLOUD_SYNC_ENABLED,
+            settings.CLOUD_PUSH_URL,
+            settings.CLOUD_PUSH_SECRET,
+        ) = saved
+
+    def test_config_check_rejects_unsafe_cloud_push_url_before_install(self):
+        from . import ops
+
+        saved = self._save()
+        try:
+            settings.CLOUD_SYNC_ENABLED = True  # type: ignore[assignment]
+            settings.CLOUD_PUSH_URL = "http://127.0.0.1/pushSync"  # type: ignore[assignment]
+            settings.CLOUD_PUSH_SECRET = VALID_CLOUD_PUSH_SECRET  # type: ignore[assignment]
+
+            status = ops.collect_runtime_config_check()
+        finally:
+            self._restore(saved)
+
+        self.assertEqual(status["status"], "err")
+        self.assertIn("CLOUD_PUSH_URL must use https", status["error"])
+
+    def test_config_check_accepts_disabled_cloud_sync_without_url(self):
+        from . import ops
+
+        saved = self._save()
+        try:
+            settings.CLOUD_SYNC_ENABLED = False  # type: ignore[assignment]
+            settings.CLOUD_PUSH_URL = ""  # type: ignore[assignment]
+            settings.CLOUD_PUSH_SECRET = ""  # type: ignore[assignment]
+
+            status = ops.collect_runtime_config_check()
+        finally:
+            self._restore(saved)
+
+        self.assertEqual(status["status"], "ok")
+
+
 class RealAiAgentDigestIntroFailure(unittest.TestCase):
     """A.#7: a failed Real-agent digest call must propagate so the round
     fails and alerts, rather than silently publishing an empty intro."""
@@ -6686,6 +6733,61 @@ class SupervisorChildFailureCleanup(_SqliteCase):
         self.assertIn("--verbose", cmd)
         self.assertIn("loop-run", cmd)
         self.assertTrue(sleep_durations)
+
+    def test_supervisor_child_module_follows_current_package_name(self):
+        class DummyLock:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                return None
+
+        class FakeProc:
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+        popen_calls = []
+
+        def fake_popen(cmd, env=None):
+            popen_calls.append(cmd)
+            return FakeProc()
+
+        def stop_while_idle(_duration):
+            raise ingest_module._SupervisorShutdown(getattr(signal, "SIGTERM", 15))
+
+        with patch.object(
+            ingest_module, "__package__", "custompkg"
+        ), patch.object(
+            ingest_module, "_SupervisorInstanceLock", return_value=DummyLock()
+        ), patch.object(
+            ingest_module, "_install_supervisor_shutdown_handlers", return_value={}
+        ), patch.object(
+            ingest_module, "_restore_supervisor_shutdown_handlers"
+        ), patch.object(
+            ingest_module, "_clear_stop_flag"
+        ), patch.object(
+            ingest_module, "_check_stop_flag"
+        ), patch.object(
+            ingest_module, "_recover_abandoned_running_runs", return_value=[]
+        ), patch.object(
+            ingest_module, "_new_run_id", return_value="custom-module-run"
+        ), patch.object(
+            ingest_module.subprocess, "Popen", side_effect=fake_popen
+        ), patch.object(
+            ingest_module, "_sleep_or_stop", side_effect=stop_while_idle
+        ):
+            rc = ingest_module.run_supervisor_loop(
+                interval_seconds=5,
+                round_timeout_seconds=3,
+                digest_reserved_seconds=1,
+                verbose=False,
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(popen_calls[0][2], "custompkg.ingest")
 
     def test_supervisor_loop_alerts_and_backs_off_after_child_failure(self):
         class DummyLock:

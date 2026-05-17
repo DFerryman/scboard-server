@@ -130,6 +130,36 @@ def _ai_check_exit_ok(status: Mapping[str, Any]) -> bool:
     return str(status.get("status") or "") in ("disabled", "parse_ok", "ok")
 
 
+def collect_runtime_config_check() -> Dict[str, Any]:
+    """Validate non-AI runtime settings before launcher writes systemd env.
+
+    Importing this module has already loaded ``settings``, so malformed numeric,
+    boolean, range, and timezone values fail before this function is reached.
+    The explicit checks below cover config whose validation lives closer to the
+    runtime boundary, such as cloud push URL/secret safety.
+    """
+
+    try:
+        if settings.CLOUD_SYNC_ENABLED:
+            from .cloud_push import validate_cloud_push_secret, validate_cloud_push_url
+
+            validate_cloud_push_url(settings.CLOUD_PUSH_URL)
+            validate_cloud_push_secret(settings.CLOUD_PUSH_SECRET)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "err",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "status": "ok",
+        "cloud_sync_enabled": bool(settings.CLOUD_SYNC_ENABLED),
+    }
+
+
+def _runtime_config_check_exit_ok(status: Mapping[str, Any]) -> bool:
+    return str(status.get("status") or "") == "ok"
+
+
 def _ai_config_sources() -> Sequence[Mapping[str, str]]:
     sources = settings.get_ai_config_sources()
     if sources:
@@ -185,6 +215,12 @@ def _print_ai_check(status: Mapping[str, Any]) -> None:
             if item.get("message"):
                 parts.append(f"message={item.get('message')}")
             _print_line("  " + " ".join(part for part in parts if part))
+
+
+def _print_runtime_config_check(status: Mapping[str, Any]) -> None:
+    _print_line(f"Runtime config status: {status.get('status')}")
+    if status.get("error"):
+        _print_line(f"Runtime config error: {status.get('error')}")
 
 
 def _row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
@@ -592,6 +628,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ai_parser.add_argument("--json", action="store_true", help="print JSON")
     ai_parser.add_argument("--quiet", action="store_true", help="suppress success output")
 
+    config_parser = sub.add_parser(
+        "config-check",
+        help="validate non-AI runtime config without touching the DB",
+    )
+    config_parser.add_argument("--json", action="store_true", help="print JSON")
+    config_parser.add_argument("--quiet", action="store_true", help="suppress success output")
+
     doctor_parser = sub.add_parser("doctor", help="run local production diagnostics")
     doctor_parser.add_argument("--no-probe-ai", action="store_true", help="skip AI network probes")
     doctor_parser.add_argument("--json", action="store_true", help="print JSON")
@@ -610,6 +653,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif not args.quiet or not _ai_check_exit_ok(status):
             _print_ai_check(status)
         return 0 if _ai_check_exit_ok(status) else 1
+
+    if args.cmd == "config-check":
+        status = collect_runtime_config_check()
+        if args.json:
+            _print_json(status)
+        elif not args.quiet or not _runtime_config_check_exit_ok(status):
+            _print_runtime_config_check(status)
+        return 0 if _runtime_config_check_exit_ok(status) else 1
 
     if args.cmd == "doctor":
         status = collect_doctor(probe_ai=not args.no_probe_ai)

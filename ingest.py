@@ -2830,6 +2830,13 @@ def _supervisor_failure_sleep_seconds(consecutive_failures: int) -> float:
     return float(min(300, base * (2 ** exponent)))
 
 
+def _current_ingest_module_name() -> str:
+    package = (__package__ or "").strip()
+    if package:
+        return f"{package}.ingest"
+    return "server.ingest"
+
+
 def run_supervisor_loop(
     *,
     interval_seconds: int,
@@ -2864,7 +2871,7 @@ def run_supervisor_loop(
             cmd = [
                 sys.executable,
                 "-m",
-                "server.ingest",
+                _current_ingest_module_name(),
                 "--once",
                 "--child",
                 "--run-id",

@@ -131,7 +131,8 @@ Stop the systemd services without disabling them.
 bash launcher.sh disable
 ```
 
-Stop and disable the systemd services.
+Stop and disable the systemd services. If the optional daily backup timer was
+installed during bootstrap, it is disabled too.
 
 ```bash
 bash launcher.sh help
