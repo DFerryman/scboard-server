@@ -213,14 +213,14 @@ HNREADER_AI_ENRICH_COMMENT_MAX_CHARS="${HNREADER_AI_ENRICH_COMMENT_MAX_CHARS:-24
 
 # ---------- Admin alert email ----------
 
-HNREADER_ADMIN_EMAIL_ENABLED="${HNREADER_ADMIN_EMAIL_ENABLED:-false}"
-HNREADER_ADMIN_EMAIL_TO="${HNREADER_ADMIN_EMAIL_TO:-}"
-HNREADER_SMTP_HOST="${HNREADER_SMTP_HOST:-}"
-HNREADER_SMTP_PORT="${HNREADER_SMTP_PORT:-587}"
-HNREADER_SMTP_USERNAME="${HNREADER_SMTP_USERNAME:-}"
+HNREADER_ADMIN_EMAIL_ENABLED="${HNREADER_ADMIN_EMAIL_ENABLED:-true}"
+HNREADER_ADMIN_EMAIL_TO="${HNREADER_ADMIN_EMAIL_TO:-hacker_news@163.com}"
+HNREADER_SMTP_HOST="${HNREADER_SMTP_HOST:-smtp.163.com}"
+HNREADER_SMTP_PORT="${HNREADER_SMTP_PORT:-25}"
+HNREADER_SMTP_USERNAME="${HNREADER_SMTP_USERNAME:-hacker_news@163.com}"
 HNREADER_SMTP_PASSWORD="${HNREADER_SMTP_PASSWORD:-}"
-HNREADER_SMTP_FROM="${HNREADER_SMTP_FROM:-}"
-HNREADER_SMTP_STARTTLS="${HNREADER_SMTP_STARTTLS:-true}"
+HNREADER_SMTP_FROM="${HNREADER_SMTP_FROM:-hacker_news@163.com}"
+HNREADER_SMTP_STARTTLS="${HNREADER_SMTP_STARTTLS:-false}"
 HNREADER_SMTP_SSL="${HNREADER_SMTP_SSL:-false}"
 HNREADER_ALERT_COOLDOWN_SECONDS="${HNREADER_ALERT_COOLDOWN_SECONDS:-1800}"
 HNREADER_ALERT_OUTBOX_MAX_RECORDS="${HNREADER_ALERT_OUTBOX_MAX_RECORDS:-1000}"
@@ -1253,7 +1253,7 @@ write_project_env_from_answers() {
 # HNREADER_CLOUD_SYNC_ENABLED=1
 # HNREADER_CLOUD_PUSH_URL=
 # HNREADER_CLOUD_PUSH_SECRET=
-# HNREADER_ADMIN_EMAIL_ENABLED=false
+# HNREADER_ADMIN_EMAIL_ENABLED=true
 
 HNREADER_AI_PROVIDER=${ai_provider}
 HNREADER_AI_CONFIGS=${ai_configs}
@@ -1353,12 +1353,12 @@ run_interactive_config_wizard() {
   fi
 
   local enable_email email_enabled email_to smtp_host smtp_port smtp_username smtp_from smtp_password smtp_starttls smtp_ssl
-  prompt_yes_no enable_email "Enable admin alert email now" "no"
+  prompt_yes_no enable_email "Enable admin alert email now" "yes"
   if [[ "$enable_email" == "yes" ]]; then
     email_enabled="true"
-    prompt_required email_to "Admin alert recipient email"
+    prompt_value email_to "Admin alert recipient email" "hacker_news@163.com"
     prompt_value smtp_host "SMTP host" "smtp.163.com"
-    prompt_value smtp_port "SMTP port" "465"
+    prompt_value smtp_port "SMTP port" "25"
     prompt_value smtp_username "SMTP username" "$email_to"
     prompt_value smtp_from "SMTP from address" "$smtp_username"
     prompt_secret_value smtp_password "SMTP password / client authorization code"
@@ -1366,18 +1366,18 @@ run_interactive_config_wizard() {
       echo "SMTP password is required when SMTP username is set."
       prompt_secret_value smtp_password "SMTP password / client authorization code"
     done
-    prompt_value smtp_ssl "Use SMTP SSL" "true"
+    prompt_value smtp_ssl "Use SMTP SSL" "false"
     prompt_value smtp_starttls "Use SMTP STARTTLS" "false"
   else
     email_enabled="false"
-    email_to=""
+    email_to="hacker_news@163.com"
     smtp_host="smtp.163.com"
-    smtp_port="465"
-    smtp_username=""
-    smtp_from=""
+    smtp_port="25"
+    smtp_username="hacker_news@163.com"
+    smtp_from="hacker_news@163.com"
     smtp_password=""
     smtp_starttls="false"
-    smtp_ssl="true"
+    smtp_ssl="false"
   fi
 
   write_project_env_from_answers \
