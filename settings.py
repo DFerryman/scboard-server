@@ -287,12 +287,10 @@ ENRICH_MAX_ATTEMPTS = _require_int_range(
     max_value=20,
 )
 # Default kept in lockstep with ``server/launcher.sh`` and ``server/launcher.bat``.
-# With per-story
-# output budget = ``_ENRICH_OUTPUT_TOKENS_PER_STORY`` (2400 in ai_agent.py),
-# desired = batch * 2400. DeepSeek V4 Flash caps at 8192 → batch=3 leaves a
-# ~1k headroom; batch>=4 risks truncation on every full request. A naked
-# ``python -m server.ingest`` (no launcher) used to default to 20, which
-# guaranteed truncation. Match the launcher to keep the safe default safe.
+# Real AI agents further cap this from provider max_output_tokens. With the
+# current 3200-token per-story output budget, an 8000-token provider runs two
+# stories per batch; if no provider cap is available, the configured default
+# still prevents the old naked ``python -m server.ingest`` batch=20 truncation.
 ENRICH_BATCH_SIZE = _require_int_range(
     "HNREADER_ENRICH_BATCH_SIZE",
     _env_int(

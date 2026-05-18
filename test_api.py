@@ -5882,8 +5882,8 @@ class RealAiAgentBatchAndSelection(unittest.TestCase):
                 )
             ]
         )
-        # 8192 // _ENRICH_OUTPUT_TOKENS_PER_STORY (2400) == 3
-        self.assertEqual(agent.recommended_enrich_batch_size(20), 3)
+        # 8192 // _ENRICH_OUTPUT_TOKENS_PER_STORY (3200) == 2
+        self.assertEqual(agent.recommended_enrich_batch_size(20), 2)
 
     def test_real_agent_uses_smallest_config_output_cap(self):
         agent = RealAiAgent(
@@ -5904,7 +5904,7 @@ class RealAiAgentBatchAndSelection(unittest.TestCase):
                 ),
             ]
         )
-        # min(8192, 3200) // _ENRICH_OUTPUT_TOKENS_PER_STORY (2400) == 1
+        # min(8192, 3200) // _ENRICH_OUTPUT_TOKENS_PER_STORY (3200) == 1
         self.assertEqual(agent.recommended_enrich_batch_size(20), 1)
 
 

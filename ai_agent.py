@@ -64,11 +64,12 @@ _MAX_INSIGHT_TEXT_CHARS = 280
 _MAX_TERM_CHARS = 48
 _MAX_TERM_DEF_CHARS = 180
 # Output budget per story for the enrich JSON (titleZh + summary +
-# discussionThemes + insights + terms). Chinese summaries run ~600-900 tokens;
-# 2400 leaves
-# headroom so providers don't truncate the JSON and force a reparse. With
-# batch=3 the desired total is 7200, which stays under DeepSeek's 8192 cap.
-_ENRICH_OUTPUT_TOKENS_PER_STORY = 2400
+# discussionThemes + insights + terms). Some providers, especially DeepSeek
+# V4 Flash, occasionally need more than 2400 tokens to finish strict JSON for
+# comment-heavy stories. 3200 gives single-story retries enough room; batch
+# size is capped from provider max_output_tokens so an 8000-token provider
+# automatically runs two stories per batch instead of three.
+_ENRICH_OUTPUT_TOKENS_PER_STORY = 3200
 
 
 def _loads_json_from_model_text(content: str) -> Any:
