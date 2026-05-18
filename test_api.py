@@ -8717,7 +8717,15 @@ class DashboardProjectionContract(_SqliteCase):
             deadline_at=now + 60,
             status="completed",
             finished_at=now - 10,
-            ai_usage={"total_tokens": 1234, "cost": 0.001},
+            ai_usage={
+                "requests": 2,
+                "total_tokens": 1234,
+                "cost": 0.001,
+                "by_step": {"story": {"total_tokens": 1000}},
+                "by_model": [
+                    {"model": "deepseek-v4-flash", "total_tokens": 1234},
+                ],
+            },
         )
         conn = db.connect()
         try:
@@ -8765,6 +8773,12 @@ class DashboardProjectionContract(_SqliteCase):
         # that prefix for versioned cleanup.
         self.assertEqual(ingest_docs[0]["_id"], f"12:run-1")
         self.assertEqual(ingest_docs[0]["syncVersion"], 12)
+        self.assertEqual(
+            ingest_docs[0]["ai_usage"],
+            {"requests": 2, "total_tokens": 1234, "cost": 0.001},
+        )
+        self.assertNotIn("by_step", ingest_docs[0]["ai_usage"])
+        self.assertNotIn("by_model", ingest_docs[0]["ai_usage"])
 
         cloud_docs = [
             json.loads(line)

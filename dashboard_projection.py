@@ -56,6 +56,25 @@ def _decode_run_ai_usage(row: sqlite3.Row) -> Optional[Dict[str, Any]]:
     return usage if isinstance(usage, dict) else None
 
 
+def _compact_ai_usage_for_dashboard(
+    usage: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Keep dashboard run history small while preserving token/cost columns."""
+    if not isinstance(usage, dict):
+        return None
+    keep = (
+        "requests",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cached_input_tokens",
+        "cost",
+        "unpriced_tokens",
+    )
+    out = {key: usage.get(key) for key in keep if key in usage}
+    return out or None
+
+
 def row_to_run_summary(
     row: sqlite3.Row,
     *,
@@ -101,8 +120,9 @@ def row_to_run_summary(
         "has_error": bool(row["error"]),
     }
     ai_usage = _decode_run_ai_usage(row)
-    if ai_usage is not None:
-        out["ai_usage"] = ai_usage
+    compact_ai_usage = _compact_ai_usage_for_dashboard(ai_usage)
+    if compact_ai_usage is not None:
+        out["ai_usage"] = compact_ai_usage
     return out
 
 
