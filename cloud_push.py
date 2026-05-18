@@ -838,6 +838,15 @@ def _dashboard_payloads(
             f"HNREADER_CLOUD_PUSH_MAX_BODY_BYTES={max_body_bytes}"
         )
 
+    full_payload = _dashboard_payload(
+        sync_version=sync_version,
+        summary=summary,
+        ingest_runs=ingest_runs if ingest_runs else None,
+        cloud_sync_runs=cloud_sync_runs if cloud_sync_runs else None,
+    )
+    if _payload_size_bytes(full_payload) <= max_body_bytes:
+        return [full_payload]
+
     payloads: List[Dict[str, Any]] = []
     payloads.extend(
         _chunk_dashboard_docs(
