@@ -23,6 +23,11 @@ During the guided setup you will be asked for:
 - Optional UFW setup. It allows only OpenSSH; this server exposes no HTTP port.
 - Optional daily SQLite backup timer.
 
+AI config entries can include optional
+`input_token_price_per_million` and `output_token_price_per_million` fields.
+When those are omitted, ingest records `unpriced_tokens` instead of guessing
+cost from provider pricing that may have changed.
+
 ## Commands
 
 ```bash

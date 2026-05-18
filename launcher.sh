@@ -175,13 +175,17 @@ HNREADER_CLEANUP_STALE_GUARD_SECONDS="${HNREADER_CLEANUP_STALE_GUARD_SECONDS:-43
 #
 # HNREADER_AI_CONFIGS is the source of truth: a JSON array of OpenAI-compatible
 # providers. Failover order = array order; switches on connection errors,
-# provider JSON parse errors, and HTTP 429/5xx. It does not switch on
-# per-request timeout, HTTP 401/403, or malformed model output.
+# provider JSON parse errors, HTTP 429/5xx, and provider-specific
+# quota/billing errors such as DashScope 403-AllocationQuota.FreeTierOnly.
+# It does not switch on per-request timeout, ordinary HTTP 401/403 access
+# errors, or malformed model output.
 #
 # Default below is a single DeepSeek entry with a placeholder api_key. Replace
 # sk-REPLACE_WITH_YOUR_DEEPSEEK_API_KEY before running. To add a backup
 # provider, append another object after a comma, e.g.:
 #   [{...primary...},{"name":"DeepSeek backup","api_key":"sk-BACKUP","model":"deepseek-v4-flash","base_url":"https://api.deepseek.com","balance_url":"https://api.deepseek.com/user/balance","timeout_seconds":60,"max_concurrent_requests":1}]
+# Optional cost fields: input_token_price_per_million and
+# output_token_price_per_million. If omitted, metrics report unpriced_tokens.
 #
 # When HNREADER_AI_CONFIGS is non-empty it fully overrides the legacy
 # HNREADER_AI_API_KEY / HNREADER_AI_MODEL / HNREADER_AI_BASE_URL trio.

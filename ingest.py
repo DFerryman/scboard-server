@@ -410,6 +410,65 @@ def _is_capacity_deferred_exception(exc: Exception) -> bool:
     return is_ai_capacity_error(exc)
 
 
+def _iter_exception_chain(exc: BaseException) -> Iterable[BaseException]:
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        yield cur
+        cur = cur.__cause__ or cur.__context__
+
+
+def _provider_http_error_from_exception(exc: Exception) -> Optional[AiProviderHttpError]:
+    """Find the provider HTTP error hidden behind wrapper RuntimeErrors."""
+    for cur in _iter_exception_chain(exc):
+        if isinstance(cur, AiProviderHttpError):
+            return cur
+    return None
+
+
+def _capacity_error_from_exception(exc: Exception) -> Optional[Exception]:
+    """Return the capacity-class exception in ``exc``'s chain, if any."""
+    for cur in _iter_exception_chain(exc):
+        if isinstance(cur, Exception) and _is_capacity_deferred_exception(cur):
+            return cur
+    return None
+
+
+def _is_nonrecoverable_provider_batch_error(exc: Exception) -> bool:
+    """Whether retrying this failed batch as N singles is just request spam."""
+    http_error = _provider_http_error_from_exception(exc)
+    if http_error is None:
+        return False
+    if _is_capacity_deferred_exception(http_error):
+        return False
+    status_code = int(http_error.status_code)
+    if status_code in (401, 403, 404):
+        return True
+    detail = " ".join(
+        part
+        for part in (
+            getattr(http_error, "provider_error_code", ""),
+            getattr(http_error, "provider_error_type", ""),
+            str(http_error),
+        )
+        if part
+    ).lower()
+    if status_code == 400 and any(
+        marker in detail
+        for marker in (
+            "model_not_found",
+            "model not found",
+            "modelnotfound",
+            "model_not_supported",
+            "unsupported model",
+            "does not support access",
+        )
+    ):
+        return True
+    return False
+
+
 def _capacity_retry_after_seconds(exc: Exception) -> int:
     """Pick a wait-before-reclaim window for a capacity-deferred row.
 
@@ -484,6 +543,26 @@ def _record_enrich_failure(
     else:
         repository.mark_enrich_pending_retry(conn, sid, error=error_msg)
         summary["retried"] += 1
+
+
+def _record_batch_provider_failure(
+    conn,
+    summary: Dict[str, Any],
+    items: Sequence[Mapping[str, Any]],
+    *,
+    error_msg: str,
+    bump_visible_version: bool,
+) -> None:
+    """Record one failed attempt per item without issuing duplicate AI calls."""
+    for item in items:
+        _record_enrich_failure(
+            conn,
+            summary,
+            item["story"],
+            is_refresh=bool(item.get("is_refresh")),
+            error_msg=error_msg,
+            bump_visible_version=bump_visible_version,
+        )
 
 
 def _write_enriched_result(
@@ -601,8 +680,9 @@ def _process_work_item_single_unlocked(
             topic_catalog,
         )
     except Exception as exc:  # noqa: BLE001
-        if _is_capacity_deferred_exception(exc):
-            error_msg = f"{type(exc).__name__}: {exc}"
+        capacity_exc = _capacity_error_from_exception(exc)
+        if capacity_exc is not None:
+            error_msg = f"{type(capacity_exc).__name__}: {capacity_exc}"
             log.info(
                 "ai process_story(%d) deferred: %s",
                 sid,
@@ -611,7 +691,7 @@ def _process_work_item_single_unlocked(
             return {
                 "status": "deferred",
                 "error_msg": error_msg,
-                "retry_after_seconds": _capacity_retry_after_seconds(exc),
+                "retry_after_seconds": _capacity_retry_after_seconds(capacity_exc),
             }
         log.warning("ai process_story(%d) failed: %s", sid, exc)
         return {
@@ -737,12 +817,15 @@ def _process_work_items(
     - Single work item: ``_enrich_work_item_single`` (records usage as the
       "story" step; capacity-deferred handling lives there).
     - Multi-item batch: dispatch to ``process_stories_batch``. Main outcomes:
-      - Capacity-deferred (every provider 429/cooled): park *every* item with
-        ``enrich_retry_after`` set, **without** bumping ``enrich_attempts``,
-        so quota incidents don't promote stories to ``failed`` after a
-        handful of retries.
+      - Capacity-deferred (rate limited, cooled, or quota/balance exhausted):
+        park *every* item with ``enrich_retry_after`` set, **without**
+        bumping ``enrich_attempts``, so quota incidents don't promote stories
+        to ``failed`` after a handful of retries.
       - Provider response JSON errors: bisect the batch, then bottom out at
         the single-story path so only the actual bad rows burn attempts.
+      - Nonrecoverable provider HTTP errors (auth/access/model-not-found):
+        record one failed attempt per item without re-sending duplicate
+        single-story calls.
       - Any other failure: fall back to single-story for each item so one
         bad batch does not poison successful neighbors.
     - On batch success: write resolved items, retry any missing ids as
@@ -796,8 +879,9 @@ def _process_work_items(
                 )
         return True
     except AiProviderHttpError as exc:
-        if _is_capacity_deferred_exception(exc):
-            error_msg = f"{type(exc).__name__}: {exc}"
+        capacity_exc = _capacity_error_from_exception(exc)
+        if capacity_exc is not None:
+            error_msg = f"{type(capacity_exc).__name__}: {capacity_exc}"
             log.info(
                 "ai batch (%d items) deferred (HTTP %d): %s",
                 len(work_items),
@@ -805,7 +889,7 @@ def _process_work_items(
                 error_msg,
             )
             with db.transaction(conn):
-                retry_after = _capacity_retry_after_seconds(exc)
+                retry_after = _capacity_retry_after_seconds(capacity_exc)
                 for item in work_items:
                     _defer_work_item_in_tx(
                         conn,
@@ -814,6 +898,24 @@ def _process_work_items(
                         retry_after_seconds=retry_after,
                         error_msg=error_msg,
                     )
+            return True
+        if _is_nonrecoverable_provider_batch_error(exc):
+            error_msg = f"{type(exc).__name__}: {exc}"
+            log.warning(
+                "ai batch failed for %d stories with nonrecoverable provider HTTP %d; "
+                "recording batch failure without single-story retry: %s",
+                len(work_items),
+                exc.status_code,
+                error_msg,
+            )
+            with db.transaction(conn):
+                _record_batch_provider_failure(
+                    conn,
+                    summary,
+                    work_items,
+                    error_msg=error_msg,
+                    bump_visible_version=bump_visible_version,
+                )
             return True
         log.warning(
             "ai batch failed for %d stories; falling back to single-story enrich: %s: %s",
@@ -880,6 +982,54 @@ def _process_work_items(
             deadline_at=deadline_at,
         )
     except Exception as exc:  # noqa: BLE001
+        capacity_exc = _capacity_error_from_exception(exc)
+        if capacity_exc is not None:
+            http_error = _provider_http_error_from_exception(capacity_exc)
+            error_msg = f"{type(capacity_exc).__name__}: {capacity_exc}"
+            if http_error is not None:
+                log.info(
+                    "ai batch (%d items) deferred (HTTP %d): %s",
+                    len(work_items),
+                    http_error.status_code,
+                    error_msg,
+                )
+            else:
+                log.info(
+                    "ai batch (%d items) deferred: %s",
+                    len(work_items),
+                    error_msg,
+                )
+            with db.transaction(conn):
+                retry_after = _capacity_retry_after_seconds(capacity_exc)
+                for item in work_items:
+                    _defer_work_item_in_tx(
+                        conn,
+                        summary,
+                        item,
+                        retry_after_seconds=retry_after,
+                        error_msg=error_msg,
+                    )
+            return True
+        if _is_nonrecoverable_provider_batch_error(exc):
+            http_error = _provider_http_error_from_exception(exc)
+            status_code = http_error.status_code if http_error is not None else 0
+            error_msg = f"{type(exc).__name__}: {exc}"
+            log.warning(
+                "ai batch failed for %d stories with nonrecoverable provider HTTP %d; "
+                "recording batch failure without single-story retry: %s",
+                len(work_items),
+                status_code,
+                error_msg,
+            )
+            with db.transaction(conn):
+                _record_batch_provider_failure(
+                    conn,
+                    summary,
+                    work_items,
+                    error_msg=error_msg,
+                    bump_visible_version=bump_visible_version,
+                )
+            return True
         log.warning(
             "ai batch failed for %d stories; falling back to single-story enrich: %s: %s",
             len(work_items),
@@ -2033,6 +2183,137 @@ def _record_run_ai_usage_snapshot(
         conn.close()
 
 
+def _compact_digest_for_log(
+    digest_summary: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(digest_summary, Mapping):
+        return None
+    out: Dict[str, Any] = {}
+    for key in (
+        "date",
+        "candidates",
+        "selected",
+        "changed",
+        "skipped",
+        "reason",
+        "trigger",
+        "mode",
+        "error",
+    ):
+        if key in digest_summary:
+            out[key] = digest_summary.get(key)
+    story_ids = digest_summary.get("story_ids")
+    if isinstance(story_ids, Sequence) and not isinstance(story_ids, (str, bytes)):
+        out["story_ids"] = list(story_ids)[:10]
+        out["story_ids_count"] = len(story_ids)
+    current_done_ids = digest_summary.get("current_done_ids")
+    if isinstance(current_done_ids, Sequence) and not isinstance(
+        current_done_ids, (str, bytes)
+    ):
+        out["current_done_ids_count"] = len(current_done_ids)
+    return out
+
+
+def _compact_enrich_for_log(
+    enrich_summary: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(enrich_summary, Mapping):
+        return None
+    out = {
+        key: enrich_summary.get(key)
+        for key in (
+            "claimed",
+            "done",
+            "failed",
+            "retried",
+            "deferred",
+            "waves",
+            "timed_out",
+            "released_on_timeout",
+        )
+        if key in enrich_summary
+    }
+    checkpoints = enrich_summary.get("publish_checkpoints")
+    if isinstance(checkpoints, Sequence) and not isinstance(
+        checkpoints, (str, bytes)
+    ):
+        out["publish_checkpoints_count"] = len(checkpoints)
+        if checkpoints:
+            out["last_publish_checkpoint"] = checkpoints[-1]
+    ai_usage = enrich_summary.get("ai_usage")
+    if isinstance(ai_usage, Mapping):
+        out["ai_usage"] = {
+            key: ai_usage.get(key)
+            for key in (
+                "requests",
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "unpriced_tokens",
+            )
+            if key in ai_usage
+        }
+    return out
+
+
+def _compact_publish_for_log(
+    publish_summary: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(publish_summary, Mapping):
+        return None
+    out = {
+        key: publish_summary.get(key)
+        for key in (
+            "changed",
+            "published_count",
+            "ready_count",
+            "preserve_existing",
+            "skipped_stale_run",
+        )
+        if key in publish_summary
+    }
+    feeds = publish_summary.get("feeds")
+    if isinstance(feeds, Mapping):
+        out["feeds"] = {
+            str(feed): {
+                key: summary.get(key)
+                for key in ("size", "ready", "changed", "skipped")
+                if isinstance(summary, Mapping) and key in summary
+            }
+            for feed, summary in feeds.items()
+        }
+    return out
+
+
+def _compact_round_summary_for_log(summary: Mapping[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "run_id": summary.get("run_id"),
+        "status": summary.get("status"),
+        "error": summary.get("error"),
+        "fetch": summary.get("fetch"),
+        "enrich": _compact_enrich_for_log(summary.get("enrich")),
+        "digest": _compact_digest_for_log(summary.get("digest")),
+        "publish": _compact_publish_for_log(summary.get("publish")),
+        "cleanup": summary.get("cleanup"),
+        "discard": summary.get("discard"),
+    }
+    checkpoints = summary.get("digest_checkpoints")
+    if isinstance(checkpoints, Sequence) and not isinstance(
+        checkpoints, (str, bytes)
+    ):
+        out["digest_checkpoints_count"] = len(checkpoints)
+    cloud = summary.get("cloud_sync")
+    if isinstance(cloud, Mapping):
+        out["cloud_sync"] = {
+            key: cloud.get(key)
+            for key in ("status", "sync_version", "elapsed_seconds", "error")
+            if key in cloud
+        }
+    else:
+        out["cloud_sync"] = cloud
+    return out
+
+
 def run_ingest_round(
     *,
     run_id: Optional[str] = None,
@@ -2267,7 +2548,7 @@ def run_ingest_round(
             progress_callback=_on_enrich_progress,
         )
         summary["enrich"] = enrich_summary
-        log.info("enricher: %s", enrich_summary)
+        log.info("enricher: %s", _compact_enrich_for_log(enrich_summary))
 
         conn = db.connect()
         try:
@@ -2305,7 +2586,10 @@ def run_ingest_round(
                     preserve_existing=bool(partial_error),
                 )
             summary["publish"] = publish_summary
-            log.info("publisher final: %s", publish_summary)
+            log.info(
+                "publisher final: %s",
+                _compact_publish_for_log(publish_summary),
+            )
         finally:
             conn.close()
 
@@ -2320,7 +2604,7 @@ def run_ingest_round(
                 mode="auto",
             )
             record_digest_summary(digest_summary, checkpoint="final")
-            log.info("digester final: %s", digest_summary)
+            log.info("digester final: %s", _compact_digest_for_log(digest_summary))
             _record_run_ai_usage_snapshot(
                 run_id, ai_agent, round_ai_usage_checkpoint
             )
@@ -2334,7 +2618,11 @@ def run_ingest_round(
         summary["discard"] = cleanup
 
         if partial_error:
-            final_status = "partial" if ready_count > 0 else ("timeout" if timed_out else "failed")
+            final_status = (
+                "partial"
+                if ready_count > 0
+                else ("timeout" if timed_out else "failed")
+            )
             _finish_run(run_id, final_status, error=partial_error)
             _alert(
                 "enrich_timeout" if timed_out else "enrich_incomplete",
@@ -2349,8 +2637,14 @@ def run_ingest_round(
                         extra=cleanup,
                     ),
                     "incomplete_candidates": incomplete,
-                    "enrich": json.dumps(enrich_summary, ensure_ascii=False),
-                    "publish": json.dumps(publish_summary, ensure_ascii=False),
+                    "enrich": json.dumps(
+                        _compact_enrich_for_log(enrich_summary),
+                        ensure_ascii=False,
+                    ),
+                    "publish": json.dumps(
+                        _compact_publish_for_log(publish_summary),
+                        ensure_ascii=False,
+                    ),
                 },
             )
             summary["status"] = final_status
@@ -2372,7 +2666,10 @@ def run_ingest_round(
                         target_ids=target_ids,
                         extra=cleanup,
                     ),
-                    "publish": json.dumps(publish_summary, ensure_ascii=False),
+                    "publish": json.dumps(
+                        _compact_publish_for_log(publish_summary),
+                        ensure_ascii=False,
+                    ),
                 },
             )
             summary["status"] = "failed"
@@ -3116,7 +3413,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.child:
             log.info(
                 "ingest_round_summary: %s",
-                json.dumps(summary, ensure_ascii=True),
+                json.dumps(_compact_round_summary_for_log(summary), ensure_ascii=True),
             )
         else:
             print(json.dumps(summary, ensure_ascii=True, indent=2))
@@ -3139,4 +3436,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

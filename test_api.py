@@ -2754,6 +2754,52 @@ class EnricherBehavior(_SqliteCase):
         self.assertGreater(int(row["enrich_retry_after"]), before)
         self.assertIn("HTTP 402", row["enrich_error"])
 
+    def test_dashscope_free_tier_403_defers_without_bumping_attempts(self):
+        """DashScope reports exhausted free-only quota as HTTP 403.
+
+        This is a provider capacity/billing condition, not a per-story
+        enrichment failure, so it must defer without burning attempts.
+        """
+        self._seed()
+
+        class FreeTierOnlyAgent:
+            def process_story(self, *_):
+                raise ai_agent_module.AiProviderHttpError(
+                    403,
+                    "HTTP 403: Forbidden: "
+                    '{"error":{"message":"The free tier of the model has been exhausted",'
+                    '"type":"AllocationQuota.FreeTierOnly",'
+                    '"code":"AllocationQuota.FreeTierOnly"}}',
+                )
+
+            def write_digest_intro(self, *_):
+                return ""
+
+        before = int(time.time())
+        summary = run_enricher_once(
+            client=_FakeHn({}, {}),
+            ai_agent=FreeTierOnlyAgent(),
+        )
+
+        self.assertEqual(summary["done"], 0)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["retried"], 0)
+        self.assertEqual(summary["deferred"], 1)
+
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT enrich_status, enrich_attempts, enrich_retry_after, enrich_error "
+                "FROM stories WHERE id=101"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(row["enrich_status"], "pending")
+        self.assertEqual(row["enrich_attempts"], 0)
+        self.assertGreater(int(row["enrich_retry_after"]), before)
+        self.assertIn("AllocationQuota.FreeTierOnly", row["enrich_error"])
+
     def test_pending_to_failed_no_visible_change_does_not_bump(self):
         """Plan P0: failed terminal write that produces identical visible
         fields must not bump ``catalog_version`` — pending rows already carry
@@ -3437,6 +3483,69 @@ class EnricherBehavior(_SqliteCase):
         finally:
             conn.close()
         self.assertEqual({r["enrich_status"] for r in rows}, {"done"})
+
+    def test_batch_auth_failure_does_not_fallback_to_duplicate_single_calls(self):
+        ids = [615, 616]
+        rankings = {"top": ids, "new": [], "best": [], "ask": [], "show": [], "job": []}
+        items = {
+            sid: {
+                "id": sid,
+                "type": "story",
+                "title": f"T{sid}",
+                "url": f"https://x/{sid}",
+                "by": "x",
+                "score": 1,
+                "descendants": 0,
+                "time": 1700000000,
+            }
+            for sid in ids
+        }
+        run_fetcher_once(client=_FakeHn(rankings, items))
+
+        class AuthFailingBatchAgent:
+            supports_batch_enrich = True
+
+            def __init__(self):
+                self.batch_calls = 0
+                self.story_calls = []
+
+            def process_stories_batch(self, _items):
+                self.batch_calls += 1
+                try:
+                    raise ai_agent_module.AiProviderHttpError(
+                        401,
+                        "HTTP 401: Unauthorized",
+                    )
+                except ai_agent_module.AiProviderHttpError as exc:
+                    raise RuntimeError(
+                        "AI provider config failed for story-batch"
+                    ) from exc
+
+            def process_story(self, story_row, _comments):
+                self.story_calls.append(int(story_row["id"]))
+                return None
+
+            def write_digest_intro(self, *_):
+                return ""
+
+        agent = AuthFailingBatchAgent()
+        summary = run_enricher_once(client=_FakeHn({}, {}), ai_agent=agent)
+
+        self.assertEqual(agent.batch_calls, 1)
+        self.assertEqual(agent.story_calls, [])
+        self.assertEqual(summary["done"], 0)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["retried"], 2)
+
+        conn = db.connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, enrich_status, enrich_attempts FROM stories ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual({r["enrich_status"] for r in rows}, {"pending"})
+        self.assertEqual([int(r["enrich_attempts"]) for r in rows], [1, 1])
 
     def test_batch_fallback_single_ai_does_not_hold_write_lock(self):
         ids = [631, 632]
@@ -4150,6 +4259,45 @@ class RealAiAgentFailover(unittest.TestCase):
         self.assertEqual(out["titleZh"], "backup")
         self.assertEqual(agent.calls, ["bad-model", "good-model"])
 
+    def test_http_quota_403_tries_next_config(self):
+        class FreeTierThenSuccessAgent(RealAiAgent):
+            def __init__(self, **kwargs):
+                self.calls = []
+                super().__init__(**kwargs)
+
+            def _post_chat(self, config, payload):
+                self.calls.append(config.model)
+                if config.model == "bad-model":
+                    raise ai_agent_module.AiProviderHttpError(
+                        403,
+                        "HTTP 403: Forbidden: "
+                        '{"error":{"message":"The free tier of the model has been exhausted",'
+                        '"type":"AllocationQuota.FreeTierOnly",'
+                        '"code":"AllocationQuota.FreeTierOnly"}}',
+                    )
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "titleZh": "backup-free-tier",
+                                        "topic": "web",
+                                        "aiSummary": "ok",
+                                        "insights": [],
+                                        "terms": [],
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+
+        agent = FreeTierThenSuccessAgent(configs=self._configs())
+        out = agent.process_story(self._story_row(), [])
+        self.assertEqual(out["titleZh"], "backup-free-tier")
+        self.assertEqual(agent.calls, ["bad-model", "good-model"])
+
     def test_http_auth_error_does_not_try_next_config(self):
         class AuthErrorAgent(RealAiAgent):
             def __init__(self, **kwargs):
@@ -4164,6 +4312,24 @@ class RealAiAgentFailover(unittest.TestCase):
                 )
 
         agent = AuthErrorAgent(configs=self._configs())
+        with self.assertRaises(RuntimeError):
+            agent.process_story(self._story_row(), [])
+        self.assertEqual(agent.calls, ["bad-model"])
+
+    def test_http_access_403_without_quota_does_not_try_next_config(self):
+        class AccessDeniedAgent(RealAiAgent):
+            def __init__(self, **kwargs):
+                self.calls = []
+                super().__init__(**kwargs)
+
+            def _post_chat(self, config, payload):
+                self.calls.append(config.model)
+                raise ai_agent_module.AiProviderHttpError(
+                    403,
+                    "HTTP 403: Forbidden: Access denied",
+                )
+
+        agent = AccessDeniedAgent(configs=self._configs())
         with self.assertRaises(RuntimeError):
             agent.process_story(self._story_row(), [])
         self.assertEqual(agent.calls, ["bad-model"])
@@ -4283,6 +4449,34 @@ class RealAiAgentFailover(unittest.TestCase):
 
         self.assertIn("HTTP 429", str(ctx.exception))
         self.assertIn("quota exhausted", str(ctx.exception))
+
+    def test_http_error_extracts_provider_error_code(self):
+        agent = RealAiAgent(configs=self._configs()[:1])
+        response_body = io.BytesIO(
+            b'{"error":{"message":"The free tier of the model has been exhausted",'
+            b'"type":"AllocationQuota.FreeTierOnly",'
+            b'"code":"AllocationQuota.FreeTierOnly"}}'
+        )
+        error = urllib.error.HTTPError(
+            "https://bad.example/v1/chat/completions",
+            403,
+            "Forbidden",
+            hdrs=None,
+            fp=response_body,
+        )
+
+        def fake_urlopen(*_args, **_kwargs):
+            raise error
+
+        with patch("server.ai_agent.http_client.urlopen_no_redirect", fake_urlopen):
+            with self.assertRaises(ai_agent_module.AiProviderHttpError) as ctx:
+                agent._send_chat_request(agent._configs[0], {"model": "bad-model"})
+
+        self.assertEqual(
+            ctx.exception.provider_error_code,
+            "AllocationQuota.FreeTierOnly",
+        )
+        self.assertTrue(ai_agent_module.is_ai_quota_or_balance_error(ctx.exception))
 
     def test_post_chat_retries_incomplete_read(self):
         # Retry on transient transport errors lives in ``_post_chat`` so the
@@ -5381,6 +5575,23 @@ class RealAiAgentFailover(unittest.TestCase):
                 )
 
         agent = BalanceEmptyAgent(configs=self._configs())
+        with self.assertRaises(ai_agent_module.AiCapacityDeferred):
+            agent.process_story(self._story_row(), [])
+
+    def test_provider_pool_all_free_tier_403_raises_capacity_deferred(self):
+        """DashScope free-tier exhaustion should cool providers and defer."""
+
+        class FreeTierEmptyAgent(RealAiAgent):
+            def _post_chat(self, config, payload):
+                raise ai_agent_module.AiProviderHttpError(
+                    403,
+                    "HTTP 403: Forbidden: "
+                    '{"error":{"message":"The free tier of the model has been exhausted",'
+                    '"type":"AllocationQuota.FreeTierOnly",'
+                    '"code":"AllocationQuota.FreeTierOnly"}}',
+                )
+
+        agent = FreeTierEmptyAgent(configs=self._configs())
         with self.assertRaises(ai_agent_module.AiCapacityDeferred):
             agent.process_story(self._story_row(), [])
 

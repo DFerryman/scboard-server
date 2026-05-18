@@ -181,6 +181,8 @@ class AiProviderHttpError(RuntimeError):
         detail: str,
         *,
         retry_after_seconds: Optional[float] = None,
+        provider_error_code: str = "",
+        provider_error_type: str = "",
     ):
         super().__init__(detail)
         self.status_code = int(status_code)
@@ -189,6 +191,8 @@ class AiProviderHttpError(RuntimeError):
             if retry_after_seconds is not None
             else None
         )
+        self.provider_error_code = str(provider_error_code or "")
+        self.provider_error_type = str(provider_error_type or "")
 
 
 class AiProviderResponseError(ValueError):
@@ -236,14 +240,49 @@ class _ProviderRuntime:
 def is_ai_quota_or_balance_error(exc: Exception) -> bool:
     if not isinstance(exc, AiProviderHttpError):
         return False
-    return exc.status_code == 402
+    if exc.status_code == 402:
+        return True
+    detail = " ".join(
+        part
+        for part in (
+            getattr(exc, "provider_error_code", ""),
+            getattr(exc, "provider_error_type", ""),
+            str(exc),
+        )
+        if part
+    ).lower()
+    if not detail:
+        return False
+    quota_markers = (
+        "allocationquota",
+        "allocation_quota",
+        "free tier",
+        "free quota",
+        "freetier",
+        "free-tier",
+        "insufficient_quota",
+        "insufficient balance",
+        "insufficient_balance",
+        "quota exhausted",
+        "quota has been exhausted",
+        "quota exceeded",
+        "quota_exceeded",
+        "quotaexceeded",
+        "balance",
+        "billing",
+        "payment required",
+    )
+    if not any(marker in detail for marker in quota_markers):
+        return False
+    return exc.status_code in (400, 403, 429)
 
 
 def _is_capacity_class_error(exc: Exception) -> bool:
     """Decide whether ``exc`` is a provider-capacity event vs a story bug.
 
     Capacity-class:
-    - HTTP 402 / quota / balance exhaustion
+    - HTTP 402 / provider-specific quota / balance exhaustion
+      (for example DashScope 403-AllocationQuota.FreeTierOnly)
     - HTTP 429 (rate limited)
     - HTTP 5xx (provider overloaded / down)
     - Transient transport errors (IncompleteRead, ConnectionReset, SSL EOF)
@@ -2061,6 +2100,21 @@ class RealAiAgent(AiAgent):
             detail = f"HTTP {exc.code}: {exc.reason}"
             if error_body:
                 detail = f"{detail}: {error_body[:1000]}"
+            provider_error_code = ""
+            provider_error_type = ""
+            if error_body and not error_body.startswith("<"):
+                try:
+                    error_json = json.loads(error_body)
+                except json.JSONDecodeError:
+                    error_json = None
+                if isinstance(error_json, dict):
+                    error_obj = error_json.get("error")
+                    if isinstance(error_obj, dict):
+                        provider_error_code = str(error_obj.get("code") or "")
+                        provider_error_type = str(error_obj.get("type") or "")
+                    else:
+                        provider_error_code = str(error_json.get("code") or "")
+                        provider_error_type = str(error_json.get("type") or "")
             # Sanitize before constructing the exception — once the
             # AiProviderHttpError leaves this scope it gets stringified
             # into ``enrich_error``, log lines, and admin alert payloads.
@@ -2079,6 +2133,8 @@ class RealAiAgent(AiAgent):
                 exc.code,
                 detail,
                 retry_after_seconds=retry_after_seconds,
+                provider_error_code=provider_error_code,
+                provider_error_type=provider_error_type,
             ) from exc
         try:
             return json.loads(data)
