@@ -9781,6 +9781,70 @@ class CloudPushBusinessDashboardSeparation(unittest.TestCase):
         )
         self.assertEqual(stats["dashboardSummary"], 1)
 
+    def test_push_dashboard_splits_large_run_history_without_dropping_fields(self):
+        from . import cloud_push, dashboard_projection
+
+        src = self._write_read_model(with_dashboard=True)
+        ingest_docs = [
+            {
+                "_id": f"5:run-{i}",
+                "syncVersion": 5,
+                "run_id": f"run-{i}",
+                "status": "completed",
+                "ai_usage": {
+                    "requests": 1,
+                    "total_tokens": 1000 + i,
+                    "by_step": {"story": {"sample": "x" * 600}},
+                    "by_model": [
+                        {"model": "deepseek-v4-flash", "sample": "y" * 600},
+                    ],
+                },
+            }
+            for i in range(5)
+        ]
+        (src / dashboard_projection.DASHBOARD_INGEST_RUNS_FILE).write_text(
+            "\n".join(json.dumps(doc) for doc in ingest_docs) + "\n",
+            encoding="utf-8",
+        )
+
+        payloads = []
+
+        def fake_post(_url, _secret, payload, *, timeout):
+            payloads.append(payload)
+            return {
+                "ok": True,
+                "dashboardSummary": 1,
+                "dashboardIngestRuns": len(payload.get("dashboardIngestRuns") or []),
+                "dashboardCloudSyncRuns": len(payload.get("dashboardCloudSyncRuns") or []),
+            }
+
+        with patch.object(cloud_push, "_post", side_effect=fake_post), \
+                patch.object(
+                    cloud_push,
+                    "validate_cloud_push_url",
+                    return_value="https://example.invalid/pushSync",
+                ):
+            stats = cloud_push.push_dashboard(
+                url="https://example.invalid/pushSync",
+                secret=VALID_CLOUD_PUSH_SECRET,
+                sync_version=5,
+                source_dir=src,
+                max_body_bytes=2500,
+            )
+
+        self.assertGreater(len(payloads), 1)
+        self.assertEqual(stats["dashboardIngestRuns"], len(ingest_docs))
+        sent = [
+            doc
+            for payload in payloads
+            for doc in (payload.get("dashboardIngestRuns") or [])
+        ]
+        self.assertEqual([doc["_id"] for doc in sent], [doc["_id"] for doc in ingest_docs])
+        self.assertIn("by_step", sent[0]["ai_usage"])
+        self.assertIn("by_model", sent[0]["ai_usage"])
+        for payload in payloads:
+            self.assertLessEqual(cloud_push._payload_size_bytes(payload), 2500)
+
     def test_push_dashboard_fails_loudly_when_summary_missing(self):
         """A missing dashboard_summary.json raises directly -- no more silent
         skip."""
