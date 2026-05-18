@@ -9,7 +9,7 @@ Business publish (:func:`push_read_model`):
 
 Dashboard publish (:func:`push_dashboard`, called independently):
     1. writeDashboard - write summary + recent ingest runs + recent cloud sync
-                        runs in a single call
+                        runs in byte-limited batches
 
 Cleanup (:func:`cleanup_old`, after the business publish):
     cleanupOld - delete old data where syncVersion NOT IN [current, previous],
@@ -716,6 +716,148 @@ def _write_batch_payloads(
         payloads.append(empty_payload)
 
     return payloads
+
+
+def _dashboard_payload(
+    *,
+    sync_version: int,
+    summary: Dict[str, Any],
+    ingest_runs: Optional[List[dict]] = None,
+    cloud_sync_runs: Optional[List[dict]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "action": "writeDashboard",
+        "syncVersion": int(sync_version),
+        "dashboardSummary": summary,
+    }
+    if ingest_runs is not None:
+        payload["dashboardIngestRuns"] = ingest_runs
+    if cloud_sync_runs is not None:
+        payload["dashboardCloudSyncRuns"] = cloud_sync_runs
+    return payload
+
+
+def _chunk_dashboard_docs(
+    *,
+    sync_version: int,
+    summary: Dict[str, Any],
+    field: str,
+    docs: List[dict],
+    max_body_bytes: int,
+) -> List[Dict[str, Any]]:
+    if field not in ("dashboardIngestRuns", "dashboardCloudSyncRuns"):
+        raise CloudPushError(f"unsupported dashboard field: {field}")
+    if not docs:
+        return []
+
+    payloads: List[Dict[str, Any]] = []
+    chunk: List[dict] = []
+    for doc in docs:
+        candidate = chunk + [doc]
+        candidate_payload = _dashboard_payload(
+            sync_version=sync_version,
+            summary=summary,
+            ingest_runs=candidate if field == "dashboardIngestRuns" else None,
+            cloud_sync_runs=(
+                candidate if field == "dashboardCloudSyncRuns" else None
+            ),
+        )
+        if _payload_size_bytes(candidate_payload) <= max_body_bytes:
+            chunk = candidate
+            continue
+
+        if chunk:
+            payloads.append(
+                _dashboard_payload(
+                    sync_version=sync_version,
+                    summary=summary,
+                    ingest_runs=chunk if field == "dashboardIngestRuns" else None,
+                    cloud_sync_runs=(
+                        chunk if field == "dashboardCloudSyncRuns" else None
+                    ),
+                )
+            )
+            chunk = [doc]
+            single_payload = _dashboard_payload(
+                sync_version=sync_version,
+                summary=summary,
+                ingest_runs=chunk if field == "dashboardIngestRuns" else None,
+                cloud_sync_runs=(
+                    chunk if field == "dashboardCloudSyncRuns" else None
+                ),
+            )
+            if _payload_size_bytes(single_payload) <= max_body_bytes:
+                continue
+        else:
+            single_payload = candidate_payload
+
+        single_size = _payload_size_bytes(single_payload)
+        raise CloudPushError(
+            f"single {field} doc {_doc_id_for_error(doc)} makes a "
+            f"writeDashboard payload of {single_size} bytes, exceeding "
+            f"HNREADER_CLOUD_PUSH_MAX_BODY_BYTES={max_body_bytes}; "
+            "reduce the cloud document size or move this payload through "
+            "cloud storage / a finer-grained cloud protocol"
+        )
+
+    if chunk:
+        payloads.append(
+            _dashboard_payload(
+                sync_version=sync_version,
+                summary=summary,
+                ingest_runs=chunk if field == "dashboardIngestRuns" else None,
+                cloud_sync_runs=(
+                    chunk if field == "dashboardCloudSyncRuns" else None
+                ),
+            )
+        )
+    return payloads
+
+
+def _dashboard_payloads(
+    *,
+    sync_version: int,
+    summary: Dict[str, Any],
+    ingest_runs: List[dict],
+    cloud_sync_runs: List[dict],
+    max_body_bytes: int,
+) -> List[Dict[str, Any]]:
+    if max_body_bytes <= 0:
+        raise CloudPushError(
+            f"HNREADER_CLOUD_PUSH_MAX_BODY_BYTES must be >= 1 "
+            f"(got {max_body_bytes})"
+        )
+    summary_payload = _dashboard_payload(
+        sync_version=sync_version,
+        summary=summary,
+    )
+    summary_size = _payload_size_bytes(summary_payload)
+    if summary_size > max_body_bytes:
+        raise CloudPushError(
+            f"dashboard summary payload is {summary_size} bytes, exceeding "
+            f"HNREADER_CLOUD_PUSH_MAX_BODY_BYTES={max_body_bytes}"
+        )
+
+    payloads: List[Dict[str, Any]] = []
+    payloads.extend(
+        _chunk_dashboard_docs(
+            sync_version=sync_version,
+            summary=summary,
+            field="dashboardIngestRuns",
+            docs=ingest_runs,
+            max_body_bytes=max_body_bytes,
+        )
+    )
+    payloads.extend(
+        _chunk_dashboard_docs(
+            sync_version=sync_version,
+            summary=summary,
+            field="dashboardCloudSyncRuns",
+            docs=cloud_sync_runs,
+            max_body_bytes=max_body_bytes,
+        )
+    )
+    return payloads or [summary_payload]
 
 
 def push_read_model(
