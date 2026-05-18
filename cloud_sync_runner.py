@@ -311,6 +311,7 @@ def run_dashboard_once(
             secret=settings.CLOUD_PUSH_SECRET,
             sync_version=int(sync_version),
             timeout_seconds=effective_timeout,
+            max_body_bytes=settings.CLOUD_PUSH_MAX_BODY_BYTES,
             deadline_at=deadline_at,
         )
     except Exception as exc:  # noqa: BLE001

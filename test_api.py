@@ -8775,10 +8775,16 @@ class DashboardProjectionContract(_SqliteCase):
         self.assertEqual(ingest_docs[0]["syncVersion"], 12)
         self.assertEqual(
             ingest_docs[0]["ai_usage"],
-            {"requests": 2, "total_tokens": 1234, "cost": 0.001},
+            {
+                "requests": 2,
+                "total_tokens": 1234,
+                "cost": 0.001,
+                "by_step": {"story": {"total_tokens": 1000}},
+                "by_model": [
+                    {"model": "deepseek-v4-flash", "total_tokens": 1234},
+                ],
+            },
         )
-        self.assertNotIn("by_step", ingest_docs[0]["ai_usage"])
-        self.assertNotIn("by_model", ingest_docs[0]["ai_usage"])
 
         cloud_docs = [
             json.loads(line)

@@ -1033,6 +1033,7 @@ def push_dashboard(
     secret: str,
     sync_version: int,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    max_body_bytes: int = DEFAULT_WRITE_BATCH_MAX_BODY_BYTES,
     source_dir: Optional[Path] = None,
     deadline_at: Optional[float] = None,
 ) -> dict:
@@ -1098,29 +1099,54 @@ def push_dashboard(
         _redacted_url_for_log(url),
     )
 
-    _abort_if_insufficient(deadline_at, phase="writeDashboard")
-    payload: Dict[str, Any] = {
-        "action": "writeDashboard",
-        "syncVersion": int(sync_version),
-        "dashboardSummary": summary,
-    }
-    if ingest_runs:
-        payload["dashboardIngestRuns"] = ingest_runs
-    if cloud_sync_runs:
-        payload["dashboardCloudSyncRuns"] = cloud_sync_runs
-    r = _post(
-        url, secret, payload,
-        timeout=_next_call_timeout(deadline_at, timeout_seconds),
+    payloads = _dashboard_payloads(
+        sync_version=int(sync_version),
+        summary=summary,
+        ingest_runs=ingest_runs,
+        cloud_sync_runs=cloud_sync_runs,
+        max_body_bytes=int(max_body_bytes),
     )
-    if not r.get("ok"):
-        raise CloudPushError(f"writeDashboard failed: {r}")
-    log.info("[push-dashboard] writeDashboard ok: %s", r)
+    sent_summary = 0
+    sent_ingest = 0
+    sent_cloud_sync = 0
+    for payload in payloads:
+        _abort_if_insufficient(deadline_at, phase="writeDashboard")
+        payload_bytes = _payload_size_bytes(payload)
+        r = _post(
+            url, secret, payload,
+            timeout=_next_call_timeout(deadline_at, timeout_seconds),
+        )
+        if not r.get("ok"):
+            raise CloudPushError(f"writeDashboard failed: {r}")
+        sent_summary = max(sent_summary, int(r.get("dashboardSummary", 0) or 0))
+        sent_ingest += int(r.get("dashboardIngestRuns", 0) or 0)
+        sent_cloud_sync += int(r.get("dashboardCloudSyncRuns", 0) or 0)
+        log.info(
+            "[push-dashboard] writeDashboard chunk: summary=%s ingest+%s "
+            "cloud_sync+%s bytes=%s/%s",
+            1 if payload.get("dashboardSummary") else 0,
+            len(payload.get("dashboardIngestRuns") or []),
+            len(payload.get("dashboardCloudSyncRuns") or []),
+            payload_bytes,
+            int(max_body_bytes),
+        )
+    log.info(
+        "[push-dashboard] writeDashboard ok: %s",
+        {
+            "ok": True,
+            "action": "writeDashboard",
+            "syncVersion": int(sync_version),
+            "dashboardSummary": sent_summary,
+            "dashboardIngestRuns": sent_ingest,
+            "dashboardCloudSyncRuns": sent_cloud_sync,
+        },
+    )
 
     return {
         "syncVersion": int(sync_version),
-        "dashboardSummary": int(r.get("dashboardSummary", 0) or 0),
-        "dashboardIngestRuns": int(r.get("dashboardIngestRuns", 0) or 0),
-        "dashboardCloudSyncRuns": int(r.get("dashboardCloudSyncRuns", 0) or 0),
+        "dashboardSummary": sent_summary,
+        "dashboardIngestRuns": sent_ingest,
+        "dashboardCloudSyncRuns": sent_cloud_sync,
     }
 
 
