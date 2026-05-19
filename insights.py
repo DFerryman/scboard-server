@@ -138,11 +138,11 @@ def _story_payload(
     *,
     feed_ranks: Mapping[int, Mapping[str, int]],
     include_raw_text: bool = False,
-    raw_text_max_chars: Optional[int] = 0,
+    raw_text_max_chars: Optional[int] = None,
     include_domain: bool = False,
     include_insights: bool = False,
     comments: Optional[Sequence[Any]] = None,
-    comment_max_chars: Optional[int] = 180,
+    comment_max_chars: Optional[int] = None,
 ) -> Dict[str, Any]:
     story_id = int(row["id"])
     out: Dict[str, Any] = {
@@ -213,7 +213,7 @@ def build_today_signals_input(
         story_kwargs: Dict[str, Any] = {}
         if comments_by_story is not None and sid in comments_by_story:
             story_kwargs["comments"] = comments_by_story.get(sid, [])
-            story_kwargs["comment_max_chars"] = settings.INSIGHTS_COMMENT_MAX_CHARS
+            story_kwargs["comment_max_chars"] = None
         stories.append(
             _story_payload(
                 row,
@@ -441,11 +441,11 @@ def build_opportunity_input(
                 row,
                 feed_ranks=feed_ranks,
                 include_raw_text=True,
-                raw_text_max_chars=settings.INSIGHTS_RAW_TEXT_MAX_CHARS,
+                raw_text_max_chars=None,
                 include_domain=True,
                 include_insights=True,
                 comments=comments_by_story.get(int(row["id"]), []),
-                comment_max_chars=settings.INSIGHTS_COMMENT_MAX_CHARS,
+                comment_max_chars=None,
             )
             for row in rows
         ]
@@ -487,7 +487,7 @@ def build_debate_input(
                 feed_ranks=feed_ranks,
                 include_insights=True,
                 comments=comments_by_story.get(int(row["id"]), []),
-                comment_max_chars=settings.INSIGHTS_COMMENT_MAX_CHARS,
+                comment_max_chars=None,
             )
             for row in candidates
         ]
@@ -738,6 +738,116 @@ def _store_cached_evidence(
             )
     finally:
         conn.close()
+
+
+def _row_batches(rows: Sequence[Any], batch_size: int) -> List[Sequence[Any]]:
+    size = max(1, int(batch_size))
+    return [rows[index:index + size] for index in range(0, len(rows), size)]
+
+
+def _unique_topic_key(raw_key: Any, seen: set[str], fallback: str) -> str:
+    base = str(raw_key or "").strip() or fallback
+    key = base
+    suffix = 2
+    while key in seen:
+        key = f"{base}-{suffix}"
+        suffix += 1
+    seen.add(key)
+    return key
+
+
+def _merge_evidence_outputs(outputs: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    cards: List[Dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    assigned_ids: set[int] = set()
+    excluded_ids: List[int] = []
+    excluded_seen: set[int] = set()
+    exclusion_reasons: Dict[str, Any] = {}
+    input_count = 0
+
+    for output in outputs:
+        coverage = output.get("coverage") or {}
+        if isinstance(coverage, Mapping):
+            input_count += int(coverage.get("inputStoryCount") or 0)
+        for item in output.get("evidenceCards") or []:
+            if not isinstance(item, Mapping):
+                continue
+            card = dict(item)
+            card["topicKey"] = _unique_topic_key(
+                card.get("topicKey"),
+                seen_keys,
+                f"topic-{len(cards) + 1}",
+            )
+            for sid in card.get("storyIds") or []:
+                try:
+                    assigned_ids.add(int(sid))
+                except (TypeError, ValueError):
+                    continue
+            cards.append(card)
+        for sid in output.get("excludedStoryIds") or []:
+            try:
+                clean_sid = int(sid)
+            except (TypeError, ValueError):
+                continue
+            if clean_sid not in excluded_seen:
+                excluded_ids.append(clean_sid)
+                excluded_seen.add(clean_sid)
+        raw_reasons = output.get("exclusionReasons") or {}
+        if isinstance(raw_reasons, Mapping):
+            for key, value in raw_reasons.items():
+                exclusion_reasons[str(key)] = value
+
+    if input_count <= 0:
+        input_count = len(assigned_ids) + len(excluded_ids)
+    return {
+        "evidenceCards": cards,
+        "excludedStoryIds": excluded_ids,
+        "exclusionReasons": exclusion_reasons,
+        "coverage": {
+            "inputStoryCount": input_count,
+            "assignedStoryCount": len(assigned_ids),
+            "excludedStoryCount": len(excluded_ids),
+        },
+    }
+
+
+def _run_evidence_batches(
+    agent: Any,
+    evidence_rows: Sequence[Any],
+    *,
+    target_date: str,
+    start_date: str,
+    feed_ranks: Mapping[int, Mapping[str, int]],
+    comments_by_story: Mapping[int, Sequence[Any]],
+) -> Dict[str, Any]:
+    batches = _row_batches(
+        list(evidence_rows),
+        settings.INSIGHTS_EVIDENCE_BATCH_STORIES,
+    )
+    if not batches:
+        return {
+            "evidenceCards": [],
+            "excludedStoryIds": [],
+            "exclusionReasons": {},
+            "coverage": {
+                "inputStoryCount": 0,
+                "assignedStoryCount": 0,
+                "excludedStoryCount": 0,
+            },
+        }
+    outputs: List[Mapping[str, Any]] = []
+    for batch_rows in batches:
+        payload = build_evidence_input(
+            batch_rows,
+            target_date=target_date,
+            start_date=start_date,
+            feed_ranks=feed_ranks,
+            comments_by_story=comments_by_story,
+        )
+        outputs.append(agent.run_evidence(payload))
+    if len(outputs) == 1:
+        return dict(outputs[0])
+    return _merge_evidence_outputs(outputs)
 
 
 def build_topic_scout_input(
@@ -1274,13 +1384,6 @@ def run_insights_once(
                 "input_gaps": preflight_gaps,
             }
 
-        evidence_input = build_evidence_input(
-            evidence_rows,
-            target_date=target_date,
-            start_date=start_date,
-            feed_ranks=feed_ranks,
-            comments_by_story=comments_by_story,
-        )
         evidence_cache_key = _insights_evidence_cache_key(
             target_date=target_date,
             start_date=start_date,
@@ -1296,11 +1399,18 @@ def run_insights_once(
         evidence_out = _load_cached_evidence(evidence_cache_key)
         if evidence_out is None:
             evidence_cache_status = "miss"
-            evidence_out = agent.run_evidence(evidence_input)
+            evidence_out = _run_evidence_batches(
+                agent,
+                evidence_rows,
+                target_date=target_date,
+                start_date=start_date,
+                feed_ranks=feed_ranks,
+                comments_by_story=comments_by_story,
+            )
             _store_cached_evidence(
                 evidence_cache_key,
                 evidence_out,
-                len(evidence_input.get("stories") or []),
+                len(evidence_rows),
             )
         topic_scout_input = build_topic_scout_input(evidence_out, trends_seed_input)
         topic_scout_out = agent.run_topic_scout(topic_scout_input)

@@ -508,18 +508,6 @@ INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS = _require_int_range(
     min_value=0,
     max_value=3650,
 )
-INSIGHTS_COMMENT_MAX_CHARS = _require_int_range(
-    "HNREADER_INSIGHTS_COMMENT_MAX_CHARS",
-    _env_int("HNREADER_INSIGHTS_COMMENT_MAX_CHARS", 180),
-    min_value=20,
-    max_value=2000,
-)
-INSIGHTS_RAW_TEXT_MAX_CHARS = _require_int_range(
-    "HNREADER_INSIGHTS_RAW_TEXT_MAX_CHARS",
-    _env_int("HNREADER_INSIGHTS_RAW_TEXT_MAX_CHARS", 800),
-    min_value=0,
-    max_value=8000,
-)
 
 # Keep the dynamic classification taxonomy broad enough to cover the product
 # surface without letting one-off story topics proliferate.

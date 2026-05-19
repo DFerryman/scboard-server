@@ -3388,15 +3388,13 @@ class CloudSyncReadModel(_SqliteCase):
             settings.INSIGHTS_MAX_TODAY_STORIES,
             settings.INSIGHTS_EVIDENCE_MAX_STORIES,
             settings.INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY,
-            settings.INSIGHTS_EVIDENCE_COMMENT_MAX_CHARS,
-            settings.INSIGHTS_EVIDENCE_RAW_TEXT_MAX_CHARS,
+            settings.INSIGHTS_EVIDENCE_BATCH_STORIES,
         )
         try:
             settings.INSIGHTS_MAX_TODAY_STORIES = 12  # type: ignore[assignment]
             settings.INSIGHTS_EVIDENCE_MAX_STORIES = 12  # type: ignore[assignment]
             settings.INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY = 3  # type: ignore[assignment]
-            settings.INSIGHTS_EVIDENCE_COMMENT_MAX_CHARS = 30  # type: ignore[assignment]
-            settings.INSIGHTS_EVIDENCE_RAW_TEXT_MAX_CHARS = 40  # type: ignore[assignment]
+            settings.INSIGHTS_EVIDENCE_BATCH_STORIES = 12  # type: ignore[assignment]
 
             conn = db.connect()
             try:
@@ -3452,11 +3450,11 @@ class CloudSyncReadModel(_SqliteCase):
             evidence_story_300 = next(
                 item for item in agent.inputs["evidence"]["stories"] if int(item["id"]) == 300
             )
-            self.assertEqual(evidence_story_300["rawTextSnippet"], long_raw_text[:40])
+            self.assertEqual(evidence_story_300["rawTextSnippet"], long_raw_text)
             self.assertEqual(
                 [item["text"] for item in evidence_story_300["comments"]],
                 [
-                    long_comment[:30],
+                    long_comment,
                     "full comment evidence 1",
                     "full comment evidence 2",
                 ],
@@ -3482,8 +3480,7 @@ class CloudSyncReadModel(_SqliteCase):
                 settings.INSIGHTS_MAX_TODAY_STORIES,
                 settings.INSIGHTS_EVIDENCE_MAX_STORIES,
                 settings.INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY,
-                settings.INSIGHTS_EVIDENCE_COMMENT_MAX_CHARS,
-                settings.INSIGHTS_EVIDENCE_RAW_TEXT_MAX_CHARS,
+                settings.INSIGHTS_EVIDENCE_BATCH_STORIES,
             ) = old_caps  # type: ignore[assignment]
 
     def test_run_insights_once_reuses_evidence_cache_until_material_changes(self):
