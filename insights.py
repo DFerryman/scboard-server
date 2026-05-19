@@ -95,12 +95,10 @@ def _as_of_label(date: str) -> str:
 
 
 def _clean_comment_text(value: Any, max_chars: Optional[int]) -> str:
+    _ = max_chars
     text = html.unescape(str(value or ""))
     text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    if max_chars is not None and len(text) > max_chars:
-        text = text[:max_chars].rstrip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _coerce_list_json(value: Any) -> List[Any]:
@@ -166,8 +164,7 @@ def _story_payload(
         out["insights"] = insights
     if include_raw_text:
         raw_text = row["raw_text"] or ""
-        if raw_text_max_chars is not None:
-            raw_text = raw_text[: max(0, raw_text_max_chars)]
+        _ = raw_text_max_chars
         out["rawTextSnippet"] = raw_text
     if comments is not None:
         out["comments"] = [

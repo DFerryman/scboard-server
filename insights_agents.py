@@ -91,7 +91,7 @@ def _require_count(items: Sequence[Any], label: str, min_count: int, max_count: 
 
 def _slug(value: str, fallback: str) -> str:
     raw = re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
-    return (raw or fallback)[:64]
+    return raw or fallback
 
 
 TODAY_SIGNALS_SYSTEM_PROMPT = (
