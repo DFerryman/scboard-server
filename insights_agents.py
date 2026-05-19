@@ -89,6 +89,83 @@ def _slug(value: str, fallback: str) -> str:
     return (raw or fallback)[:64]
 
 
+TODAY_SIGNALS_SYSTEM_PROMPT = (
+    "You write the opening signal panel for a paid Chinese product-research "
+    "brief. This is not a news summary. Use only the provided stories, topic "
+    "summary, discussion themes, and comments. Output Chinese reader-facing "
+    "text, but keep JSON keys exactly as shown. The reader should understand "
+    "the day's market direction in ten seconds. Produce exactly three dense "
+    "judgment calls, preferably covering an opportunity, a pattern, and a "
+    "risk. Each title should be a judgment about what is changing, not a topic "
+    "name. Each brief should explain why the signal matters for builders, "
+    "operators, or buyers. Avoid generic hype, do not list stories, and do not "
+    "invent evidence beyond the input. Avoid the words HN, HackerNews, "
+    "Hacker News, and Show HN. Return strict JSON only: "
+    "{\"headline\":\"\",\"summary\":\"\",\"signals\":[{\"id\":\"\","
+    "\"label\":\"机会|模式|风险|分歧\",\"title\":\"\",\"brief\":\"\","
+    "\"trend\":\"+18\",\"tone\":\"up|down|flat\"}]}. "
+    "signals must contain exactly 3 items."
+)
+
+
+TREND_HEAT_SYSTEM_PROMPT = (
+    "You polish a mobile-friendly trend bar ranking for a Chinese "
+    "product-research brief. Use only the provided topicDailyStats. This is a "
+    "simple ranked bar list, not a heatmap matrix. Do not invent heat, "
+    "deltaText, trendKey, or topic names; keep those values aligned to input. "
+    "The module answers which themes are warming up and which are merely "
+    "ordinary heat. Use a short note only if it helps interpret the ranking. "
+    "Output Chinese reader-facing text, but keep JSON keys exactly as shown. "
+    "Avoid the words HN, HackerNews, Hacker News, and Show HN. Return strict "
+    "JSON only: {\"trendHeatmap\":{\"title\":\"趋势温度\",\"note\":\"\","
+    "\"items\":[{\"topic\":\"\",\"heat\":96,"
+    "\"deltaText\":\"+18 / 24h\",\"trendKey\":\"burst\"}]}}. "
+    "items must contain 5-8 items."
+)
+
+
+OPPORTUNITY_SYSTEM_PROMPT = (
+    "You are a Chinese startup opportunity analyst writing the main paid "
+    "module of a product-research brief. Use only the provided candidates, "
+    "their summaries, discussion themes, comments, domains, and story ids. "
+    "Score each opportunity by pain intensity, discussion heat, 7-day "
+    "recurrence, small-team entry, clear paying audience, and "
+    "incumbent/open-source risk. Each opportunity must read like a concrete "
+    "product thesis, not a topic recap. The title should describe a specific "
+    "opportunity surface. thesis is the core judgment. whyNow must explain "
+    "the timing using evidence from recent discussion. risk must name the "
+    "main adoption, competition, trust, or distribution risk. audience must "
+    "name specific buyer/user groups. linkedStoryIds must cite the input "
+    "stories that support the thesis. Output Chinese reader-facing text, but "
+    "keep JSON keys exactly as shown. Avoid the words HN, HackerNews, "
+    "Hacker News, and Show HN. Return strict JSON only: "
+    "{\"opportunities\":[{\"rank\":1,\"rankText\":\"01\","
+    "\"title\":\"\",\"score\":92,\"category\":\"\","
+    "\"audience\":[\"开发者\"],\"thesis\":\"\",\"whyNow\":\"\","
+    "\"risk\":\"\",\"linkedStoryIds\":[123]}]}. Return 3-5 items; "
+    "linkedStoryIds must come from input."
+)
+
+
+DEBATE_SYSTEM_PROMPT = (
+    "You are a Chinese research editor writing a disagreement index for a "
+    "paid product-research brief. The value is not just what is hot; the "
+    "value is where smart readers disagree and what that disagreement means. "
+    "Use only the provided candidates, discussion themes, insights, and "
+    "comments. Do not force extreme conflict; describe tradeoffs when the "
+    "evidence is mixed. topic should be a debatable claim, support should "
+    "summarize the strongest pro argument, oppose should summarize the "
+    "strongest counterargument, and watch should be an actionable observation "
+    "for builders or buyers. Output Chinese reader-facing text, but keep JSON "
+    "keys exactly as shown. Avoid the words HN, HackerNews, Hacker News, and "
+    "Show HN. Return strict JSON only: "
+    "{\"debates\":[{\"topic\":\"\",\"verdict\":\"机会伴随风险\","
+    "\"intensity\":91,\"supportWidth\":57,\"opposeWidth\":43,"
+    "\"support\":\"\",\"oppose\":\"\",\"watch\":\"\"}]}. "
+    "Return 2-4 items."
+)
+
+
 class InsightsAiClient(RealAiAgent):
     """Small JSON-completion surface backed by the existing provider pool."""
 
@@ -157,15 +234,7 @@ class TodaySignalsAgent:
     def run(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
         raw = self.client.complete_json(
             purpose=self.purpose,
-            system_prompt=(
-                "You write a Chinese product-research insights brief. "
-                "Use only the provided stories and topic summary. Avoid the words "
-                "HN, HackerNews, Hacker News, and Show HN. Return strict JSON only: "
-                "{\"headline\":\"\",\"summary\":\"\",\"signals\":[{\"id\":\"\","
-                "\"label\":\"机会|模式|风险|分歧\",\"title\":\"\",\"brief\":\"\","
-                "\"trend\":\"+18\",\"tone\":\"up|down|flat\"}]}. "
-                "signals must contain exactly 3 items."
-            ),
+            system_prompt=TODAY_SIGNALS_SYSTEM_PROMPT,
             user_payload=payload,
             max_tokens=1800,
         )
@@ -212,16 +281,7 @@ class TrendHeatAgent:
     def run(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
         raw = self.client.complete_json(
             purpose=self.purpose,
-            system_prompt=(
-                "You polish Chinese labels for a trend heatmap. Use only the "
-                "provided topicDailyStats. Do not invent heat, deltaText, or "
-                "trendKey; keep those values aligned to input. Avoid the words "
-                "HN, HackerNews, Hacker News, and Show HN. Return strict JSON only: "
-                "{\"trendHeatmap\":{\"title\":\"趋势温度\",\"note\":\"\","
-                "\"items\":[{\"topic\":\"\",\"heat\":96,"
-                "\"deltaText\":\"+18 / 24h\",\"trendKey\":\"burst\"}]}}. "
-                "items must contain 5-8 items."
-            ),
+            system_prompt=TREND_HEAT_SYSTEM_PROMPT,
             user_payload=payload,
             max_tokens=1600,
         )
@@ -279,18 +339,7 @@ class OpportunityAgent:
     def run(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
         raw = self.client.complete_json(
             purpose=self.purpose,
-            system_prompt=(
-                "You are a Chinese startup opportunity analyst. Use only the "
-                "provided candidates. Score each opportunity by pain intensity, "
-                "discussion heat, 7-day recurrence, small-team entry, clear "
-                "paying audience, and incumbent/open-source risk. Avoid the words "
-                "HN, HackerNews, Hacker News, and Show HN. Return strict JSON only: "
-                "{\"opportunities\":[{\"rank\":1,\"rankText\":\"01\","
-                "\"title\":\"\",\"score\":92,\"category\":\"\","
-                "\"audience\":[\"开发者\"],\"thesis\":\"\",\"whyNow\":\"\","
-                "\"risk\":\"\",\"linkedStoryIds\":[123]}]}. Return 3-5 items; "
-                "linkedStoryIds must come from input."
-            ),
+            system_prompt=OPPORTUNITY_SYSTEM_PROMPT,
             user_payload=payload,
             max_tokens=3200,
         )
@@ -359,17 +408,7 @@ class DebateAgent:
     def run(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
         raw = self.client.complete_json(
             purpose=self.purpose,
-            system_prompt=(
-                "You are a Chinese research editor summarizing disagreements. "
-                "Use only the provided candidates, themes, insights, and comments. "
-                "Do not force extreme conflict; describe tradeoffs when appropriate. "
-                "Avoid the words HN, HackerNews, Hacker News, and Show HN. "
-                "Return strict JSON only: "
-                "{\"debates\":[{\"topic\":\"\",\"verdict\":\"机会伴随风险\","
-                "\"intensity\":91,\"supportWidth\":57,\"opposeWidth\":43,"
-                "\"support\":\"\",\"oppose\":\"\",\"watch\":\"\"}]}. "
-                "Return 2-4 items."
-            ),
+            system_prompt=DEBATE_SYSTEM_PROMPT,
             user_payload=payload,
             max_tokens=2600,
         )
@@ -450,7 +489,11 @@ __all__ = [
     "InsightsAgentRunner",
     "InsightsAiClient",
     "InsightsValidationError",
+    "DEBATE_SYSTEM_PROMPT",
+    "OPPORTUNITY_SYSTEM_PROMPT",
     "OpportunityAgent",
+    "TODAY_SIGNALS_SYSTEM_PROMPT",
+    "TREND_HEAT_SYSTEM_PROMPT",
     "TodaySignalsAgent",
     "TrendHeatAgent",
     "build_insights_ai_client",

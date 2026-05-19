@@ -172,19 +172,31 @@ def build_today_signals_input(
     *,
     target_date: str,
     feed_ranks: Mapping[int, Mapping[str, int]],
+    comments_by_story: Optional[Mapping[int, Sequence[Any]]] = None,
 ) -> Dict[str, Any]:
     rows = sorted(
         today_rows,
         key=lambda r: (int(r["score"] or 0), int(r["descendants"] or 0), int(r["hn_time"] or 0)),
         reverse=True,
     )[: settings.INSIGHTS_MAX_TODAY_STORIES]
+    stories = []
+    for row in rows:
+        sid = int(row["id"])
+        story_kwargs: Dict[str, Any] = {}
+        if comments_by_story is not None and sid in comments_by_story:
+            story_kwargs["comments"] = comments_by_story.get(sid, [])[:4]
+            story_kwargs["comment_max_chars"] = settings.INSIGHTS_COMMENT_MAX_CHARS
+        stories.append(
+            _story_payload(
+                row,
+                feed_ranks=feed_ranks,
+                **story_kwargs,
+            )
+        )
     return {
         "date": target_date,
         "topicSummary": _build_today_topic_summary(rows),
-        "stories": [
-            _story_payload(row, feed_ranks=feed_ranks)
-            for row in rows
-        ],
+        "stories": stories,
     }
 
 
@@ -618,7 +630,19 @@ def run_insights_once(
             ),
             reverse=True,
         )[: settings.INSIGHTS_MAX_DEBATE_CANDIDATES]
-        comment_ids = list(dict.fromkeys(opportunity_seed[:12] + debate_seed))
+        today_seed = [
+            int(row["id"])
+            for row in sorted(
+                today_rows,
+                key=lambda r: (
+                    int(r["score"] or 0),
+                    int(r["descendants"] or 0),
+                    int(r["hn_time"] or 0),
+                ),
+                reverse=True,
+            )[:12]
+        ]
+        comment_ids = list(dict.fromkeys(today_seed + opportunity_seed[:12] + debate_seed))
         comments_by_story = repository.insight_comment_rows_for_story_ids(
             conn,
             comment_ids,
@@ -641,6 +665,7 @@ def run_insights_once(
             today_rows,
             target_date=target_date,
             feed_ranks=feed_ranks,
+            comments_by_story=comments_by_story,
         )
         trends_input = build_trend_heat_input(
             window_rows,

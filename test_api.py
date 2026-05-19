@@ -2438,6 +2438,60 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertNotIn("comments", trends_json)
         self.assertNotIn("RAW_TEXT_SHOULD_NOT_LEAK", trends_json)
 
+    def test_today_signals_input_can_include_comment_evidence(self):
+        from . import insights
+
+        target = "2026-05-19"
+        start, _ = repository.digest_date_epoch_bounds(target)
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                self._insert_done_story(
+                    conn,
+                    101,
+                    start,
+                    topic="ai",
+                    score=120,
+                    descendants=80,
+                    raw_text="RAW_TEXT_SHOULD_NOT_LEAK",
+                )
+                now = repository.now_seconds()
+                for index in range(6):
+                    conn.execute(
+                        """
+                        INSERT INTO comments(id, story_id, text, rank, fetched_at)
+                        VALUES(?, 101, ?, ?, ?)
+                        """,
+                        (9100 + index, f"comment evidence {index}", index, now),
+                    )
+                rows = repository.candidate_rows_for_insights(
+                    conn,
+                    start_ts=start,
+                    end_ts=start + 86400,
+                )
+                comments_by_story = repository.insight_comment_rows_for_story_ids(
+                    conn,
+                    [101],
+                    limit_per_story=6,
+                )
+            payload = insights.build_today_signals_input(
+                rows,
+                target_date=target,
+                feed_ranks={},
+                comments_by_story=comments_by_story,
+            )
+        finally:
+            conn.close()
+
+        story = payload["stories"][0]
+        self.assertEqual(
+            [item["text"] for item in story["comments"]],
+            [f"comment evidence {index}" for index in range(4)],
+        )
+        self.assertNotIn("rawTextSnippet", story)
+        self.assertNotIn("domain", story)
+        self.assertNotIn("insights", story)
+
     def test_opportunity_input_uses_opportunity_comment_limit(self):
         from . import insights
 
@@ -2563,6 +2617,38 @@ class CloudSyncReadModel(_SqliteCase):
             [item["trendKey"] for item in items],
             ["stable", "rising", "stable", "rising", "stable"],
         )
+
+    def test_insights_system_prompts_encode_product_brief_shape(self):
+        from . import insights_agents
+
+        self.assertIn(
+            "This is not a news summary",
+            insights_agents.TODAY_SIGNALS_SYSTEM_PROMPT,
+        )
+        self.assertIn(
+            "ten seconds",
+            insights_agents.TODAY_SIGNALS_SYSTEM_PROMPT,
+        )
+        self.assertIn(
+            "simple ranked bar list",
+            insights_agents.TREND_HEAT_SYSTEM_PROMPT,
+        )
+        self.assertIn(
+            "main paid module",
+            insights_agents.OPPORTUNITY_SYSTEM_PROMPT,
+        )
+        self.assertIn(
+            "where smart readers disagree",
+            insights_agents.DEBATE_SYSTEM_PROMPT,
+        )
+        for prompt in (
+            insights_agents.TODAY_SIGNALS_SYSTEM_PROMPT,
+            insights_agents.TREND_HEAT_SYSTEM_PROMPT,
+            insights_agents.OPPORTUNITY_SYSTEM_PROMPT,
+            insights_agents.DEBATE_SYSTEM_PROMPT,
+        ):
+            self.assertIn("Output Chinese reader-facing text", prompt)
+            self.assertIn("Return strict JSON only", prompt)
 
     def test_run_insights_once_does_not_send_story_before_window_to_agents(self):
         from . import insights
