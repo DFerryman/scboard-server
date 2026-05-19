@@ -609,11 +609,11 @@ def build_evidence_input(
                 row,
                 feed_ranks=feed_ranks,
                 include_raw_text=True,
-                raw_text_max_chars=settings.INSIGHTS_EVIDENCE_RAW_TEXT_MAX_CHARS,
+                raw_text_max_chars=None,
                 include_domain=True,
                 include_insights=True,
                 comments=comments_by_story.get(int(row["id"]), []),
-                comment_max_chars=settings.INSIGHTS_EVIDENCE_COMMENT_MAX_CHARS,
+                comment_max_chars=None,
             )
             for row in rows
         ],
@@ -661,15 +661,12 @@ def _insights_evidence_cache_key(
                 "commentLimitPerStory": int(
                     settings.INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY
                 ),
-                "commentMaxChars": int(settings.INSIGHTS_EVIDENCE_COMMENT_MAX_CHARS),
-                "rawTextMaxChars": int(settings.INSIGHTS_EVIDENCE_RAW_TEXT_MAX_CHARS),
+                "batchStories": int(settings.INSIGHTS_EVIDENCE_BATCH_STORIES),
             },
         },
     )
     for row in sorted(window_rows, key=lambda r: int(r["id"])):
         sid = int(row["id"])
-        raw_text = str(row["raw_text"] or "")
-        raw_text = raw_text[: max(0, int(settings.INSIGHTS_EVIDENCE_RAW_TEXT_MAX_CHARS))]
         _hash_update_json(
             hasher,
             {
@@ -691,14 +688,10 @@ def _insights_evidence_cache_key(
                 "discussionThemes": row["discussion_themes"] or "[]",
                 "insights": row["insights"] or "[]",
                 "terms": row["terms"] or "[]",
-                "rawText": _hash_text(raw_text),
+                "rawText": _hash_text(row["raw_text"] or ""),
             },
         )
         for comment in comments_by_story.get(sid, []):
-            comment_text = _clean_comment_text(
-                _row_value(comment, "text", "") or "",
-                settings.INSIGHTS_EVIDENCE_COMMENT_MAX_CHARS,
-            )
             _hash_update_json(
                 hasher,
                 {
@@ -710,7 +703,7 @@ def _insights_evidence_cache_key(
                     "depth": int(_row_value(comment, "depth", 0) or 0),
                     "rank": int(_row_value(comment, "rank", 0) or 0),
                     "fetchedAt": int(_row_value(comment, "fetched_at", 0) or 0),
-                    "text": _hash_text(comment_text),
+                    "text": _hash_text(_row_value(comment, "text", "") or ""),
                 },
             )
     return f"insights:evidence:v3:{target_date}:{hasher.hexdigest()}"
