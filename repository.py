@@ -2073,6 +2073,10 @@ def insight_needs_update(
     min_interval_seconds: int,
     current_candidate_story_ids: Sequence[int],
 ) -> bool:
+    # Candidate IDs are accepted for call-site context, but they intentionally
+    # do not bypass the cadence gate. Fresh stories wait for the next interval
+    # unless the operator passes --force-insights.
+    _ = current_candidate_story_ids
     row = get_insight_row(conn, date)
     if row is None:
         return True

@@ -29,6 +29,10 @@ log = logging.getLogger(__name__)
 
 INSIGHTS_VERSION = 1
 INSIGHTS_WINDOW_LABEL = "24h"
+SIGNALS_MIN_STORIES = 3
+TREND_HEAT_MIN_TOPICS = 5
+OPPORTUNITY_MIN_CANDIDATES = 3
+DEBATE_MIN_CANDIDATES = 2
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -171,6 +175,35 @@ def _story_payload(
             if _clean_comment_text(c["text"] or "", comment_max_chars)
         ]
     return out
+
+
+def _story_strength_key(row: Any) -> Tuple[int, int, int, int]:
+    return (
+        int(row["score"] or 0),
+        int(row["descendants"] or 0),
+        int(row["hn_time"] or 0),
+        -int(row["id"] or 0),
+    )
+
+
+def _ensure_min_story_rows(
+    selected_rows: Sequence[Any],
+    fallback_rows: Sequence[Any],
+    min_count: int,
+) -> List[Any]:
+    rows = list(selected_rows)
+    seen = {int(row["id"]) for row in rows}
+    if len(rows) >= min_count:
+        return rows
+    for row in sorted(fallback_rows, key=_story_strength_key, reverse=True):
+        sid = int(row["id"])
+        if sid in seen:
+            continue
+        rows.append(row)
+        seen.add(sid)
+        if len(rows) >= min_count:
+            break
+    return rows
 
 
 def _build_today_topic_summary(rows: Sequence[Any]) -> List[Dict[str, Any]]:
@@ -397,7 +430,11 @@ def build_opportunity_input(
         ),
         reverse=True,
     )
-    rows = [item[3] for item in candidates]
+    rows = _ensure_min_story_rows(
+        [item[3] for item in candidates],
+        window_rows,
+        OPPORTUNITY_MIN_CANDIDATES,
+    )
     return {
         "candidates": [
             _story_payload(
@@ -435,6 +472,11 @@ def build_debate_input(
         ):
             continue
         candidates.append(row)
+    candidates = _ensure_min_story_rows(
+        candidates,
+        window_rows,
+        DEBATE_MIN_CANDIDATES,
+    )
     candidates.sort(
         key=lambda row: (
             int(row["descendants"] or 0),
@@ -493,6 +535,41 @@ def _collect_story_reference_ids(*payloads: Mapping[str, Any]) -> List[int]:
     return out
 
 
+def _input_count(value: Mapping[str, Any], key: str) -> int:
+    items = value.get(key)
+    return len(items) if isinstance(items, list) else 0
+
+
+def _insights_input_counts(
+    *,
+    signals_input: Mapping[str, Any],
+    trends_input: Mapping[str, Any],
+    opportunities_input: Mapping[str, Any],
+    debates_input: Mapping[str, Any],
+) -> Dict[str, int]:
+    return {
+        "signals_stories": _input_count(signals_input, "stories"),
+        "trend_topics": _input_count(trends_input, "topicDailyStats"),
+        "opportunity_candidates": _input_count(opportunities_input, "candidates"),
+        "debate_candidates": _input_count(debates_input, "candidates"),
+    }
+
+
+def _insights_input_gaps(counts: Mapping[str, int]) -> List[str]:
+    checks = (
+        ("signals_stories", SIGNALS_MIN_STORIES, "signals stories"),
+        ("trend_topics", TREND_HEAT_MIN_TOPICS, "trend topics"),
+        ("opportunity_candidates", OPPORTUNITY_MIN_CANDIDATES, "opportunity candidates"),
+        ("debate_candidates", DEBATE_MIN_CANDIDATES, "debate candidates"),
+    )
+    gaps = []
+    for key, minimum, label in checks:
+        actual = int(counts.get(key) or 0)
+        if actual < minimum:
+            gaps.append(f"{label} {actual}/{minimum}")
+    return gaps
+
+
 def _usage_checkpoint(agent: Any) -> Optional[int]:
     fn = getattr(agent, "usage_checkpoint", None)
     if not callable(fn):
@@ -539,11 +616,11 @@ def _validate_final_payload(payload: Mapping[str, Any], allowed_story_ids: Seque
     if len(payload.get("signals") or []) != 3:
         raise InsightsValidationError("signals must contain exactly 3 items")
     trend_items = ((payload.get("trendHeatmap") or {}).get("items") or [])
-    if not (5 <= len(trend_items) <= 8):
+    if not (TREND_HEAT_MIN_TOPICS <= len(trend_items) <= 8):
         raise InsightsValidationError("trendHeatmap.items must contain 5-8 items")
-    if not (3 <= len(payload.get("opportunities") or []) <= 5):
+    if not (OPPORTUNITY_MIN_CANDIDATES <= len(payload.get("opportunities") or []) <= 5):
         raise InsightsValidationError("opportunities must contain 3-5 items")
-    if not (2 <= len(payload.get("debates") or []) <= 4):
+    if not (DEBATE_MIN_CANDIDATES <= len(payload.get("debates") or []) <= 4):
         raise InsightsValidationError("debates must contain 2-4 items")
     allowed = {int(sid) for sid in allowed_story_ids}
     for sid in _collect_story_reference_ids(payload):
@@ -667,9 +744,6 @@ def run_insights_once(
     usage_checkpoint = None
 
     try:
-        agent = ai_agent or InsightsAgentRunner()
-        usage_checkpoint = _usage_checkpoint(agent)
-
         signals_input = build_today_signals_input(
             today_rows,
             target_date=target_date,
@@ -692,6 +766,33 @@ def run_insights_once(
             feed_ranks=feed_ranks,
             comments_by_story=comments_by_story,
         )
+
+        input_counts = _insights_input_counts(
+            signals_input=signals_input,
+            trends_input=trends_input,
+            opportunities_input=opportunities_input,
+            debates_input=debates_input,
+        )
+        input_gaps = _insights_input_gaps(input_counts)
+        if input_gaps:
+            reason = "insufficient_insights_inputs"
+            _finish_run_record(
+                run_id=run_id,
+                date=target_date,
+                started_at=started_at,
+                status="skipped",
+                error=f"{reason}: {'; '.join(input_gaps)}",
+            )
+            return {
+                "status": "skipped",
+                "reason": reason,
+                "date": target_date,
+                "input_counts": input_counts,
+                "input_gaps": input_gaps,
+            }
+
+        agent = ai_agent or InsightsAgentRunner()
+        usage_checkpoint = _usage_checkpoint(agent)
 
         signals_out = agent.run_signals(signals_input)
         trends_out = agent.run_trends(trends_input)

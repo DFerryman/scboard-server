@@ -2383,6 +2383,127 @@ class CloudSyncReadModel(_SqliteCase):
         finally:
             conn.close()
 
+    def test_insights_update_gate_runs_after_interval_or_when_disabled(self):
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.upsert_insight(
+                    conn,
+                    "2026-05-19",
+                    {"headline": "existing"},
+                    [101, 102],
+                    1_000,
+                    7,
+                )
+                with patch.object(repository, "now_seconds", return_value=1_000 + 14_399):
+                    self.assertFalse(
+                        repository.insight_needs_update(
+                            conn,
+                            "2026-05-19",
+                            4 * 60 * 60,
+                            [101, 102],
+                        )
+                    )
+                with patch.object(repository, "now_seconds", return_value=1_000 + 14_400):
+                    self.assertTrue(
+                        repository.insight_needs_update(
+                            conn,
+                            "2026-05-19",
+                            4 * 60 * 60,
+                            [101, 102],
+                        )
+                    )
+                self.assertTrue(
+                    repository.insight_needs_update(
+                        conn,
+                        "2026-05-19",
+                        0,
+                        [101, 102],
+                    )
+                )
+        finally:
+            conn.close()
+
+    def test_opportunity_and_debate_inputs_backfill_low_signal_windows(self):
+        from . import insights
+
+        target = "2026-05-19"
+        start, _ = repository.digest_date_epoch_bounds(target)
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                for offset in range(5):
+                    self._insert_done_story(
+                        conn,
+                        200 + offset,
+                        start + offset * 60,
+                        topic=f"topic-{offset}",
+                        score=10 + offset,
+                        descendants=1,
+                    )
+                conn.execute("UPDATE stories SET discussion_themes='[]', insights='[]'")
+                rows = repository.candidate_rows_for_insights(
+                    conn,
+                    start_ts=start,
+                    end_ts=start + 86400,
+                )
+            opportunities = insights.build_opportunity_input(
+                rows,
+                target_end_ts=start + 86400,
+                feed_ranks={},
+                comments_by_story={},
+            )
+            debates = insights.build_debate_input(
+                rows,
+                feed_ranks={},
+                comments_by_story={},
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual(len(opportunities["candidates"]), 3)
+        self.assertEqual(len(debates["candidates"]), 2)
+
+    def test_run_insights_once_skips_when_trend_topics_are_insufficient(self):
+        from . import insights
+
+        target = "2026-05-19"
+        start, _ = repository.digest_date_epoch_bounds(target)
+
+        class ExplodingAgent:
+            def run_signals(self, _payload):
+                raise AssertionError("agent should not run when inputs are insufficient")
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                for offset in range(5):
+                    self._insert_done_story(
+                        conn,
+                        300 + offset,
+                        start + offset * 60,
+                        topic="same-topic",
+                        score=120 + offset,
+                        descendants=60 + offset,
+                    )
+        finally:
+            conn.close()
+
+        summary = insights.run_insights_once(
+            date=target,
+            force=True,
+            ai_agent=ExplodingAgent(),
+        )
+        self.assertEqual(summary["status"], "skipped")
+        self.assertEqual(summary["reason"], "insufficient_insights_inputs")
+        self.assertEqual(summary["input_counts"]["trend_topics"], 1)
+        self.assertIn("trend topics 1/5", summary["input_gaps"])
+        conn = db.connect()
+        try:
+            self.assertIsNone(repository.get_insight_row(conn, target))
+        finally:
+            conn.close()
+
     def test_insights_agent_inputs_are_minimal_by_section(self):
         from . import insights
 
@@ -2752,6 +2873,7 @@ class CloudSyncReadModel(_SqliteCase):
             self.assertIn("Output Chinese reader-facing text", prompt)
             self.assertIn("Return strict JSON only", prompt)
             self.assertIn("unfinished sentence", prompt)
+            self.assertIn("Security boundary", prompt)
             self.assertFalse(
                 any("\u4e00" <= ch <= "\u9fff" for ch in prompt),
                 prompt,
