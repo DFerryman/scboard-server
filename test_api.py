@@ -2478,6 +2478,52 @@ class CloudSyncReadModel(_SqliteCase):
 
         self.assertEqual(len(payload["candidates"][0]["comments"]), 2)
 
+    def test_insights_inputs_preserve_generated_reader_fields(self):
+        from . import insights
+
+        target = "2026-05-19"
+        start, _ = repository.digest_date_epoch_bounds(target)
+        themes = [
+            {"title": f"theme-{i}", "summary": f"theme summary {i}"}
+            for i in range(5)
+        ]
+        insight_items = [
+            {"author": f"user-{i}", "score": i, "text": f"reader insight {i}"}
+            for i in range(4)
+        ]
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                self._insert_done_story(conn, 101, start, score=120, descendants=80)
+                conn.execute(
+                    """
+                    UPDATE stories
+                       SET discussion_themes=?, insights=?
+                     WHERE id=?
+                    """,
+                    (
+                        json.dumps(themes, ensure_ascii=False),
+                        json.dumps(insight_items, ensure_ascii=False),
+                        101,
+                    ),
+                )
+                rows = repository.candidate_rows_for_insights(
+                    conn,
+                    start_ts=start,
+                    end_ts=start + 86400,
+                )
+            payload = insights.build_debate_input(
+                rows,
+                feed_ranks={},
+                comments_by_story={},
+            )
+        finally:
+            conn.close()
+
+        story = payload["candidates"][0]
+        self.assertEqual(story["discussionThemes"], themes)
+        self.assertEqual(story["insights"], insight_items)
+
     def test_trend_heat_agent_uses_server_metrics_not_model_inventions(self):
         from .insights_agents import TrendHeatAgent
 
@@ -4909,15 +4955,24 @@ class AiValidation(unittest.TestCase):
         self.assertEqual(len(out["insights"]), 8)
         self.assertEqual(out["insights"][0]["text"], ("comment body " * 40).strip())
 
-    def test_prompt_advertises_compact_output_targets(self):
-        """Prompt size targets are soft guidance; validators must preserve output."""
+    def test_prompt_uses_budget_guidance_not_static_truncation_caps(self):
+        """Prompt targets are computed per request; validators preserve output."""
         prompt = ai_agent_module._SYSTEM_PROMPT
         self.assertIn("discussionThemes", prompt)
-        self.assertIn("up to 4 discussion themes", prompt)
-        self.assertIn("up to 3 representative comments", prompt)
-        self.assertIn("~80-120 Chinese characters", prompt)
+        self.assertIn("request-specific output budget guidance", prompt)
+        self.assertNotIn("up to 4 discussion themes", prompt)
+        self.assertNotIn("up to 3 representative comments", prompt)
+        self.assertNotIn("~80-120 Chinese characters", prompt)
         self.assertNotIn("\"pro\"", prompt)
         self.assertNotIn("\"con\"", prompt)
+
+        guidance = ai_agent_module._enrich_output_budget_guidance(
+            6400,
+            story_count=2,
+        )
+        self.assertIn("6400 total; about 3200 per story", guidance)
+        self.assertIn("aiSummary target:", guidance)
+        self.assertIn("not server-side truncation limits", guidance)
 
 
 class RealAiAgentFailover(unittest.TestCase):
@@ -4944,6 +4999,52 @@ class RealAiAgentFailover(unittest.TestCase):
                 timeout=1.0,
             ),
         ]
+
+    def test_story_prompt_includes_budget_from_effective_max_tokens(self):
+        class CapturingAgent(RealAiAgent):
+            def __init__(self, **kwargs):
+                self.payloads = []
+                super().__init__(**kwargs)
+
+            def _post_chat(self, config, payload):
+                self.payloads.append(payload)
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "titleZh": "title",
+                                        "topicName": "General",
+                                        "aiSummary": "summary",
+                                        "discussionThemes": [],
+                                        "insights": [],
+                                        "terms": [],
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+
+        agent = CapturingAgent(
+            configs=[
+                AiProviderConfig(
+                    api_key="secret",
+                    model="model",
+                    base_url="https://example.test/v1",
+                    timeout=1.0,
+                    max_output_tokens=1800,
+                )
+            ]
+        )
+        agent.process_story(self._story_row(), [])
+
+        payload = agent.payloads[0]
+        self.assertEqual(payload["max_tokens"], 1800)
+        system_prompt = payload["messages"][0]["content"]
+        self.assertIn("1800 total; about 1800 per story", system_prompt)
+        self.assertIn("not server-side truncation limits", system_prompt)
 
     def test_insights_ai_config_is_independent_from_story_ai_config(self):
         old_values = {
@@ -6761,6 +6862,71 @@ class RealAiAgentBatchAndSelection(unittest.TestCase):
         self.assertEqual(results[101]["titleZh"], "标题 A")
         self.assertEqual(results[102]["aiSummary"], "摘要 B")
 
+
+    def test_real_agent_batch_prompt_uses_per_story_output_budget(self):
+        class CapturingBatchAgent(RealAiAgent):
+            def __init__(self, **kwargs):
+                self.payloads = []
+                super().__init__(**kwargs)
+
+            def _post_chat(self, config, payload):
+                self.payloads.append(payload)
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "results": [
+                                            {
+                                                "id": 101,
+                                                "titleZh": "A",
+                                                "topicName": "General",
+                                                "aiSummary": "summary A",
+                                                "discussionThemes": [],
+                                                "insights": [],
+                                                "terms": [],
+                                            },
+                                            {
+                                                "id": 102,
+                                                "titleZh": "B",
+                                                "topicName": "General",
+                                                "aiSummary": "summary B",
+                                                "discussionThemes": [],
+                                                "insights": [],
+                                                "terms": [],
+                                            },
+                                        ]
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+
+        agent = CapturingBatchAgent(
+            configs=[
+                AiProviderConfig(
+                    api_key="k1",
+                    model="m1",
+                    base_url="https://a.example/v1",
+                    timeout=1.0,
+                    max_output_tokens=6400,
+                )
+            ]
+        )
+        agent.process_stories_batch(
+            [
+                {"story": self._story(101, "A"), "comments": []},
+                {"story": self._story(102, "B"), "comments": []},
+            ]
+        )
+
+        payload = agent.payloads[0]
+        self.assertEqual(payload["max_tokens"], 6400)
+        system_prompt = payload["messages"][0]["content"]
+        self.assertIn("6400 total; about 3200 per story", system_prompt)
+        self.assertIn("not server-side truncation limits", system_prompt)
 
     def test_real_agent_recommends_batch_size_from_output_cap(self):
         agent = RealAiAgent(

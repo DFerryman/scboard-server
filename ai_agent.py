@@ -67,6 +67,57 @@ _MAX_AI_USAGE_TOKENS = 10_000_000
 _ENRICH_OUTPUT_TOKENS_PER_STORY = 3200
 
 
+def _clamp_int(value: int, lower: int, upper: int) -> int:
+    return max(lower, min(upper, int(value)))
+
+
+def _enrich_output_budget_targets(
+    max_tokens: int,
+    *,
+    story_count: int = 1,
+) -> Dict[str, int]:
+    total = max(1, int(max_tokens))
+    stories = max(1, int(story_count))
+    per_story = max(1, total // stories)
+    return {
+        "totalTokens": total,
+        "storyCount": stories,
+        "tokensPerStory": per_story,
+        "summaryMinChars": _clamp_int(per_story // 24, 80, 180),
+        "summaryMaxChars": _clamp_int(per_story // 12, 140, 360),
+        "discussionThemes": _clamp_int(round(per_story / 800), 2, 8),
+        "insights": _clamp_int(round(per_story / 1000), 1, 6),
+        "terms": _clamp_int(round(per_story / 650), 2, 8),
+    }
+
+
+def _enrich_output_budget_guidance(
+    max_tokens: int,
+    *,
+    story_count: int = 1,
+) -> str:
+    targets = _enrich_output_budget_targets(
+        max_tokens,
+        story_count=story_count,
+    )
+    return (
+        "Output budget guidance derived from this request's max_tokens "
+        f"({targets['totalTokens']} total; about "
+        f"{targets['tokensPerStory']} per story):\n"
+        f"- aiSummary target: {targets['summaryMinChars']}-"
+        f"{targets['summaryMaxChars']} Chinese characters.\n"
+        f"- discussionThemes target: up to {targets['discussionThemes']} "
+        "coherent comment themes when comments support them.\n"
+        f"- insights target: up to {targets['insights']} representative "
+        "comments when comments are present.\n"
+        f"- terms target: up to {targets['terms']} useful explanations.\n"
+        "These are generation targets, not server-side truncation limits. "
+        "Do not cut off reader-facing text mid-thought; if the material "
+        "needs more room, keep complete valid JSON and include the important "
+        "content rather than silently shortening fields."
+    )
+
+
 def _loads_json_from_model_text(content: str) -> Any:
     """Parse JSON from chat content, tolerating common model wrappers."""
     stripped = content.strip()
@@ -1255,9 +1306,10 @@ _SYSTEM_PROMPT = (
     "new Chinese topic name when no existing one fits and the catalog has "
     "fewer than 16 entries. Use a short Chinese noun phrase; avoid one-off "
     "labels, company names, or product names. When uncertain, use \"综合技术\".\n"
-    "- aiSummary: string, ~80-120 Chinese characters. Lead with the facts, "
-    "then any controversy.\n"
-    "- discussionThemes: array, up to 4 discussion themes from comments. "
+    "- aiSummary: string. Use the request-specific output budget guidance "
+    "for length. Lead with the facts, then any controversy.\n"
+    "- discussionThemes: array. Use the request-specific output budget "
+    "guidance for the target count. "
     "Provide entries whenever comments are present and coherent themes exist; "
     "use [] only when there are no comments or no coherent theme. Each entry: "
     "{\"title\": \"short Chinese theme\", \"summary\": \"one-sentence Chinese "
@@ -1265,11 +1317,13 @@ _SYSTEM_PROMPT = (
     "support/oppose camps: technical corrections, cost concerns, "
     "implementation details, ethics, alternatives, and experience reports "
     "are all valid themes — many comments carry no clear stance.\n"
-    "- insights: array, up to 3 representative comments. Provide entries "
-    "whenever comments are present. Each entry: {\"author\": \"hn username\", "
+    "- insights: array. Use the request-specific output budget guidance for "
+    "the target count. Provide entries whenever comments are present. Each "
+    "entry: {\"author\": \"hn username\", "
     "\"score\": 0, \"text\": \"Chinese paraphrase\"}. score is the AI's "
     "importance/representativeness ranking, NOT the HN upvote count.\n"
-    "- terms: array, up to 5 term explanations. Each entry: {\"term\": "
+    "- terms: array. Use the request-specific output budget guidance for "
+    "the target count. Each entry: {\"term\": "
     "\"source term\", \"def\": \"one-sentence Chinese explanation\"}. The "
     "key MUST be \"def\", not \"def_\" or \"definition\".\n"
     "Do NOT omit any field. Use \"\" for empty strings, [] for empty "
@@ -2262,35 +2316,34 @@ class RealAiAgent(AiAgent):
         # must surface in ``enrich_error`` via the Enricher's normal retry
         # path. Swallowing them here would hide misconfiguration as healthy
         # "ai agent returned None" output.
+        user_prompt = self._build_user_prompt(story_row, comments)
         base_payload = {
             "temperature": 0.3,
             "response_format": {"type": "json_object"},
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        _SYSTEM_PROMPT
-                        + "\n\n"
-                        + self._topic_section(topic_catalog)
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": self._build_user_prompt(story_row, comments),
-                },
-            ],
         }
 
         def _process_with_config(config: AiProviderConfig) -> Dict[str, Any]:
+            max_tokens = _resolve_max_tokens(
+                config, _ENRICH_OUTPUT_TOKENS_PER_STORY
+            )
+            system_content = (
+                _SYSTEM_PROMPT
+                + "\n\n"
+                + _enrich_output_budget_guidance(max_tokens, story_count=1)
+                + "\n\n"
+                + self._topic_section(topic_catalog)
+            )
             response = self._post_chat_for_purpose(
                 "story",
                 config,
                 {
                     **base_payload,
                     "model": config.model,
-                    "max_tokens": _resolve_max_tokens(
-                        config, _ENRICH_OUTPUT_TOKENS_PER_STORY
-                    ),
+                    "max_tokens": max_tokens,
+                    "messages": [
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": user_prompt},
+                    ],
                 },
             )
             raw = self._extract_json(response)
@@ -2340,9 +2393,7 @@ class RealAiAgent(AiAgent):
         # the system message so provider prefix caches hit across batches in
         # the same wave. The user message holds only the variable JSON
         # payload, which is the cache miss tail.
-        system_content = (
-            _SYSTEM_PROMPT
-            + "\n\n"
+        system_suffix = (
             "Enrich each Hacker News story below. Return one strict JSON object "
             "with a results array. Each result object must include id plus the "
             "same fields required for a single story: titleZh, topicId, topicName, aiSummary, "
@@ -2359,21 +2410,32 @@ class RealAiAgent(AiAgent):
         base_payload = {
             "temperature": 0.3,
             "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": user_content},
-            ],
         }
         desired_max_tokens = _ENRICH_OUTPUT_TOKENS_PER_STORY * len(items)
 
         def _process_with_config(config: AiProviderConfig) -> Dict[int, Dict[str, Any]]:
+            max_tokens = _resolve_max_tokens(config, desired_max_tokens)
+            system_content = (
+                _SYSTEM_PROMPT
+                + "\n\n"
+                + _enrich_output_budget_guidance(
+                    max_tokens,
+                    story_count=len(items),
+                )
+                + "\n\n"
+                + system_suffix
+            )
             response = self._post_chat_for_purpose(
                 "story-batch",
                 config,
                 {
                     **base_payload,
                     "model": config.model,
-                    "max_tokens": _resolve_max_tokens(config, desired_max_tokens),
+                    "max_tokens": max_tokens,
+                    "messages": [
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": user_content},
+                    ],
                 },
             )
             try:

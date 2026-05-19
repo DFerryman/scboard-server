@@ -132,13 +132,13 @@ def _story_payload(
         "time": int(row["hn_time"] or 0),
         "feedRanks": dict(feed_ranks.get(story_id, {})),
         "aiSummary": row["ai_summary"] or "",
-        "discussionThemes": _coerce_list_json(row["discussion_themes"])[:2],
+        "discussionThemes": _coerce_list_json(row["discussion_themes"]),
     }
     if include_domain and "domain" in row.keys():
         out["domain"] = row["domain"] or ""
     insights = _coerce_list_json(row["insights"])
     if include_insights and insights:
-        out["insights"] = insights[:3]
+        out["insights"] = insights
     if include_raw_text:
         out["rawTextSnippet"] = (row["raw_text"] or "")[: max(0, raw_text_max_chars)]
     if comments is not None:
