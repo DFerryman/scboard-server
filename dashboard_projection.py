@@ -56,6 +56,26 @@ def _decode_run_ai_usage(row: sqlite3.Row) -> Optional[Dict[str, Any]]:
     return usage if isinstance(usage, dict) else None
 
 
+def _decode_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _decode_json_list(raw: Any) -> List[Any]:
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return value if isinstance(value, list) else []
+
+
 def row_to_run_summary(
     row: sqlite3.Row,
     *,
@@ -263,6 +283,93 @@ def _safe_ai_status_for_dashboard(ai_status: Optional[Dict[str, Any]]) -> Option
     return out
 
 
+def _latest_insight_summary(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+) -> Optional[Dict[str, Any]]:
+    try:
+        row = conn.execute(
+            "SELECT * FROM insights ORDER BY generated_at DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+
+    generated_at = int(row["generated_at"] or 0)
+    interval = max(0, int(settings.INSIGHTS_UPDATE_INTERVAL_SECONDS))
+    source_story_ids = _decode_json_list(row["source_story_ids"])
+    out: Dict[str, Any] = {
+        "date": row["date"],
+        "generated_at": generated_at,
+        "window_days": int(row["window_days"] or 0),
+        "source_story_count": len(source_story_ids),
+        "age_seconds": max(0, int(now) - generated_at) if generated_at else None,
+        "next_update_after": (
+            generated_at + interval if generated_at and interval > 0 else generated_at
+        ),
+        "due": (
+            True
+            if not generated_at or interval <= 0
+            else int(now) - generated_at >= interval
+        ),
+    }
+    model_usage = _decode_json_dict(row["model_usage"])
+    if model_usage is not None:
+        out["model_usage"] = model_usage
+    return out
+
+
+def _latest_insight_run_summary(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
+    try:
+        row = conn.execute(
+            "SELECT * FROM insights_runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+
+    status = row["status"] or ""
+    out: Dict[str, Any] = {
+        "run_id": row["run_id"],
+        "date": row["date"],
+        "started_at": int(row["started_at"]) if row["started_at"] is not None else None,
+        "finished_at": int(row["finished_at"]) if row["finished_at"] is not None else None,
+        "status": status,
+        "has_error": status == "failed" and bool(row["error"]),
+    }
+    if status == "skipped" and row["error"]:
+        out["reason"] = row["error"]
+    model_usage = _decode_json_dict(row["model_usage"])
+    if model_usage is not None:
+        out["model_usage"] = model_usage
+    return out
+
+
+def insights_status_for_dashboard(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+) -> Dict[str, Any]:
+    """Dashboard-safe operational state for the server-side insights pipeline."""
+    try:
+        row = conn.execute("SELECT COUNT(*) AS c FROM insights").fetchone()
+        count = int(row["c"] or 0) if row is not None else 0
+    except sqlite3.Error:
+        count = 0
+
+    return {
+        "enabled": bool(settings.INSIGHTS_ENABLED),
+        "update_interval_seconds": int(settings.INSIGHTS_UPDATE_INTERVAL_SECONDS),
+        "window_days": int(settings.INSIGHTS_WINDOW_DAYS),
+        "count": count,
+        "latest": _latest_insight_summary(conn, now=now),
+        "latestRun": _latest_insight_run_summary(conn),
+    }
+
+
 def build_dashboard_summary(
     conn: sqlite3.Connection,
     *,
@@ -313,6 +420,7 @@ def build_dashboard_summary(
         "latestRun": latest_run,
         "latestCloudSync": latest_cloud_sync,
         "ai": _safe_ai_status_for_dashboard(ai_status),
+        "insights": insights_status_for_dashboard(conn, now=server_time),
         "recentIngestRunsCount": len(runs_list),
         "recentCloudSyncRunsCount": len(cloud_syncs_list),
     }

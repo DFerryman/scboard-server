@@ -962,6 +962,20 @@ class ServerHttpSurfaceGone(unittest.TestCase):
 
 
 class SettingsValidation(unittest.TestCase):
+    def test_default_insights_interval_tracks_ingest_interval_at_4x(self):
+        with patch.dict(
+            os.environ,
+            {
+                "HNREADER_INGEST_INTERVAL_SECONDS": "3600",
+                "HNREADER_INSIGHTS_UPDATE_INTERVAL_SECONDS": "",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                settings._default_insights_update_interval_seconds(),  # type: ignore[attr-defined]
+                4 * 3600,
+            )
+
     def test_runtime_int_range_rejects_extreme_worker_count(self):
         with self.assertRaises(RuntimeError):
             settings._require_int_range(  # type: ignore[attr-defined]
@@ -9384,6 +9398,53 @@ class DashboardProjectionContract(_SqliteCase):
         ]
         self.assertEqual(len(cloud_docs), 1)
         self.assertTrue(cloud_docs[0]["_id"].startswith("12:run-1:"))
+
+    def test_dashboard_summary_surfaces_insights_status_without_error_text(self):
+        from . import dashboard_projection
+
+        now = int(time.time())
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.upsert_insight(
+                    conn,
+                    "2026-05-19",
+                    {"headline": "h"},
+                    [101, 102, 101],
+                    now - 120,
+                    7,
+                    model_usage={"total_tokens": 123},
+                )
+                repository.record_insight_run(
+                    conn,
+                    run_id="insights-run-failed",
+                    date="2026-05-19",
+                    started_at=now - 60,
+                    finished_at=now - 50,
+                    status="failed",
+                    model_usage={"total_tokens": 9},
+                    error="provider stack with private details",
+                )
+                summary = dashboard_projection.build_dashboard_summary(
+                    conn,
+                    sync_version=3,
+                    server_time=now,
+                    published_at=now,
+                )
+        finally:
+            conn.close()
+
+        insights_status = summary["insights"]
+        self.assertTrue(insights_status["enabled"])
+        self.assertEqual(insights_status["count"], 1)
+        self.assertEqual(insights_status["latest"]["date"], "2026-05-19")
+        self.assertEqual(insights_status["latest"]["source_story_count"], 2)
+        self.assertEqual(
+            insights_status["latestRun"]["run_id"],
+            "insights-run-failed",
+        )
+        self.assertTrue(insights_status["latestRun"]["has_error"])
+        self.assertNotIn("private details", json.dumps(summary))
 
 
 class CloudSyncPreviousVersionUsesLastSuccessful(_SqliteCase):
