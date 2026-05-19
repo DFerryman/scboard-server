@@ -22,7 +22,7 @@ from .insights_agents import (
     contains_forbidden_words,
     sanitize_forbidden_words,
 )
-from .topics import topic_name_from_id
+from .topics import clean_topic_name, topic_name_from_id
 
 
 log = logging.getLogger(__name__)
@@ -102,11 +102,29 @@ def _coerce_list_json(value: Any) -> List[Any]:
     return data if isinstance(data, list) else []
 
 
-def _topic_label(topic: str) -> str:
+def _row_value(row: Any, key: str, default: Any = "") -> Any:
+    try:
+        if key in row.keys():
+            return row[key]
+    except AttributeError:
+        if isinstance(row, Mapping):
+            return row.get(key, default)
+    return default
+
+
+def _topic_label(topic: str, topic_name: Any = "") -> str:
+    name = clean_topic_name(topic_name)
+    if name:
+        return name
     clean = str(topic or "").strip()
-    if not clean:
-        return "General"
     return topic_name_from_id(clean)
+
+
+def _row_topic_label(row: Any) -> str:
+    return _topic_label(
+        str(row["topic"] or ""),
+        _row_value(row, "topic_name", ""),
+    )
 
 
 def _story_payload(
@@ -125,6 +143,7 @@ def _story_payload(
         "id": story_id,
         "kind": row["kind"] or "story",
         "topic": row["topic"] or "",
+        "topicName": _row_topic_label(row),
         "titleZh": row["title_zh"] or row["title_en"] or "",
         "titleEn": row["title_en"] or "",
         "score": int(row["score"] or 0),
@@ -158,7 +177,7 @@ def _build_today_topic_summary(rows: Sequence[Any]) -> List[Dict[str, Any]]:
     counts: Dict[str, int] = {}
     score_sum: Dict[str, int] = {}
     for row in rows:
-        topic = _topic_label(row["topic"] or "")
+        topic = _row_topic_label(row)
         counts[topic] = counts.get(topic, 0) + 1
         score_sum[topic] = score_sum.get(topic, 0) + int(row["score"] or 0)
     return [
@@ -205,12 +224,33 @@ def _date_list(start_date: str, days: int) -> List[str]:
     return [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
 
 
-def _trend_key(today_value: float, previous_avg: float, total_count: int) -> str:
-    if today_value >= previous_avg * 2 + 1 and today_value >= 2:
+def _daily_topic_activity_heat(item: Mapping[str, Any]) -> float:
+    count = max(0, int(item.get("count") or 0))
+    score_sum = max(0, int(item.get("scoreSum") or 0))
+    descendants_sum = max(0, int(item.get("descendantsSum") or 0))
+    if count <= 0:
+        return 0.0
+    raw = count * 18 + score_sum / 18 + descendants_sum / 9
+    return max(0.0, min(100.0, raw))
+
+
+def _trend_key(
+    today_heat: float,
+    previous_avg_heat: float,
+    *,
+    today_count: int,
+    previous_avg_count: float,
+    total_count: int,
+) -> str:
+    heat_delta = today_heat - previous_avg_heat
+    if (
+        (heat_delta >= 18 and today_heat >= 55)
+        or (today_count >= previous_avg_count * 2 + 1 and today_count >= 2)
+    ):
         return "burst"
-    if today_value > previous_avg:
+    if heat_delta >= 6:
         return "rising"
-    if today_value < previous_avg * 0.5 and total_count > 1:
+    if heat_delta <= -6 and total_count > 1:
         return "cooling"
     return "stable"
 
@@ -224,7 +264,7 @@ def build_trend_heat_input(
     dates = _date_list(start_date, settings.INSIGHTS_WINDOW_DAYS)
     by_topic: Dict[str, Dict[str, Any]] = {}
     for row in window_rows:
-        topic = _topic_label(row["topic"] or "")
+        topic = _row_topic_label(row)
         day = repository.date_in_digest_tz(int(row["hn_time"] or 0))
         if day not in dates:
             continue
@@ -258,17 +298,17 @@ def build_trend_heat_input(
         prev_count = sum(item["count"] for item in previous) / max(1, len(previous))
         prev_score = sum(item["scoreSum"] for item in previous) / max(1, len(previous))
         prev_desc = sum(item["descendantsSum"] for item in previous) / max(1, len(previous))
+        today_heat = _daily_topic_activity_heat(today)
+        previous_avg_heat = sum(_daily_topic_activity_heat(item) for item in previous) / max(
+            1, len(previous)
+        )
         count_delta = today["count"] - prev_count
         score_delta = today["scoreSum"] - prev_score
         descendants_delta = today["descendantsSum"] - prev_desc
-        raw_heat = (
-            today["count"] * 18
-            + today["scoreSum"] / 20
-            + today["descendantsSum"] / 10
-            + max(0.0, count_delta) * 10
-            + max(0.0, score_delta) / 30
-            + max(0.0, descendants_delta) / 15
-            + sum(item["count"] for item in daily) * 2
+        heat_delta = today_heat - previous_avg_heat
+        rank_score = today_heat + max(0.0, heat_delta) * 0.75 + min(
+            10.0,
+            sum(item["count"] for item in daily),
         )
         scored.append(
             {
@@ -279,23 +319,32 @@ def build_trend_heat_input(
                 "countDelta": round(count_delta, 2),
                 "scoreDelta": round(score_delta, 2),
                 "descendantsDelta": round(descendants_delta, 2),
-                "_rawHeat": raw_heat,
-                "trendKey": _trend_key(today["count"], prev_count, sum(item["count"] for item in daily)),
+                "heatDelta": round(heat_delta, 2),
+                "_todayHeat": today_heat,
+                "_rankScore": rank_score,
+                "trendKey": _trend_key(
+                    today_heat,
+                    previous_avg_heat,
+                    today_count=int(today["count"]),
+                    previous_avg_count=prev_count,
+                    total_count=sum(item["count"] for item in daily),
+                ),
             }
         )
-    scored.sort(key=lambda item: (item["_rawHeat"], len(item["todayStoryIds"])), reverse=True)
+    scored.sort(key=lambda item: (item["_rankScore"], len(item["todayStoryIds"])), reverse=True)
     selected = scored[: max(5, settings.INSIGHTS_MAX_TREND_TOPICS)]
-    max_heat = max((item["_rawHeat"] for item in selected), default=1.0) or 1.0
     out_items = []
     for item in selected[: settings.INSIGHTS_MAX_TREND_TOPICS]:
-        heat = int(round(30 + 70 * (item["_rawHeat"] / max_heat)))
-        today_count = int(item["daily"][-1]["count"])
-        prev_avg = (today_count - float(item["countDelta"]))
-        delta = today_count - prev_avg
+        heat = int(round(float(item["_todayHeat"])))
+        delta = int(round(float(item["heatDelta"])))
         sign = "+" if delta >= 0 else ""
         out_items.append(
             {
-                **{k: v for k, v in item.items() if k != "_rawHeat"},
+                **{
+                    k: v
+                    for k, v in item.items()
+                    if k not in ("_todayHeat", "_rankScore")
+                },
                 "heat": max(0, min(100, heat)),
                 "deltaText": f"{sign}{int(round(delta))} / 24h",
             }

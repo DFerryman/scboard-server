@@ -2097,13 +2097,14 @@ def candidate_rows_for_insights(
         params.append(max(1, int(limit)))
     rows = conn.execute(
         f"""
-        SELECT *
-        FROM stories
-        WHERE enrich_status='done'
-          AND enriched_at IS NOT NULL
-          AND needs_reenrich=0
-          AND hn_time >= ? AND hn_time < ?
-        ORDER BY hn_time DESC, score DESC, descendants DESC, id ASC
+        SELECT s.*, COALESCE(t.name, '') AS topic_name
+        FROM stories s
+        LEFT JOIN topics t ON t.id=s.topic
+        WHERE s.enrich_status='done'
+          AND s.enriched_at IS NOT NULL
+          AND s.needs_reenrich=0
+          AND s.hn_time >= ? AND s.hn_time < ?
+        ORDER BY s.hn_time DESC, s.score DESC, s.descendants DESC, s.id ASC
         {limit_clause}
         """,
         tuple(params),

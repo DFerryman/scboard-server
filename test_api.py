@@ -2578,6 +2578,109 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(story["discussionThemes"], themes)
         self.assertEqual(story["insights"], insight_items)
 
+    def test_trend_heat_uses_dynamic_topic_display_names(self):
+        from . import insights
+
+        target = "2026-05-19"
+        start, _ = repository.digest_date_epoch_bounds(target)
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                conn.execute(
+                    """
+                    INSERT INTO topics(id, name, created_at, updated_at, last_seen_at)
+                    VALUES('topic-ai-coding', 'AI Coding', ?, ?, ?)
+                    """,
+                    (start, start, start),
+                )
+                self._insert_done_story(
+                    conn,
+                    101,
+                    start,
+                    topic="topic-ai-coding",
+                    score=120,
+                    descendants=80,
+                )
+                rows = repository.candidate_rows_for_insights(
+                    conn,
+                    start_ts=start,
+                    end_ts=start + 86400,
+                )
+            payload = insights.build_trend_heat_input(
+                rows,
+                target_date=target,
+                start_date=target,
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual(rows[0]["topic_name"], "AI Coding")
+        self.assertEqual(payload["topicDailyStats"][0]["topic"], "AI Coding")
+
+    def test_trend_heat_delta_tracks_activity_heat_not_story_count(self):
+        from . import insights
+
+        target = "2026-05-19"
+        start_ts, end_ts, start_date = insights._window_bounds(target, 7)
+        dates = insights._date_list(start_date, settings.INSIGHTS_WINDOW_DAYS)
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                conn.execute(
+                    """
+                    INSERT INTO topics(id, name, created_at, updated_at, last_seen_at)
+                    VALUES('rising-topic', 'AI Coding', ?, ?, ?)
+                    """,
+                    (start_ts, start_ts, start_ts),
+                )
+                for offset, day in enumerate(dates[:-1]):
+                    day_start, _ = repository.digest_date_epoch_bounds(day)
+                    self._insert_done_story(
+                        conn,
+                        200 + offset,
+                        day_start,
+                        topic="rising-topic",
+                        score=18,
+                        descendants=9,
+                    )
+                today_start, _ = repository.digest_date_epoch_bounds(target)
+                self._insert_done_story(
+                    conn,
+                    300,
+                    today_start,
+                    topic="rising-topic",
+                    score=180,
+                    descendants=90,
+                )
+                for offset in range(4):
+                    self._insert_done_story(
+                        conn,
+                        400 + offset,
+                        today_start + offset + 1,
+                        topic=f"ordinary-topic-{offset}",
+                        score=50,
+                        descendants=9,
+                    )
+                rows = repository.candidate_rows_for_insights(
+                    conn,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                )
+            payload = insights.build_trend_heat_input(
+                rows,
+                target_date=target,
+                start_date=start_date,
+            )
+        finally:
+            conn.close()
+
+        item = next(
+            item for item in payload["topicDailyStats"] if item["topic"] == "AI Coding"
+        )
+        self.assertEqual(item["heat"], 38)
+        self.assertEqual(item["deltaText"], "+18 / 24h")
+        self.assertEqual(item["trendKey"], "rising")
+
     def test_trend_heat_agent_uses_server_metrics_not_model_inventions(self):
         from .insights_agents import TrendHeatAgent
 
