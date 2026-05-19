@@ -2853,6 +2853,72 @@ class CloudSyncReadModel(_SqliteCase):
             self.assertEqual(item["supportWidth"] + item["opposeWidth"], 100)
             self.assertEqual(item["intensity"], 100)
 
+    def test_insights_agents_preserve_long_reader_text(self):
+        from .insights_agents import DebateAgent, OpportunityAgent, TodaySignalsAgent
+
+        signals = object.__new__(TodaySignalsAgent).validate(
+            {
+                "headline": "headline " * 40,
+                "summary": "summary " * 80,
+                "signals": [
+                    {
+                        "id": f"signal-{i}",
+                        "label": "label",
+                        "title": "title " * 30,
+                        "brief": "brief " * 70,
+                        "trend": "+100",
+                        "tone": "flat",
+                    }
+                    for i in range(3)
+                ],
+            }
+        )
+        self.assertEqual(signals["summary"], ("summary " * 80).strip())
+        self.assertEqual(signals["signals"][0]["brief"], ("brief " * 70).strip())
+
+        opportunities = object.__new__(OpportunityAgent).validate(
+            {
+                "opportunities": [
+                    {
+                        "title": "opportunity " * 30,
+                        "score": 80 + i,
+                        "category": "category " * 20,
+                        "audience": [f"audience-{n}" for n in range(6)],
+                        "thesis": "thesis " * 80,
+                        "whyNow": "why now " * 80,
+                        "risk": "risk " * 80,
+                        "linkedStoryIds": [101, 102, 103, 104, 105, 106, 107],
+                    }
+                    for i in range(3)
+                ]
+            },
+            {"candidates": [{"id": sid} for sid in range(101, 108)]},
+        )["opportunities"][0]
+        self.assertEqual(opportunities["thesis"], ("thesis " * 80).strip())
+        self.assertEqual(opportunities["audience"], [f"audience-{n}" for n in range(6)])
+        self.assertEqual(opportunities["linkedStoryIds"], [101, 102, 103, 104, 105, 106, 107])
+
+        debate = object.__new__(DebateAgent).validate(
+            {
+                "debates": [
+                    {
+                        "topic": "topic " * 30,
+                        "verdict": "verdict " * 20,
+                        "intensity": 80,
+                        "supportWidth": 50,
+                        "opposeWidth": 50,
+                        "support": "support " * 80,
+                        "oppose": "oppose " * 80,
+                        "watch": "watch " * 80,
+                    }
+                    for _ in range(2)
+                ]
+            }
+        )["debates"][0]
+        self.assertEqual(debate["support"], ("support " * 80).strip())
+        self.assertEqual(debate["oppose"], ("oppose " * 80).strip())
+        self.assertEqual(debate["watch"], ("watch " * 80).strip())
+
     def test_insights_forbidden_words_are_cleaned(self):
         from .insights_agents import contains_forbidden_words, sanitize_forbidden_words
 
@@ -4733,10 +4799,7 @@ class AiValidation(unittest.TestCase):
             out["terms"], [{"term": "RAG", "def": "x"}, {"term": "LLM", "def": "y"}]
         )
 
-    def test_discussion_themes_capped_and_normalized(self):
-        """Discussion themes replace binary pro/con camps. Models that
-        overshoot the prompt limit get silently truncated by the validator
-        so the per-story output budget isn't blown."""
+    def test_discussion_themes_are_normalized_without_truncation(self):
         out = validate_ai_output(
             {
                 "discussionThemes": [
@@ -4745,7 +4808,7 @@ class AiValidation(unittest.TestCase):
                     {"title": "", "summary": "missing title"},
                     {"title": "替代方案", "summary": "有人提出更简单路径"},
                     {"title": "长期维护", "summary": "担心项目后续维护"},
-                    {"title": "extra", "summary": "should be trimmed"},
+                    {"title": "extra" * 20, "summary": "should not be trimmed" * 20},
                 ]
             },
             fallback_title="t",
@@ -4757,51 +4820,97 @@ class AiValidation(unittest.TestCase):
                 {"title": "成本讨论", "summary": "用户关注部署成本"},
                 {"title": "替代方案", "summary": "有人提出更简单路径"},
                 {"title": "长期维护", "summary": "担心项目后续维护"},
+                {"title": "extra" * 20, "summary": "should not be trimmed" * 20},
             ],
         )
 
-    def test_insights_capped_at_three(self):
-        """Doc §6.4: 5 → 3 representative comments."""
+    def test_insights_preserve_all_items(self):
         items = [
             {"author": f"u{i}", "score": i, "text": f"t{i}"}
             for i in range(5)
         ]
         out = validate_ai_output({"insights": items}, fallback_title="t")
-        self.assertEqual(len(out["insights"]), 3)
+        self.assertEqual(len(out["insights"]), 5)
         self.assertEqual(
-            [it["author"] for it in out["insights"]], ["u0", "u1", "u2"]
+            [it["author"] for it in out["insights"]],
+            ["u0", "u1", "u2", "u3", "u4"],
         )
 
-    def test_ai_output_long_leaf_fields_are_truncated(self):
+    def test_ai_output_long_leaf_fields_are_preserved(self):
+        title = "T" * 300
+        author = "u" * 100
+        text = "comment " * 80
+        term = "TERM" * 30
+        definition = "definition " * 80
         out = validate_ai_output(
             {
-                "titleZh": "标" * 300,
+                "titleZh": title,
                 "insights": [
-                    {"author": "u" * 100, "score": 1, "text": "评" * 500}
+                    {"author": author, "score": 1, "text": text}
                 ],
-                "terms": [{"term": "T" * 100, "def": "D" * 500}],
+                "terms": [{"term": term, "def": definition}],
             },
             fallback_title="fallback",
         )
-        self.assertEqual(len(out["titleZh"]), 160)
-        self.assertEqual(len(out["insights"][0]["author"]), 64)
-        self.assertEqual(len(out["insights"][0]["text"]), 280)
-        self.assertEqual(len(out["terms"][0]["term"]), 48)
-        self.assertEqual(len(out["terms"][0]["def"]), 180)
+        self.assertEqual(out["titleZh"], title)
+        self.assertEqual(out["insights"][0]["author"], author)
+        self.assertEqual(out["insights"][0]["text"], text.strip())
+        self.assertEqual(out["terms"][0]["term"], term)
+        self.assertEqual(out["terms"][0]["def"], definition.strip())
 
-    def test_aiSummary_truncated_to_120_chars(self):
-        """Doc §6.4: 150 → 120 char cap. Hard cap protects the per-story
-        output budget when the model emits a long summary."""
-        long_summary = "甲" * 200
+    def test_aiSummary_preserved_without_truncation(self):
+        long_summary = "summary " * 200
         out = validate_ai_output(
             {"aiSummary": long_summary}, fallback_title="t"
         )
-        self.assertEqual(len(out["aiSummary"]), 120)
-        self.assertEqual(out["aiSummary"], "甲" * 120)
+        self.assertEqual(out["aiSummary"], long_summary.strip())
 
-    def test_prompt_advertises_tightened_caps(self):
-        """Prompt and validator must agree on the limits: prompt soft-hint
-        is what we pay tokens for; mismatch reintroduces the death-loop."""
+    def test_batch_ai_output_preserves_long_content(self):
+        long_summary = "batch summary " * 120
+        results = ai_agent_module.validate_batch_ai_output(
+            {
+                "results": [
+                    {
+                        "id": 101,
+                        "titleZh": "batch title " * 80,
+                        "topicName": "Batch Topic",
+                        "aiSummary": long_summary,
+                        "discussionThemes": [
+                            {"title": "theme " * 20, "summary": "theme summary " * 40}
+                        ],
+                        "insights": [
+                            {"author": "author " * 20, "score": 1, "text": "insight " * 80}
+                        ],
+                        "terms": [{"term": "term " * 20, "def": "definition " * 40}],
+                    }
+                ]
+            },
+            story_rows=[{"id": 101, "title_en": "fallback"}],
+        )
+        out = results[101]
+        self.assertEqual(out["aiSummary"], long_summary.strip())
+        self.assertEqual(out["discussionThemes"][0]["summary"], ("theme summary " * 40).strip())
+        self.assertEqual(out["insights"][0]["text"], ("insight " * 80).strip())
+        self.assertEqual(out["terms"][0]["def"], ("definition " * 40).strip())
+
+    def test_fallback_agent_preserves_all_comment_insights(self):
+        comments = [
+            {"by": f"user-{i}", "text": "<p>" + ("comment body " * 40) + "</p>"}
+            for i in range(8)
+        ]
+        out = FallbackAiAgent().process_story(
+            {
+                "title_en": "fallback title",
+            },
+            comments,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertEqual(len(out["insights"]), 8)
+        self.assertEqual(out["insights"][0]["text"], ("comment body " * 40).strip())
+
+    def test_prompt_advertises_compact_output_targets(self):
+        """Prompt size targets are soft guidance; validators must preserve output."""
         prompt = ai_agent_module._SYSTEM_PROMPT
         self.assertIn("discussionThemes", prompt)
         self.assertIn("up to 4 discussion themes", prompt)

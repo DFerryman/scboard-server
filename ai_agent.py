@@ -58,11 +58,6 @@ _AI_TRANSPORT_RETRY_ATTEMPTS = 3
 # otherwise poison cost/metrics; treating those values as "missing" plus a
 # warning is cheaper than auditing every downstream consumer for overflow.
 _MAX_AI_USAGE_TOKENS = 10_000_000
-_MAX_TITLE_ZH_CHARS = 160
-_MAX_INSIGHT_AUTHOR_CHARS = 64
-_MAX_INSIGHT_TEXT_CHARS = 280
-_MAX_TERM_CHARS = 48
-_MAX_TERM_DEF_CHARS = 180
 # Output budget per story for the enrich JSON (titleZh + summary +
 # discussionThemes + insights + terms). Some providers, especially DeepSeek
 # V4 Flash, occasionally need more than 2400 tokens to finish strict JSON for
@@ -1361,12 +1356,7 @@ def _validate_discussion_themes(value: Any) -> List[Dict[str, str]]:
     if not isinstance(value, list):
         return []
     out: List[Dict[str, str]] = []
-    # Cap matches the prompt limit ("up to 4 discussion themes"). Hard cap
-    # exists because models routinely overshoot soft prompt limits, and the
-    # per-story output budget can't absorb long theme lists.
     for item in value:
-        if len(out) >= 4:
-            break
         if not isinstance(item, dict):
             continue
         title = item.get("title")
@@ -1377,7 +1367,7 @@ def _validate_discussion_themes(value: Any) -> List[Dict[str, str]]:
         summary = summary.strip()
         if not title or not summary:
             continue
-        out.append({"title": title[:24], "summary": summary[:120]})
+        out.append({"title": title, "summary": summary})
     return out
 
 
@@ -1385,9 +1375,7 @@ def _validate_insights(value: Any) -> List[Dict[str, Any]]:
     if not isinstance(value, list):
         return []
     out: List[Dict[str, Any]] = []
-    # Cap matches the prompt limit ("up to 3 representative comments"). See
-    # _validate_discussion_themes rationale.
-    for item in value[:3]:
+    for item in value:
         if not isinstance(item, dict):
             continue
         author = item.get("author")
@@ -1399,9 +1387,9 @@ def _validate_insights(value: Any) -> List[Dict[str, Any]]:
         score = _coerce_int_in_range(item.get("score"), 0, 100000) or 0
         out.append(
             {
-                "author": author.strip()[:_MAX_INSIGHT_AUTHOR_CHARS] or "anonymous",
+                "author": author.strip() or "anonymous",
                 "score": score,
-                "text": text.strip()[:_MAX_INSIGHT_TEXT_CHARS],
+                "text": text.strip(),
             }
         )
     return out
@@ -1411,7 +1399,7 @@ def _validate_terms(value: Any) -> List[Dict[str, str]]:
     if not isinstance(value, list):
         return []
     out: List[Dict[str, str]] = []
-    for item in value[:8]:
+    for item in value:
         if not isinstance(item, dict):
             continue
         term = item.get("term")
@@ -1422,8 +1410,8 @@ def _validate_terms(value: Any) -> List[Dict[str, str]]:
             continue
         out.append(
             {
-                "term": term.strip()[:_MAX_TERM_CHARS],
-                "def": d.strip()[:_MAX_TERM_DEF_CHARS],
+                "term": term.strip(),
+                "def": d.strip(),
             }
         )
     return out
@@ -1441,7 +1429,7 @@ def validate_ai_output(
     served. ``titleZh`` falls back to ``fallback_title``; topic to ``web``.
     """
     out: Dict[str, Any] = {
-        "titleZh": str(fallback_title or "").strip()[:_MAX_TITLE_ZH_CHARS],
+        "titleZh": str(fallback_title or "").strip(),
         "topic": DEFAULT_TOPIC_ID,
         "topicName": DEFAULT_TOPIC_NAME,
         "aiSummary": "",
@@ -1454,7 +1442,7 @@ def validate_ai_output(
 
     title = raw.get("titleZh")
     if isinstance(title, str) and title.strip():
-        out["titleZh"] = title.strip()[:_MAX_TITLE_ZH_CHARS]
+        out["titleZh"] = title.strip()
 
     topic_id, topic_name = normalize_topic(
         topic=raw.get("topic"),
@@ -1472,11 +1460,7 @@ def validate_ai_output(
 
     summary = raw.get("aiSummary")
     if isinstance(summary, str):
-        # Hard cap matches the prompt limit ("~80-120 Chinese characters").
-        # Truncating here protects the per-story output budget when the model
-        # overshoots; existing rows (already saved long summaries) are not
-        # touched.
-        out["aiSummary"] = summary.strip()[:120]
+        out["aiSummary"] = summary.strip()
 
     out["discussionThemes"] = _validate_discussion_themes(
         raw.get("discussionThemes")
@@ -1568,7 +1552,7 @@ def _clean_comment_text(value: object, *, max_chars: int = 220) -> str:
     text = html.unescape(value)
     text = _HTML_TAG_RE.sub(" ", text)
     text = " ".join(text.split())
-    if len(text) > max_chars:
+    if max_chars > 0 and len(text) > max_chars:
         return text[: max_chars - 1].rstrip() + "…"
     return text
 
@@ -1576,7 +1560,7 @@ def _clean_comment_text(value: object, *, max_chars: int = 220) -> str:
 def _fallback_comment_fields(comments: Sequence[dict]) -> Dict[str, Any]:
     cleaned: List[Tuple[str, str]] = []
     for c in comments:
-        text = _clean_comment_text(c.get("text") or "")
+        text = _clean_comment_text(c.get("text") or "", max_chars=0)
         if not text:
             continue
         cleaned.append((str(c.get("by") or "anon"), text))
@@ -1591,7 +1575,7 @@ def _fallback_comment_fields(comments: Sequence[dict]) -> Dict[str, Any]:
             "score": max(1, 100 - index * 12),
             "text": text,
         }
-        for index, (author, text) in enumerate(cleaned[:5])
+        for index, (author, text) in enumerate(cleaned)
     ]
     return {
         "discussionThemes": [

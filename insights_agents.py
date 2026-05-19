@@ -34,8 +34,6 @@ def _clean_text(value: Any, *, max_chars: int = 240) -> str:
         lambda m: "产品展示" if m.group(0).lower().startswith("show") else "社区",
         text,
     )
-    if len(text) > max_chars:
-        text = text[:max_chars].rstrip()
     return text
 
 
@@ -325,7 +323,7 @@ class OpportunityAgent:
                 raise InsightsValidationError("opportunity missing linkedStoryIds")
             audience = [
                 _clean_text(v, max_chars=20)
-                for v in _as_list(obj.get("audience"))[:4]
+                for v in _as_list(obj.get("audience"))
                 if _clean_text(v, max_chars=20)
             ]
             out_items.append(
@@ -335,11 +333,11 @@ class OpportunityAgent:
                     "title": _clean_text(obj.get("title"), max_chars=80),
                     "score": _clamp_int(obj.get("score")),
                     "category": _clean_text(obj.get("category"), max_chars=40),
-                    "audience": audience[:4] or ["开发者"],
+                    "audience": audience or ["开发者"],
                     "thesis": _clean_text(obj.get("thesis"), max_chars=180),
                     "whyNow": _clean_text(obj.get("whyNow"), max_chars=160),
                     "risk": _clean_text(obj.get("risk"), max_chars=140),
-                    "linkedStoryIds": linked[:6],
+                    "linkedStoryIds": linked,
                 }
             )
         out_items.sort(key=lambda x: int(x["score"]), reverse=True)
