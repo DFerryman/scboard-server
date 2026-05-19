@@ -38,6 +38,7 @@ from .ai_agent import (
     _summarize_usage_records,
     build_ai_agent,
     build_ai_provider_configs,
+    build_insights_compression_ai_provider_configs,
     build_insights_ai_provider_configs,
     validate_ai_output,
 )
@@ -1913,6 +1914,17 @@ class IngestRoundBehavior(_SqliteCase):
         outbox_text = settings.get_alert_outbox_path().read_text(encoding="utf-8")
         self.assertIn("cloud_sync_deferred", outbox_text)
         self.assertIn("insufficient round budget", outbox_text)
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT status, sync_version, error FROM cloud_sync_runs WHERE run_id=?",
+                ("deadline-tight",),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["status"], "deferred")
+        self.assertIsNone(row["sync_version"])
+        self.assertIn("insufficient round budget", row["error"])
 
     def test_cloud_sync_disabled_does_not_record_skipped_runs(self):
         old_enabled = settings.CLOUD_SYNC_ENABLED
@@ -2464,15 +2476,126 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(opportunities["candidates"], [])
         self.assertEqual(debates["candidates"], [])
 
-    def test_run_insights_once_skips_when_opportunity_or_debate_inputs_are_insufficient(self):
+    def test_run_insights_once_uses_evidence_layer_when_legacy_candidate_filters_are_sparse(self):
         from . import insights
 
         target = "2026-05-19"
         start, _ = repository.digest_date_epoch_bounds(target)
 
-        class ExplodingAgent:
+        class EvidenceBackedAgent:
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint):
+                return checkpoint, {}
+
+            def run_evidence(self, payload):
+                return {
+                    "evidenceCards": [
+                        {
+                            "topicKey": f"topic-{index}",
+                            "topic": story["topicName"],
+                            "storyIds": [story["id"]],
+                            "synthesis": story["aiSummary"],
+                            "painPoints": ["pain"],
+                            "opportunityAngles": ["angle"],
+                            "debatePoints": ["debate"],
+                            "commentSignals": [],
+                        }
+                        for index, story in enumerate(payload["stories"])
+                    ],
+                    "excludedStoryIds": [],
+                    "exclusionReasons": {},
+                    "coverage": {
+                        "inputStoryCount": len(payload["stories"]),
+                        "assignedStoryCount": len(payload["stories"]),
+                        "excludedStoryCount": 0,
+                    },
+                }
+
+            def run_topic_scout(self, payload):
+                return {
+                    "selectedTopics": [
+                        {
+                            "topicKey": card["topicKey"],
+                            "reason": "selected",
+                            "routes": ["signals", "trends", "opportunities", "debates"],
+                        }
+                        for card in payload["evidenceCards"]
+                    ],
+                    "excludedTopics": [],
+                }
+
             def run_signals(self, _payload):
-                raise AssertionError("agent should not run when inputs are insufficient")
+                return {
+                    "headline": "headline",
+                    "summary": "summary",
+                    "signals": [
+                        {
+                            "id": f"s-{i}",
+                            "label": "模式",
+                            "title": f"signal {i}",
+                            "brief": "brief",
+                            "trend": "+0",
+                            "tone": "flat",
+                        }
+                        for i in range(3)
+                    ],
+                }
+
+            def run_trends(self, payload):
+                return {
+                    "trendHeatmap": {
+                        "title": "趋势温度",
+                        "note": "note",
+                        "items": [
+                            {
+                                "topic": item["topic"],
+                                "heat": item["heat"],
+                                "deltaText": item["deltaText"],
+                                "trendKey": item["trendKey"],
+                            }
+                            for item in payload["topicDailyStats"][:5]
+                        ],
+                    }
+                }
+
+            def run_opportunities(self, payload):
+                ids = [item["storyIds"][0] for item in payload["candidates"][:3]]
+                return {
+                    "opportunities": [
+                        {
+                            "rank": index + 1,
+                            "rankText": f"{index + 1:02d}",
+                            "title": f"opp {index}",
+                            "score": 80,
+                            "category": "tool",
+                            "audience": ["dev"],
+                            "thesis": "thesis",
+                            "whyNow": "now",
+                            "risk": "risk",
+                            "linkedStoryIds": [sid],
+                        }
+                        for index, sid in enumerate(ids)
+                    ]
+                }
+
+            def run_debates(self, _payload):
+                return {
+                    "debates": [
+                        {
+                            "topic": f"debate {index}",
+                            "verdict": "观察",
+                            "intensity": 50,
+                            "supportWidth": 50,
+                            "opposeWidth": 50,
+                            "support": "support",
+                            "oppose": "oppose",
+                            "watch": "watch",
+                        }
+                        for index in range(2)
+                    ]
+                }
 
         conn = db.connect()
         try:
@@ -2493,15 +2616,9 @@ class CloudSyncReadModel(_SqliteCase):
         summary = insights.run_insights_once(
             date=target,
             force=True,
-            ai_agent=ExplodingAgent(),
+            ai_agent=EvidenceBackedAgent(),
         )
-        self.assertEqual(summary["status"], "skipped")
-        self.assertEqual(summary["reason"], "insufficient_insights_inputs")
-        self.assertEqual(summary["input_counts"]["trend_topics"], 5)
-        self.assertEqual(summary["input_counts"]["opportunity_candidates"], 0)
-        self.assertEqual(summary["input_counts"]["debate_candidates"], 0)
-        self.assertIn("opportunity candidates 0/3", summary["input_gaps"])
-        self.assertIn("debate candidates 0/2", summary["input_gaps"])
+        self.assertEqual(summary["status"], "ok")
 
     def test_run_insights_once_skips_when_trend_topics_are_insufficient(self):
         from . import insights
@@ -2737,6 +2854,86 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(story["discussionThemes"], themes)
         self.assertEqual(story["insights"], insight_items)
 
+    def test_topic_scout_excluded_topics_are_hard_exclusions(self):
+        from . import insights
+
+        target = "2026-05-19"
+        evidence_cards = []
+        story_refs = {}
+        topic_stats = []
+        for index in range(8):
+            sid = 800 + index
+            key = f"topic-{index}"
+            topic = f"Topic {index}"
+            evidence_cards.append(
+                {
+                    "topicKey": key,
+                    "topic": topic,
+                    "storyIds": [sid],
+                    "synthesis": "synthesis",
+                    "painPoints": ["pain"],
+                    "opportunityAngles": ["angle"],
+                    "debatePoints": ["debate"],
+                    "commentSignals": [],
+                }
+            )
+            story_refs[sid] = {
+                "id": sid,
+                "topic": key,
+                "topicName": topic,
+                "titleZh": topic,
+                "titleEn": topic,
+                "score": 100,
+                "descendants": 10,
+                "time": 1_800_000_000 + index,
+                "feedRanks": {},
+            }
+            topic_stats.append(
+                {
+                    "topic": topic,
+                    "heat": 80 - index,
+                    "deltaText": "+1 / 24h",
+                    "trendKey": "rising",
+                }
+            )
+
+        scout = {
+            "selectedTopics": [
+                {
+                    "topicKey": "topic-0",
+                    "reason": "selected",
+                    "routes": ["signals", "trends", "opportunities", "debates"],
+                }
+            ],
+            "excludedTopics": [
+                {"topicKey": "topic-1", "reason": "duplicate"},
+                {"topicKey": "topic-2", "reason": "noise"},
+            ],
+        }
+        signals_input, trends_input, opportunities_input, debates_input = (
+            insights.build_routed_insights_inputs(
+                target_date=target,
+                today_rows=[],
+                trends_input={"date": target, "topicDailyStats": topic_stats},
+                evidence={"coverage": {}, "evidenceCards": evidence_cards},
+                scout=scout,
+                story_refs=story_refs,
+            )
+        )
+
+        for items, key in (
+            (signals_input["evidenceCards"], "topicKey"),
+            (opportunities_input["candidates"], "topicKey"),
+            (debates_input["candidates"], "topicKey"),
+        ):
+            topic_keys = [item[key] for item in items]
+            self.assertNotIn("topic-1", topic_keys)
+            self.assertNotIn("topic-2", topic_keys)
+        trend_topics = [item["topic"] for item in trends_input["topicDailyStats"]]
+        self.assertNotIn("Topic 1", trend_topics)
+        self.assertNotIn("Topic 2", trend_topics)
+        self.assertGreaterEqual(len(trend_topics), insights.TREND_HEAT_MIN_TOPICS)
+
     def test_trend_heat_uses_dynamic_topic_display_names(self):
         from . import insights
 
@@ -2836,9 +3033,10 @@ class CloudSyncReadModel(_SqliteCase):
         item = next(
             item for item in payload["topicDailyStats"] if item["topic"] == "AI Coding"
         )
-        self.assertEqual(item["heat"], 38)
-        self.assertEqual(item["deltaText"], "+18 / 24h")
-        self.assertEqual(item["trendKey"], "rising")
+        self.assertEqual(item["heat"], 100)
+        self.assertEqual(item["previousHeat"], 78)
+        self.assertEqual(item["deltaText"], "+22 / 24h")
+        self.assertEqual(item["trendKey"], "burst")
 
     def test_trend_heat_agent_uses_server_metrics_not_model_inventions(self):
         from .insights_agents import TrendHeatAgent
@@ -2903,6 +3101,14 @@ class CloudSyncReadModel(_SqliteCase):
             "where smart readers disagree",
             insights_agents.DEBATE_SYSTEM_PROMPT,
         )
+        self.assertIn(
+            "evidence digestion layer",
+            insights_agents.EVIDENCE_SYSTEM_PROMPT,
+        )
+        self.assertIn(
+            "topic scout and router",
+            insights_agents.TOPIC_SCOUT_SYSTEM_PROMPT,
+        )
         for prompt in (
             insights_agents.TODAY_SIGNALS_SYSTEM_PROMPT,
             insights_agents.TREND_HEAT_SYSTEM_PROMPT,
@@ -2917,10 +3123,90 @@ class CloudSyncReadModel(_SqliteCase):
                 any("\u4e00" <= ch <= "\u9fff" for ch in prompt),
                 prompt,
             )
+        for prompt in (
+            insights_agents.EVIDENCE_SYSTEM_PROMPT,
+            insights_agents.TOPIC_SCOUT_SYSTEM_PROMPT,
+        ):
+            self.assertIn("Return strict JSON only", prompt)
+            self.assertIn("Security boundary", prompt)
+            self.assertFalse(
+                any("\u4e00" <= ch <= "\u9fff" for ch in prompt),
+                prompt,
+            )
 
         self.assertGreaterEqual(insights_agents.INSIGHTS_SIGNALS_MAX_TOKENS, 4096)
+        self.assertGreaterEqual(insights_agents.INSIGHTS_EVIDENCE_MAX_TOKENS, 8192)
         self.assertGreaterEqual(insights_agents.INSIGHTS_OPPORTUNITIES_MAX_TOKENS, 8192)
         self.assertGreaterEqual(insights_agents.INSIGHTS_DEBATES_MAX_TOKENS, 6144)
+
+    def test_insights_runner_routes_compression_agents_to_cheaper_client(self):
+        from .insights_agents import InsightsAgentRunner
+
+        class FakeInsightsClient:
+            def __init__(self, name):
+                self.name = name
+                self.purposes = []
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint, *, purposes=None):
+                return checkpoint, {}
+
+            def complete_json(self, *, purpose, system_prompt, user_payload, max_tokens):
+                self.purposes.append(purpose)
+                if purpose == "insights-evidence":
+                    return {
+                        "evidenceCards": [
+                            {
+                                "topicKey": "topic-a",
+                                "topic": "主题 A",
+                                "storyIds": [101],
+                                "synthesis": "summary",
+                            }
+                        ]
+                    }
+                if purpose == "insights-topic-scout":
+                    return {
+                        "selectedTopics": [
+                            {
+                                "topicKey": "topic-a",
+                                "reason": "selected",
+                                "routes": ["signals"],
+                            }
+                        ],
+                        "excludedTopics": [],
+                    }
+                if purpose == "insights-signals":
+                    return {
+                        "headline": "headline",
+                        "summary": "summary",
+                        "signals": [
+                            {
+                                "id": f"s-{index}",
+                                "label": "模式",
+                                "title": f"title {index}",
+                                "brief": "brief",
+                                "trend": "+0",
+                                "tone": "flat",
+                            }
+                            for index in range(3)
+                        ],
+                    }
+                raise AssertionError(f"unexpected purpose {purpose}")
+
+        cheap = FakeInsightsClient("cheap")
+        complex_client = FakeInsightsClient("complex")
+        runner = InsightsAgentRunner(
+            compression_client=cheap,  # type: ignore[arg-type]
+            insights_client=complex_client,  # type: ignore[arg-type]
+        )
+        runner.run_evidence({"stories": [{"id": 101, "topicName": "主题 A"}]})
+        runner.run_topic_scout({"evidenceCards": [{"topicKey": "topic-a"}]})
+        runner.run_signals({"stories": [{}, {}, {}]})
+
+        self.assertEqual(cheap.purposes, ["insights-evidence", "insights-topic-scout"])
+        self.assertEqual(complex_client.purposes, ["insights-signals"])
 
     def test_today_signals_agent_normalizes_english_labels(self):
         from .insights_agents import TodaySignalsAgent
@@ -2979,6 +3265,50 @@ class CloudSyncReadModel(_SqliteCase):
             def usage_summary_since(self, checkpoint):
                 return checkpoint, {}
 
+            def run_evidence(self, payload):
+                self.inputs["evidence"] = payload
+                return {
+                    "evidenceCards": [
+                        {
+                            "topicKey": f"topic-{index}",
+                            "topic": story["topicName"],
+                            "storyIds": [story["id"]],
+                            "synthesis": story["aiSummary"],
+                            "painPoints": ["pain"],
+                            "opportunityAngles": ["angle"],
+                            "debatePoints": ["debate"],
+                            "commentSignals": [
+                                item["text"] for item in story.get("comments", [])
+                            ],
+                        }
+                        for index, story in enumerate(payload["stories"])
+                    ],
+                    "excludedStoryIds": [],
+                    "exclusionReasons": {},
+                    "coverage": {
+                        "inputStoryCount": len(payload["stories"]),
+                        "assignedStoryCount": len(payload["stories"]),
+                        "excludedStoryCount": 0,
+                    },
+                }
+
+            def run_topic_scout(self, payload):
+                self.inputs["topic_scout"] = payload
+                return {
+                    "selectedTopics": [
+                        {
+                            "topicKey": card["topicKey"],
+                            "reason": "selected",
+                            "routes": ["signals", "trends", "opportunities", "debates"],
+                        }
+                        for card in payload["evidenceCards"][:8]
+                    ],
+                    "excludedTopics": [
+                        {"topicKey": card["topicKey"], "reason": "not core"}
+                        for card in payload["evidenceCards"][8:]
+                    ],
+                }
+
             def run_signals(self, payload):
                 self.inputs["signals"] = payload
                 return {
@@ -3017,7 +3347,7 @@ class CloudSyncReadModel(_SqliteCase):
 
             def run_opportunities(self, payload):
                 self.inputs["opportunities"] = payload
-                ids = [item["id"] for item in payload["candidates"][:3]]
+                ids = [item["storyIds"][0] for item in payload["candidates"][:3]]
                 return {
                     "opportunities": [
                         {
@@ -3054,70 +3384,301 @@ class CloudSyncReadModel(_SqliteCase):
                     ]
                 }
 
+        old_caps = (
+            settings.INSIGHTS_MAX_TODAY_STORIES,
+            settings.INSIGHTS_EVIDENCE_MAX_STORIES,
+            settings.INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY,
+            settings.INSIGHTS_EVIDENCE_COMMENT_MAX_CHARS,
+            settings.INSIGHTS_EVIDENCE_RAW_TEXT_MAX_CHARS,
+        )
+        try:
+            settings.INSIGHTS_MAX_TODAY_STORIES = 12  # type: ignore[assignment]
+            settings.INSIGHTS_EVIDENCE_MAX_STORIES = 12  # type: ignore[assignment]
+            settings.INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY = 3  # type: ignore[assignment]
+            settings.INSIGHTS_EVIDENCE_COMMENT_MAX_CHARS = 30  # type: ignore[assignment]
+            settings.INSIGHTS_EVIDENCE_RAW_TEXT_MAX_CHARS = 40  # type: ignore[assignment]
+
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    long_raw_text = "RAW-" + ("x" * 100)
+                    for offset in range(45):
+                        self._insert_done_story(
+                            conn,
+                            300 + offset,
+                            target_start + offset * 60,
+                            topic=f"topic-{offset}",
+                            score=1000 if offset == 0 else 120 + offset,
+                            descendants=600 if offset == 0 else 60 + offset,
+                            raw_text=long_raw_text if offset == 0 else "raw article text",
+                        )
+                    now = repository.now_seconds()
+                    long_comment = "COMMENT-" + ("y" * 100)
+                    for index in range(26):
+                        conn.execute(
+                            """
+                            INSERT INTO comments(id, story_id, text, rank, fetched_at)
+                            VALUES(?, 300, ?, ?, ?)
+                            """,
+                            (
+                                9300 + index,
+                                long_comment if index == 0 else f"full comment evidence {index}",
+                                index,
+                                now,
+                            ),
+                        )
+                    self._insert_done_story(
+                        conn,
+                        999,
+                        start_ts - 1,
+                        topic="old",
+                        raw_text="OLD_STORY_SHOULD_NOT_REACH_PROMPT",
+                    )
+            finally:
+                conn.close()
+
+            agent = CapturingInsightsAgent()
+            summary = insights.run_insights_once(date=target, force=True, ai_agent=agent)
+            prompts_json = json.dumps(agent.inputs, ensure_ascii=False)
+            self.assertEqual(summary["status"], "ok")
+            self.assertNotIn("999", prompts_json)
+            self.assertNotIn("OLD_STORY_SHOULD_NOT_REACH_PROMPT", prompts_json)
+            self.assertEqual(len(agent.inputs["evidence"]["stories"]), 12)
+            self.assertEqual(len(agent.inputs["topic_scout"]["evidenceCards"]), 12)
+            self.assertEqual(len(agent.inputs["signals"]["evidenceCards"]), 8)
+            self.assertEqual(len(agent.inputs["trends"]["topicDailyStats"]), 8)
+            self.assertEqual(len(agent.inputs["opportunities"]["candidates"]), 8)
+            self.assertEqual(len(agent.inputs["debates"]["candidates"]), 8)
+            evidence_story_300 = next(
+                item for item in agent.inputs["evidence"]["stories"] if int(item["id"]) == 300
+            )
+            self.assertEqual(evidence_story_300["rawTextSnippet"], long_raw_text[:40])
+            self.assertEqual(
+                [item["text"] for item in evidence_story_300["comments"]],
+                [
+                    long_comment[:30],
+                    "full comment evidence 1",
+                    "full comment evidence 2",
+                ],
+            )
+            linked_ids = [
+                sid
+                for item in agent.inputs["opportunities"]["candidates"][:3]
+                for sid in [int(item["storyIds"][0])]
+            ]
+            conn = db.connect()
+            try:
+                row = repository.get_insight_row(conn, target)
+                self.assertIsNotNone(row)
+                stored_ids = json.loads(row["source_story_ids"])
+                payload = json.loads(row["payload"])
+            finally:
+                conn.close()
+            self.assertEqual(stored_ids, linked_ids)
+            self.assertLess(len(stored_ids), len(agent.inputs["opportunities"]["candidates"]))
+            self.assertEqual(payload["stats"][1]["value"], str(len(linked_ids)))
+        finally:
+            (
+                settings.INSIGHTS_MAX_TODAY_STORIES,
+                settings.INSIGHTS_EVIDENCE_MAX_STORIES,
+                settings.INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY,
+                settings.INSIGHTS_EVIDENCE_COMMENT_MAX_CHARS,
+                settings.INSIGHTS_EVIDENCE_RAW_TEXT_MAX_CHARS,
+            ) = old_caps  # type: ignore[assignment]
+
+    def test_run_insights_once_reuses_evidence_cache_until_material_changes(self):
+        from . import insights
+
+        target = "2026-05-19"
+        target_start, _ = repository.digest_date_epoch_bounds(target)
+
+        class CacheAwareAgent:
+            def __init__(self):
+                self.evidence_calls = 0
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint):
+                return checkpoint, {}
+
+            def run_evidence(self, payload):
+                self.evidence_calls += 1
+                return {
+                    "evidenceCards": [
+                        {
+                            "topicKey": f"topic-{index}",
+                            "topic": story["topicName"],
+                            "storyIds": [story["id"]],
+                            "synthesis": story["aiSummary"],
+                            "painPoints": ["pain"],
+                            "opportunityAngles": ["angle"],
+                            "debatePoints": ["debate"],
+                            "commentSignals": [
+                                item["text"] for item in story.get("comments", [])
+                            ],
+                        }
+                        for index, story in enumerate(payload["stories"])
+                    ],
+                    "excludedStoryIds": [],
+                    "exclusionReasons": {},
+                    "coverage": {
+                        "inputStoryCount": len(payload["stories"]),
+                        "assignedStoryCount": len(payload["stories"]),
+                        "excludedStoryCount": 0,
+                    },
+                }
+
+            def run_topic_scout(self, payload):
+                return {
+                    "selectedTopics": [
+                        {
+                            "topicKey": card["topicKey"],
+                            "reason": "selected",
+                            "routes": ["signals", "trends", "opportunities", "debates"],
+                        }
+                        for card in payload["evidenceCards"]
+                    ],
+                    "excludedTopics": [],
+                }
+
+            def run_signals(self, _payload):
+                return {
+                    "headline": "headline",
+                    "summary": "summary",
+                    "signals": [
+                        {
+                            "id": f"s-{i}",
+                            "label": "模式",
+                            "title": f"signal {i}",
+                            "brief": "brief",
+                            "trend": "+0",
+                            "tone": "flat",
+                        }
+                        for i in range(3)
+                    ],
+                }
+
+            def run_trends(self, payload):
+                return {
+                    "trendHeatmap": {
+                        "title": "趋势温度",
+                        "note": "note",
+                        "items": [
+                            {
+                                "topic": item["topic"],
+                                "heat": item["heat"],
+                                "deltaText": item["deltaText"],
+                                "trendKey": item["trendKey"],
+                            }
+                            for item in payload["topicDailyStats"][:5]
+                        ],
+                    }
+                }
+
+            def run_opportunities(self, payload):
+                ids = [item["storyIds"][0] for item in payload["candidates"][:3]]
+                return {
+                    "opportunities": [
+                        {
+                            "rank": index + 1,
+                            "rankText": f"{index + 1:02d}",
+                            "title": f"opp {index}",
+                            "score": 80,
+                            "category": "tool",
+                            "audience": ["dev"],
+                            "thesis": "thesis",
+                            "whyNow": "now",
+                            "risk": "risk",
+                            "linkedStoryIds": [sid],
+                        }
+                        for index, sid in enumerate(ids)
+                    ]
+                }
+
+            def run_debates(self, _payload):
+                return {
+                    "debates": [
+                        {
+                            "topic": f"debate {index}",
+                            "verdict": "观察",
+                            "intensity": 50,
+                            "supportWidth": 50,
+                            "opposeWidth": 50,
+                            "support": "support",
+                            "oppose": "oppose",
+                            "watch": "watch",
+                        }
+                        for index in range(2)
+                    ]
+                }
+
         conn = db.connect()
         try:
             with db.transaction(conn):
-                for offset in range(45):
+                for offset in range(8):
                     self._insert_done_story(
                         conn,
-                        300 + offset,
+                        700 + offset,
                         target_start + offset * 60,
                         topic=f"topic-{offset}",
                         score=120 + offset,
                         descendants=60 + offset,
                     )
-                now = repository.now_seconds()
-                for index in range(26):
-                    conn.execute(
-                        """
-                        INSERT INTO comments(id, story_id, text, rank, fetched_at)
-                        VALUES(?, 300, ?, ?, ?)
-                        """,
-                        (9300 + index, f"full comment evidence {index}", index, now),
-                    )
-                self._insert_done_story(
-                    conn,
-                    999,
-                    start_ts - 1,
-                    topic="old",
-                    raw_text="OLD_STORY_SHOULD_NOT_REACH_PROMPT",
+                conn.execute(
+                    """
+                    INSERT INTO comments(id, story_id, text, rank, fetched_at)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (9700, 700, "stable comment evidence", 0, repository.now_seconds()),
                 )
         finally:
             conn.close()
 
-        agent = CapturingInsightsAgent()
-        summary = insights.run_insights_once(date=target, force=True, ai_agent=agent)
-        prompts_json = json.dumps(agent.inputs, ensure_ascii=False)
-        self.assertEqual(summary["status"], "ok")
-        self.assertNotIn("999", prompts_json)
-        self.assertNotIn("OLD_STORY_SHOULD_NOT_REACH_PROMPT", prompts_json)
-        self.assertEqual(len(agent.inputs["signals"]["stories"]), 45)
-        self.assertEqual(len(agent.inputs["trends"]["topicDailyStats"]), 45)
-        self.assertEqual(len(agent.inputs["opportunities"]["candidates"]), 45)
-        self.assertEqual(len(agent.inputs["debates"]["candidates"]), 45)
-        signal_story_300 = next(
-            item for item in agent.inputs["signals"]["stories"] if int(item["id"]) == 300
-        )
-        self.assertEqual(
-            [item["text"] for item in signal_story_300["comments"]],
-            [f"full comment evidence {index}" for index in range(26)],
-        )
-        linked_ids = [
-            sid
-            for item in agent.inputs["opportunities"]["candidates"][:3]
-            for sid in [int(item["id"])]
-        ]
+        agent = CacheAwareAgent()
+        first = insights.run_insights_once(date=target, force=True, ai_agent=agent)
+        second = insights.run_insights_once(date=target, force=True, ai_agent=agent)
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(first["evidence_cache"], "miss")
+        self.assertEqual(second["evidence_cache"], "hit")
+        self.assertEqual(agent.evidence_calls, 1)
+
         conn = db.connect()
         try:
-            row = repository.get_insight_row(conn, target)
-            self.assertIsNotNone(row)
-            stored_ids = json.loads(row["source_story_ids"])
-            payload = json.loads(row["payload"])
+            with db.transaction(conn):
+                conn.execute(
+                    "UPDATE comments SET text=? WHERE id=?",
+                    ("changed comment evidence", 9700),
+                )
         finally:
             conn.close()
-        self.assertEqual(stored_ids, linked_ids)
-        self.assertLess(len(stored_ids), len(agent.inputs["opportunities"]["candidates"]))
-        self.assertEqual(payload["stats"][1]["value"], str(len(linked_ids)))
+
+        third = insights.run_insights_once(date=target, force=True, ai_agent=agent)
+        self.assertEqual(third["status"], "ok")
+        self.assertEqual(third["evidence_cache"], "miss")
+        self.assertEqual(agent.evidence_calls, 2)
+
+    def test_insights_usage_checkpoint_preserves_structured_checkpoint(self):
+        from . import insights
+
+        class StructuredUsageAgent:
+            def __init__(self):
+                self.seen_checkpoint = None
+
+            def usage_checkpoint(self):
+                return {"compression": 2, "insights": 5}
+
+            def usage_summary_since(self, checkpoint):
+                self.seen_checkpoint = checkpoint
+                return {"compression": 3, "insights": 6}, {"requests": 2}
+
+        agent = StructuredUsageAgent()
+        checkpoint = insights._usage_checkpoint(agent)
+        usage = insights._usage_since(agent, checkpoint)
+        self.assertEqual(checkpoint, {"compression": 2, "insights": 5})
+        self.assertEqual(agent.seen_checkpoint, checkpoint)
+        self.assertEqual(usage, {"requests": 2})
 
     def test_run_insights_once_records_agent_construction_failure(self):
         from . import insights
@@ -3174,6 +3735,43 @@ class CloudSyncReadModel(_SqliteCase):
 
             def usage_summary_since(self, checkpoint):
                 return checkpoint, {}
+
+            def run_evidence(self, payload):
+                return {
+                    "evidenceCards": [
+                        {
+                            "topicKey": f"topic-{index}",
+                            "topic": story["topicName"],
+                            "storyIds": [story["id"]],
+                            "synthesis": story["aiSummary"],
+                            "painPoints": [],
+                            "opportunityAngles": [],
+                            "debatePoints": [],
+                            "commentSignals": [],
+                        }
+                        for index, story in enumerate(payload["stories"])
+                    ],
+                    "excludedStoryIds": [],
+                    "exclusionReasons": {},
+                    "coverage": {
+                        "inputStoryCount": len(payload["stories"]),
+                        "assignedStoryCount": len(payload["stories"]),
+                        "excludedStoryCount": 0,
+                    },
+                }
+
+            def run_topic_scout(self, payload):
+                return {
+                    "selectedTopics": [
+                        {
+                            "topicKey": card["topicKey"],
+                            "reason": "selected",
+                            "routes": ["signals", "trends", "opportunities", "debates"],
+                        }
+                        for card in payload["evidenceCards"]
+                    ],
+                    "excludedTopics": [],
+                }
 
             def run_signals(self, _payload):
                 return {
@@ -3291,6 +3889,126 @@ class CloudSyncReadModel(_SqliteCase):
         }
         with self.assertRaises(InsightsValidationError):
             agent.validate(raw, {"candidates": [{"id": 101}]})
+
+    def test_opportunity_agent_drops_invalid_linked_ids_when_valid_evidence_remains(self):
+        from .insights_agents import OpportunityAgent
+
+        agent = object.__new__(OpportunityAgent)
+        raw = {
+            "opportunities": [
+                {
+                    "title": f"机会 {i}",
+                    "score": 80 + i,
+                    "category": "工具",
+                    "audience": ["开发者"],
+                    "thesis": "判断",
+                    "whyNow": "现在",
+                    "risk": "风险",
+                    "linkedStoryIds": [999, 101 + i],
+                }
+                for i in range(3)
+            ]
+        }
+        out = agent.validate(
+            raw,
+            {"candidates": [{"storyIds": [101, 102, 103]}]},
+        )
+        self.assertEqual(
+            [item["linkedStoryIds"] for item in out["opportunities"]],
+            [[103], [102], [101]],
+        )
+
+    def test_evidence_agent_validation_preserves_story_id_coverage(self):
+        from .insights_agents import EvidenceAgent
+
+        agent = object.__new__(EvidenceAgent)
+        out = agent.validate(
+            {
+                "evidenceCards": [
+                    {
+                        "topicKey": "kept",
+                        "topic": "Kept",
+                        "storyIds": [101],
+                        "synthesis": "summary",
+                    }
+                ]
+            },
+            {
+                "stories": [
+                    {"id": 101, "topicName": "Kept", "titleZh": "故事 101"},
+                    {"id": 102, "topicName": "Missing", "titleZh": "故事 102"},
+                ]
+            },
+        )
+        covered = [
+            sid
+            for card in out["evidenceCards"]
+            for sid in card["storyIds"]
+        ]
+        self.assertEqual(sorted(covered), [101, 102])
+        self.assertEqual(out["coverage"]["inputStoryCount"], 2)
+        self.assertEqual(out["coverage"]["assignedStoryCount"], 2)
+
+    def test_evidence_agent_validation_does_not_truncate_generated_evidence(self):
+        from .insights_agents import EvidenceAgent
+
+        agent = object.__new__(EvidenceAgent)
+        long_synthesis = "完整证据-" + ("细节" * 200)
+        long_pain = "痛点-" + ("描述" * 160)
+        long_angle = "机会-" + ("判断" * 160)
+        long_debate = "争议-" + ("证据" * 160)
+        long_signal = "评论-" + ("线索" * 160)
+        out = agent.validate(
+            {
+                "evidenceCards": [
+                    {
+                        "topicKey": "full-evidence",
+                        "topic": "完整证据主题",
+                        "storyIds": [101],
+                        "synthesis": long_synthesis,
+                        "painPoints": [long_pain],
+                        "opportunityAngles": [long_angle],
+                        "debatePoints": [long_debate],
+                        "commentSignals": [long_signal],
+                    }
+                ],
+                "excludedStoryIds": [],
+            },
+            {"stories": [{"id": 101, "topicName": "完整证据主题", "titleZh": "故事 101"}]},
+        )
+
+        card = out["evidenceCards"][0]
+        self.assertEqual(card["synthesis"], long_synthesis)
+        self.assertEqual(card["painPoints"], [long_pain])
+        self.assertEqual(card["opportunityAngles"], [long_angle])
+        self.assertEqual(card["debatePoints"], [long_debate])
+        self.assertEqual(card["commentSignals"], [long_signal])
+
+    def test_topic_scout_agent_accounts_for_unmentioned_cards(self):
+        from .insights_agents import TopicScoutAgent
+
+        agent = object.__new__(TopicScoutAgent)
+        out = agent.validate(
+            {
+                "selectedTopics": [
+                    {
+                        "topicKey": "a",
+                        "reason": "strong",
+                        "routes": ["signals", "opportunities"],
+                    }
+                ],
+                "excludedTopics": [],
+            },
+            {
+                "evidenceCards": [
+                    {"topicKey": "a", "topic": "A", "storyIds": [101]},
+                    {"topicKey": "b", "topic": "B", "storyIds": [102]},
+                ]
+            },
+        )
+        self.assertEqual(out["selectedTopics"][0]["topicKey"], "a")
+        self.assertEqual(out["selectedTopics"][0]["routes"], ["signals", "opportunities"])
+        self.assertEqual(out["excludedTopics"], [{"topicKey": "b", "reason": "未进入本轮核心主题"}])
 
     def test_debate_agent_normalizes_support_and_oppose_to_100(self):
         from .insights_agents import DebateAgent
@@ -5521,6 +6239,152 @@ class RealAiAgentFailover(unittest.TestCase):
         self.assertEqual(insights_configs[0].timeout, 122.0)
         self.assertEqual(insights_configs[0].max_output_tokens, 4096)
 
+    def test_insights_compression_ai_config_can_use_separate_provider(self):
+        old_values = {
+            "INSIGHTS_AI_CONFIG_FILE": settings.INSIGHTS_AI_CONFIG_FILE,
+            "INSIGHTS_AI_CONFIGS_JSON": settings.INSIGHTS_AI_CONFIGS_JSON,
+            "INSIGHTS_AI_API_KEY": settings.INSIGHTS_AI_API_KEY,
+            "INSIGHTS_AI_MODEL": settings.INSIGHTS_AI_MODEL,
+            "INSIGHTS_AI_BASE_URL": settings.INSIGHTS_AI_BASE_URL,
+            "INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS": settings.INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS,
+            "INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST": settings.INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST,
+            "INSIGHTS_AI_MAX_OUTPUT_TOKENS": settings.INSIGHTS_AI_MAX_OUTPUT_TOKENS,
+            "INSIGHTS_COMPRESSION_AI_CONFIG_FILE": settings.INSIGHTS_COMPRESSION_AI_CONFIG_FILE,
+            "INSIGHTS_COMPRESSION_AI_CONFIGS_JSON": settings.INSIGHTS_COMPRESSION_AI_CONFIGS_JSON,
+            "INSIGHTS_COMPRESSION_AI_API_KEY": settings.INSIGHTS_COMPRESSION_AI_API_KEY,
+            "INSIGHTS_COMPRESSION_AI_MODEL": settings.INSIGHTS_COMPRESSION_AI_MODEL,
+            "INSIGHTS_COMPRESSION_AI_BASE_URL": settings.INSIGHTS_COMPRESSION_AI_BASE_URL,
+            "INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS": settings.INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS,
+            "INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST": settings.INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST,
+            "INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS": settings.INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS,
+        }
+        try:
+            settings.INSIGHTS_AI_CONFIG_FILE = ""  # type: ignore[assignment]
+            settings.INSIGHTS_AI_CONFIGS_JSON = ""  # type: ignore[assignment]
+            settings.INSIGHTS_AI_API_KEY = "complex-secret"  # type: ignore[assignment]
+            settings.INSIGHTS_AI_MODEL = "complex-reasoner"  # type: ignore[assignment]
+            settings.INSIGHTS_AI_BASE_URL = "https://complex.example/v1"  # type: ignore[assignment]
+            settings.INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS = 130.0  # type: ignore[assignment]
+            settings.INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST = ()  # type: ignore[assignment]
+            settings.INSIGHTS_AI_MAX_OUTPUT_TOKENS = 12000  # type: ignore[assignment]
+
+            settings.INSIGHTS_COMPRESSION_AI_CONFIG_FILE = ""  # type: ignore[assignment]
+            settings.INSIGHTS_COMPRESSION_AI_CONFIGS_JSON = ""  # type: ignore[assignment]
+            settings.INSIGHTS_COMPRESSION_AI_API_KEY = "cheap-secret"  # type: ignore[assignment]
+            settings.INSIGHTS_COMPRESSION_AI_MODEL = "cheap-compressor"  # type: ignore[assignment]
+            settings.INSIGHTS_COMPRESSION_AI_BASE_URL = "https://cheap.example/v1"  # type: ignore[assignment]
+            settings.INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS = 45.0  # type: ignore[assignment]
+            settings.INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST = ()  # type: ignore[assignment]
+            settings.INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS = 4096  # type: ignore[assignment]
+
+            with patch.dict(
+                os.environ,
+                {
+                    "HNREADER_INSIGHTS_AI_CONFIG_FILE": "",
+                    "HNREADER_INSIGHTS_COMPRESSION_AI_CONFIG_FILE": "",
+                },
+            ):
+                insights_configs = build_insights_ai_provider_configs()
+                compression_configs = build_insights_compression_ai_provider_configs()
+        finally:
+            for name, value in old_values.items():
+                setattr(settings, name, value)
+
+        self.assertEqual(insights_configs[0].model, "complex-reasoner")
+        self.assertEqual(insights_configs[0].base_url, "https://complex.example/v1")
+        self.assertEqual(insights_configs[0].timeout, 130.0)
+        self.assertEqual(insights_configs[0].max_output_tokens, 12000)
+
+        self.assertEqual(compression_configs[0].model, "cheap-compressor")
+        self.assertEqual(compression_configs[0].base_url, "https://cheap.example/v1")
+        self.assertEqual(compression_configs[0].timeout, 45.0)
+        self.assertEqual(compression_configs[0].max_output_tokens, 4096)
+
+    def test_insights_json_config_file_supports_compression_section(self):
+        env_names = [
+            "HNREADER_INSIGHTS_AI_CONFIG_FILE",
+            "HNREADER_INSIGHTS_COMPRESSION_AI_CONFIG_FILE",
+            "HNREADER_INSIGHTS_AI_CONFIGS",
+            "HNREADER_INSIGHTS_COMPRESSION_AI_CONFIGS",
+        ]
+        old_env = {name: os.environ.get(name) for name in env_names}
+        old_settings = {
+            "INSIGHTS_AI_CONFIG_FILE": settings.INSIGHTS_AI_CONFIG_FILE,
+            "INSIGHTS_AI_CONFIGS_JSON": settings.INSIGHTS_AI_CONFIGS_JSON,
+            "INSIGHTS_AI_API_KEY": settings.INSIGHTS_AI_API_KEY,
+            "INSIGHTS_AI_MODEL": settings.INSIGHTS_AI_MODEL,
+            "INSIGHTS_AI_BASE_URL": settings.INSIGHTS_AI_BASE_URL,
+            "INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS": settings.INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS,
+            "INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST": settings.INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST,
+            "INSIGHTS_AI_MAX_OUTPUT_TOKENS": settings.INSIGHTS_AI_MAX_OUTPUT_TOKENS,
+            "INSIGHTS_COMPRESSION_AI_CONFIG_FILE": settings.INSIGHTS_COMPRESSION_AI_CONFIG_FILE,
+            "INSIGHTS_COMPRESSION_AI_CONFIGS_JSON": settings.INSIGHTS_COMPRESSION_AI_CONFIGS_JSON,
+            "INSIGHTS_COMPRESSION_AI_API_KEY": settings.INSIGHTS_COMPRESSION_AI_API_KEY,
+            "INSIGHTS_COMPRESSION_AI_MODEL": settings.INSIGHTS_COMPRESSION_AI_MODEL,
+            "INSIGHTS_COMPRESSION_AI_BASE_URL": settings.INSIGHTS_COMPRESSION_AI_BASE_URL,
+            "INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS": settings.INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS,
+            "INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST": settings.INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST,
+            "INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS": settings.INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS,
+        }
+        old_applied = set(settings._last_applied_insights_ai_env_keys)  # type: ignore[attr-defined]
+        old_sources = settings._last_insights_ai_config_sources  # type: ignore[attr-defined]
+        try:
+            with tempfile.TemporaryDirectory(prefix="hnreader_insights_ai_json_") as tmpdir:
+                config_path = Path(tmpdir) / "insights-ai.json"
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "insights": {
+                                "configs": [
+                                    {
+                                        "api_key": "complex-secret",
+                                        "model": "complex-model",
+                                        "base_url": "https://complex.example/v1",
+                                    }
+                                ],
+                                "request_timeout_seconds": 130,
+                                "max_output_tokens": 12000,
+                            },
+                            "compression": {
+                                "configs": [
+                                    {
+                                        "api_key": "cheap-secret",
+                                        "model": "cheap-model",
+                                        "base_url": "https://cheap.example/v1",
+                                    }
+                                ],
+                                "request_timeout_seconds": 45,
+                                "max_output_tokens": 4096,
+                            },
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                os.environ["HNREADER_INSIGHTS_AI_CONFIG_FILE"] = str(config_path)
+                os.environ.pop("HNREADER_INSIGHTS_COMPRESSION_AI_CONFIG_FILE", None)
+
+                insights_configs = build_insights_ai_provider_configs()
+                compression_configs = build_insights_compression_ai_provider_configs()
+        finally:
+            for name, value in old_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            for name, value in old_settings.items():
+                setattr(settings, name, value)
+            settings._last_applied_insights_ai_env_keys = old_applied  # type: ignore[attr-defined]
+            settings._last_insights_ai_config_sources = old_sources  # type: ignore[attr-defined]
+
+        self.assertEqual(insights_configs[0].model, "complex-model")
+        self.assertEqual(insights_configs[0].timeout, 130.0)
+        self.assertEqual(insights_configs[0].max_output_tokens, 12000)
+        self.assertEqual(compression_configs[0].model, "cheap-model")
+        self.assertEqual(compression_configs[0].timeout, 45.0)
+        self.assertEqual(compression_configs[0].max_output_tokens, 4096)
+
     def test_insights_ai_global_max_output_tokens_caps_json_configs(self):
         old_values = {
             "INSIGHTS_AI_CONFIG_FILE": settings.INSIGHTS_AI_CONFIG_FILE,
@@ -7732,6 +8596,60 @@ class CleanupBehavior(_SqliteCase):
         self.assertEqual(summary["ranking_candidates_deleted"], 1)
         self.assertEqual(summary["ingest_runs_deleted"], 1)
         self.assertEqual(summary["digest_meta_deleted"], 1)
+
+    def test_cleanup_purges_old_insight_evidence_cache_when_fetcher_is_stale(self):
+        from .cleanup import run_cleanup_once
+
+        old_retention = settings.INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS
+        now = repository.now_seconds()
+        old = now - 3 * 24 * 60 * 60
+        try:
+            settings.INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS = 1  # type: ignore[assignment]
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    repository.set_meta(
+                        conn,
+                        "last_full_fetch_at",
+                        str(now - settings.CLEANUP_STALE_GUARD_SECONDS - 10),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO insight_evidence_cache(
+                            cache_key, payload, story_count, created_at, updated_at
+                        ) VALUES(?, ?, ?, ?, ?)
+                        """,
+                        ("old-cache", "{}", 1, old, old),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO insight_evidence_cache(
+                            cache_key, payload, story_count, created_at, updated_at
+                        ) VALUES(?, ?, ?, ?, ?)
+                        """,
+                        ("fresh-cache", "{}", 1, now, now),
+                    )
+            finally:
+                conn.close()
+
+            summary = run_cleanup_once()
+        finally:
+            settings.INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS = old_retention  # type: ignore[assignment]
+
+        self.assertTrue(summary["skipped"], summary)
+        self.assertEqual(summary["reason"], "fetcher_stale")
+        self.assertEqual(summary["insight_evidence_cache_deleted"], 1)
+        conn = db.connect()
+        try:
+            keys = [
+                row["cache_key"]
+                for row in conn.execute(
+                    "SELECT cache_key FROM insight_evidence_cache ORDER BY cache_key"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+        self.assertEqual(keys, ["fresh-cache"])
 
     def test_cleanup_respects_grace_and_protection(self):
         from .cleanup import run_cleanup_once

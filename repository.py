@@ -2087,6 +2087,60 @@ def insight_needs_update(
     return now_seconds() - generated_at >= interval
 
 
+def get_insight_evidence_cache(
+    conn: sqlite3.Connection,
+    cache_key: str,
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT *
+        FROM insight_evidence_cache
+        WHERE cache_key=?
+        """,
+        (str(cache_key),),
+    ).fetchone()
+
+
+def upsert_insight_evidence_cache(
+    conn: sqlite3.Connection,
+    cache_key: str,
+    payload: dict,
+    story_count: int,
+    now: int,
+) -> None:
+    encoded_payload = _stable_json_dumps(payload if isinstance(payload, dict) else {})
+    conn.execute(
+        """
+        INSERT INTO insight_evidence_cache(
+            cache_key, payload, story_count, created_at, updated_at
+        ) VALUES(?, ?, ?, ?, ?)
+        ON CONFLICT(cache_key) DO UPDATE SET
+            payload=excluded.payload,
+            story_count=excluded.story_count,
+            updated_at=excluded.updated_at
+        """,
+        (
+            str(cache_key),
+            encoded_payload,
+            int(story_count),
+            int(now),
+            int(now),
+        ),
+    )
+
+
+def purge_old_insight_evidence_cache(
+    conn: sqlite3.Connection,
+    retention_days: int,
+) -> int:
+    cutoff = now_seconds() - max(0, int(retention_days)) * 24 * 60 * 60
+    cursor = conn.execute(
+        "DELETE FROM insight_evidence_cache WHERE updated_at < ?",
+        (cutoff,),
+    )
+    return cursor.rowcount or 0
+
+
 def candidate_rows_for_insights(
     conn: sqlite3.Connection,
     *,
@@ -2618,6 +2672,9 @@ __all__ = [
     "list_insight_rows",
     "upsert_insight",
     "insight_needs_update",
+    "get_insight_evidence_cache",
+    "upsert_insight_evidence_cache",
+    "purge_old_insight_evidence_cache",
     "candidate_rows_for_insights",
     "insight_feed_ranks_for_story_ids",
     "insight_comment_rows_for_story_ids",

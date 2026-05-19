@@ -1772,6 +1772,17 @@ def _trigger_and_record_cloud_sync(
                     f"need >={per_call_timeout + safety_margin}s"
                 ),
             }
+            now = repository.now_seconds()
+            _write_cloud_sync_run(
+                run_id,
+                started_at=now,
+                finished_at=now,
+                status="deferred",
+                sync_version=None,
+                push_stats={},
+                elapsed_seconds=0.0,
+                error=result["error"],
+            )
             _alert_cloud_sync_result(run_id, result)
             return result
 

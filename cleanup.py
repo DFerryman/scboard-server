@@ -46,6 +46,7 @@ def run_cleanup_once() -> Dict[str, Any]:
         "ingest_runs_deleted": 0,
         "cloud_sync_runs_deleted": 0,
         "ranking_candidates_deleted": 0,
+        "insight_evidence_cache_deleted": 0,
         "topics_deleted": 0,
     }
 
@@ -66,6 +67,11 @@ def run_cleanup_once() -> Dict[str, Any]:
             summary["cloud_sync_runs_deleted"] = (
                 repository.purge_old_cloud_sync_runs(
                     conn, settings.CLOUD_SYNC_RUN_RETENTION_DAYS
+                )
+            )
+            summary["insight_evidence_cache_deleted"] = (
+                repository.purge_old_insight_evidence_cache(
+                    conn, settings.INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS
                 )
             )
 

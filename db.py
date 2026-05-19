@@ -161,6 +161,17 @@ CREATE TABLE IF NOT EXISTS insights_runs (
 CREATE INDEX IF NOT EXISTS idx_insights_runs_started
 ON insights_runs(started_at DESC);
 
+CREATE TABLE IF NOT EXISTS insight_evidence_cache (
+  cache_key TEXT PRIMARY KEY,
+  payload TEXT NOT NULL DEFAULT '{}',
+  story_count INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_insight_evidence_cache_updated
+ON insight_evidence_cache(updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,

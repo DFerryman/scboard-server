@@ -473,6 +473,41 @@ INSIGHTS_MIN_TODAY_STORIES = _require_int_range(
     min_value=0,
     max_value=500,
 )
+INSIGHTS_MAX_TODAY_STORIES = _require_int_range(
+    "HNREADER_INSIGHTS_MAX_TODAY_STORIES",
+    _env_int("HNREADER_INSIGHTS_MAX_TODAY_STORIES", 80),
+    min_value=1,
+    max_value=1000,
+)
+if INSIGHTS_MAX_TODAY_STORIES < INSIGHTS_MIN_TODAY_STORIES:
+    raise RuntimeError(
+        "HNREADER_INSIGHTS_MAX_TODAY_STORIES must be >= "
+        "HNREADER_INSIGHTS_MIN_TODAY_STORIES"
+    )
+INSIGHTS_EVIDENCE_MAX_STORIES = _require_int_range(
+    "HNREADER_INSIGHTS_EVIDENCE_MAX_STORIES",
+    _env_int("HNREADER_INSIGHTS_EVIDENCE_MAX_STORIES", 120),
+    min_value=1,
+    max_value=1000,
+)
+INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY = _require_int_range(
+    "HNREADER_INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY",
+    _env_int("HNREADER_INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY", 8),
+    min_value=0,
+    max_value=200,
+)
+INSIGHTS_EVIDENCE_BATCH_STORIES = _require_int_range(
+    "HNREADER_INSIGHTS_EVIDENCE_BATCH_STORIES",
+    _env_int("HNREADER_INSIGHTS_EVIDENCE_BATCH_STORIES", 20),
+    min_value=1,
+    max_value=200,
+)
+INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS = _require_int_range(
+    "HNREADER_INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS",
+    _env_int("HNREADER_INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS", 14),
+    min_value=0,
+    max_value=3650,
+)
 INSIGHTS_COMMENT_MAX_CHARS = _require_int_range(
     "HNREADER_INSIGHTS_COMMENT_MAX_CHARS",
     _env_int("HNREADER_INSIGHTS_COMMENT_MAX_CHARS", 180),
@@ -645,6 +680,57 @@ INSIGHTS_AI_MAX_OUTPUT_TOKENS = _require_int_range(
     max_value=1_000_000,
 ) or None
 
+INSIGHTS_COMPRESSION_AI_CONFIG_FILE = _env_str(
+    "HNREADER_INSIGHTS_COMPRESSION_AI_CONFIG_FILE",
+    INSIGHTS_AI_CONFIG_FILE,
+)
+INSIGHTS_COMPRESSION_AI_PROVIDER = (
+    _env_str("HNREADER_INSIGHTS_COMPRESSION_AI_PROVIDER", "")
+    or INSIGHTS_AI_PROVIDER
+).strip().lower()
+INSIGHTS_COMPRESSION_AI_CONFIGS_JSON = (
+    _env_str("HNREADER_INSIGHTS_COMPRESSION_AI_CONFIGS", "")
+    or INSIGHTS_AI_CONFIGS_JSON
+)
+INSIGHTS_COMPRESSION_AI_API_KEY = (
+    _env_str("HNREADER_INSIGHTS_COMPRESSION_AI_API_KEY", "")
+    or INSIGHTS_AI_API_KEY
+)
+INSIGHTS_COMPRESSION_AI_MODEL = (
+    _env_str("HNREADER_INSIGHTS_COMPRESSION_AI_MODEL", "")
+    or INSIGHTS_AI_MODEL
+)
+INSIGHTS_COMPRESSION_AI_BASE_URL = (
+    _env_str("HNREADER_INSIGHTS_COMPRESSION_AI_BASE_URL", "")
+    or INSIGHTS_AI_BASE_URL
+)
+INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST = (
+    _env_csv("HNREADER_INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST")
+    or INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST
+)
+INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS = _require_float_range(
+    "HNREADER_INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS",
+    _env_float(
+        "HNREADER_INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS",
+        INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS,
+    ),
+    min_value=0.1,
+    max_value=600.0,
+)
+_INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS_RAW = _env_optional_int(
+    "HNREADER_INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS"
+)
+INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS = _require_int_range(
+    "HNREADER_INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS",
+    (
+        _INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS_RAW
+        if _INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS_RAW is not None
+        else (INSIGHTS_AI_MAX_OUTPUT_TOKENS or 0)
+    ),
+    min_value=0,
+    max_value=1_000_000,
+) or None
+
 
 _AI_ENV_NAMES = {
     "HNREADER_AI_CONFIG_FILE",
@@ -702,6 +788,18 @@ _INSIGHTS_AI_ENV_NAMES = {
     "HNREADER_INSIGHTS_AI_MAX_OUTPUT_TOKENS",
 }
 
+_INSIGHTS_COMPRESSION_AI_ENV_NAMES = {
+    "HNREADER_INSIGHTS_COMPRESSION_AI_CONFIG_FILE",
+    "HNREADER_INSIGHTS_COMPRESSION_AI_PROVIDER",
+    "HNREADER_INSIGHTS_COMPRESSION_AI_CONFIGS",
+    "HNREADER_INSIGHTS_COMPRESSION_AI_API_KEY",
+    "HNREADER_INSIGHTS_COMPRESSION_AI_MODEL",
+    "HNREADER_INSIGHTS_COMPRESSION_AI_BASE_URL",
+    "HNREADER_INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST",
+    "HNREADER_INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS",
+    "HNREADER_INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS",
+}
+
 _INSIGHTS_AI_JSON_FIELD_ENV_NAMES = {
     "provider": "HNREADER_INSIGHTS_AI_PROVIDER",
     "configs": "HNREADER_INSIGHTS_AI_CONFIGS",
@@ -711,6 +809,21 @@ _INSIGHTS_AI_JSON_FIELD_ENV_NAMES = {
     "internal_host_allowlist": "HNREADER_INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST",
     "request_timeout_seconds": "HNREADER_INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS",
     "max_output_tokens": "HNREADER_INSIGHTS_AI_MAX_OUTPUT_TOKENS",
+}
+
+_INSIGHTS_COMPRESSION_AI_JSON_FIELD_ENV_NAMES = {
+    "provider": "HNREADER_INSIGHTS_COMPRESSION_AI_PROVIDER",
+    "configs": "HNREADER_INSIGHTS_COMPRESSION_AI_CONFIGS",
+    "api_key": "HNREADER_INSIGHTS_COMPRESSION_AI_API_KEY",
+    "model": "HNREADER_INSIGHTS_COMPRESSION_AI_MODEL",
+    "base_url": "HNREADER_INSIGHTS_COMPRESSION_AI_BASE_URL",
+    "internal_host_allowlist": (
+        "HNREADER_INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST"
+    ),
+    "request_timeout_seconds": (
+        "HNREADER_INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS"
+    ),
+    "max_output_tokens": "HNREADER_INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS",
 }
 
 
@@ -792,10 +905,9 @@ def _read_ai_env_file(path: Path) -> Dict[str, str]:
 def _json_value_to_env(value: Any, *, key: str) -> str:
     if value is None:
         return ""
-    if key in (
-        "internal_host_allowlist",
-        "HNREADER_AI_INTERNAL_HOST_ALLOWLIST",
-        "HACKERMINI_AI_INTERNAL_HOST_ALLOWLIST",
+    if (
+        key == "internal_host_allowlist"
+        or str(key).endswith("_INTERNAL_HOST_ALLOWLIST")
     ) and isinstance(value, list):
         return ",".join(str(item) for item in value)
     if isinstance(value, (dict, list)):
@@ -859,11 +971,27 @@ def _read_ai_config_file(path: Path) -> Tuple[Dict[str, str], str]:
     return _read_ai_env_file(path), "env"
 
 
-def _insights_ai_env_file_candidates() -> Tuple[Path, ...]:
-    explicit = _env_first("HNREADER_INSIGHTS_AI_CONFIG_FILE")
-    if not explicit:
-        return ()
-    return _split_config_files(explicit)
+def _insights_ai_env_file_candidates() -> Tuple[Tuple[Path, str], ...]:
+    raw_values = [
+        (_env_first("HNREADER_INSIGHTS_AI_CONFIG_FILE"), "insights"),
+        (_env_first("HNREADER_INSIGHTS_COMPRESSION_AI_CONFIG_FILE"), "compression"),
+    ]
+    deduped: list[Tuple[Path, str]] = []
+    by_path: Dict[str, int] = {}
+    for raw, scope in raw_values:
+        if not raw:
+            continue
+        for path in _split_config_files(raw):
+            key = str(path)
+            if key in by_path:
+                existing_index = by_path[key]
+                existing_path, existing_scope = deduped[existing_index]
+                if existing_scope != scope:
+                    deduped[existing_index] = (existing_path, "combined")
+                continue
+            by_path[key] = len(deduped)
+            deduped.append((path, scope))
+    return tuple(deduped)
 
 
 def _read_insights_ai_env_file(path: Path) -> Dict[str, str]:
@@ -885,13 +1013,51 @@ def _read_insights_ai_env_file(path: Path) -> Dict[str, str]:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
-        if key not in _INSIGHTS_AI_ENV_NAMES:
+        if (
+            key not in _INSIGHTS_AI_ENV_NAMES
+            and key not in _INSIGHTS_COMPRESSION_AI_ENV_NAMES
+        ):
             continue
         values[key] = _unquote_env_value(value)
     return values
 
 
-def _read_insights_ai_json_file(path: Path) -> Dict[str, str]:
+def _apply_insights_ai_json_section(
+    values: Dict[str, str],
+    parsed: Any,
+    *,
+    label: str,
+    env_names: set,
+    field_env_names: Dict[str, str],
+    provider_env_name: str,
+    configs_env_name: str,
+) -> None:
+    if isinstance(parsed, list):
+        values[provider_env_name] = "enabled"
+        values[configs_env_name] = json.dumps(
+            parsed, ensure_ascii=False, separators=(",", ":")
+        )
+        return
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} must be an object or array")
+
+    before = set(values.keys())
+    for key, value in parsed.items():
+        if key in env_names:
+            values[key] = _json_value_to_env(value, key=key)
+
+    for field, env_name in field_env_names.items():
+        if field not in parsed:
+            continue
+        values[env_name] = _json_value_to_env(parsed[field], key=field)
+
+    changed = set(values.keys()) - before
+    if configs_env_name in changed and provider_env_name not in values:
+        values[provider_env_name] = "enabled"
+
+
+def _read_insights_ai_json_file(path: Path, *, scope: str = "combined") -> Dict[str, str]:
     try:
         raw = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
@@ -908,8 +1074,14 @@ def _read_insights_ai_json_file(path: Path) -> Dict[str, str]:
 
     values: Dict[str, str] = {}
     if isinstance(parsed, list):
-        values["HNREADER_INSIGHTS_AI_PROVIDER"] = "enabled"
-        values["HNREADER_INSIGHTS_AI_CONFIGS"] = json.dumps(
+        if scope == "compression":
+            provider_name = "HNREADER_INSIGHTS_COMPRESSION_AI_PROVIDER"
+            configs_name = "HNREADER_INSIGHTS_COMPRESSION_AI_CONFIGS"
+        else:
+            provider_name = "HNREADER_INSIGHTS_AI_PROVIDER"
+            configs_name = "HNREADER_INSIGHTS_AI_CONFIGS"
+        values[provider_name] = "enabled"
+        values[configs_name] = json.dumps(
             parsed, ensure_ascii=False, separators=(",", ":")
         )
         return values
@@ -917,32 +1089,68 @@ def _read_insights_ai_json_file(path: Path) -> Dict[str, str]:
     if not isinstance(parsed, dict):
         raise ValueError(f"{path} insights AI JSON config must be an object or array")
 
-    for key, value in parsed.items():
-        if key in _INSIGHTS_AI_ENV_NAMES:
-            values[key] = _json_value_to_env(value, key=key)
+    if scope == "compression":
+        top_field_env_names = _INSIGHTS_COMPRESSION_AI_JSON_FIELD_ENV_NAMES
+        top_provider_env_name = "HNREADER_INSIGHTS_COMPRESSION_AI_PROVIDER"
+        top_configs_env_name = "HNREADER_INSIGHTS_COMPRESSION_AI_CONFIGS"
+    else:
+        top_field_env_names = _INSIGHTS_AI_JSON_FIELD_ENV_NAMES
+        top_provider_env_name = "HNREADER_INSIGHTS_AI_PROVIDER"
+        top_configs_env_name = "HNREADER_INSIGHTS_AI_CONFIGS"
 
-    for field, env_name in _INSIGHTS_AI_JSON_FIELD_ENV_NAMES.items():
-        if field not in parsed:
-            continue
-        values[env_name] = _json_value_to_env(parsed[field], key=field)
+    _apply_insights_ai_json_section(
+        values,
+        parsed,
+        label=f"{path} insights AI JSON config",
+        env_names=_INSIGHTS_AI_ENV_NAMES | _INSIGHTS_COMPRESSION_AI_ENV_NAMES,
+        field_env_names=top_field_env_names,
+        provider_env_name=top_provider_env_name,
+        configs_env_name=top_configs_env_name,
+    )
 
-    if (
-        "HNREADER_INSIGHTS_AI_CONFIGS" in values
-        and "HNREADER_INSIGHTS_AI_PROVIDER" not in values
+    for nested_key, env_names, field_env_names, provider_name, configs_name in (
+        (
+            "insights",
+            _INSIGHTS_AI_ENV_NAMES,
+            _INSIGHTS_AI_JSON_FIELD_ENV_NAMES,
+            "HNREADER_INSIGHTS_AI_PROVIDER",
+            "HNREADER_INSIGHTS_AI_CONFIGS",
+        ),
+        (
+            "compression",
+            _INSIGHTS_COMPRESSION_AI_ENV_NAMES,
+            _INSIGHTS_COMPRESSION_AI_JSON_FIELD_ENV_NAMES,
+            "HNREADER_INSIGHTS_COMPRESSION_AI_PROVIDER",
+            "HNREADER_INSIGHTS_COMPRESSION_AI_CONFIGS",
+        ),
     ):
-        values["HNREADER_INSIGHTS_AI_PROVIDER"] = "enabled"
+        if nested_key not in parsed:
+            continue
+        _apply_insights_ai_json_section(
+            values,
+            parsed[nested_key],
+            label=f"{path} insights AI JSON {nested_key!r} section",
+            env_names=env_names,
+            field_env_names=field_env_names,
+            provider_env_name=provider_name,
+            configs_env_name=configs_name,
+        )
 
     if not values:
         raise ValueError(
-            f"{path} insights AI JSON config must contain a provider/configs "
-            "object or HNREADER_INSIGHTS_AI_* keys"
+            f"{path} insights AI JSON config must contain provider/configs, "
+            "an insights/compression section, or HNREADER_INSIGHTS_*AI_* keys"
         )
     return values
 
 
-def _read_insights_ai_config_file(path: Path) -> Tuple[Dict[str, str], str]:
+def _read_insights_ai_config_file(
+    path: Path,
+    *,
+    scope: str = "combined",
+) -> Tuple[Dict[str, str], str]:
     if path.suffix.lower() == ".json":
-        return _read_insights_ai_json_file(path), "json"
+        return _read_insights_ai_json_file(path, scope=scope), "json"
     return _read_insights_ai_env_file(path), "env"
 
 
@@ -1030,6 +1238,12 @@ def _reload_insights_ai_settings_from_process_env() -> None:
     global INSIGHTS_AI_PROVIDER, INSIGHTS_AI_API_KEY, INSIGHTS_AI_MODEL
     global INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST, INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS
     global INSIGHTS_AI_MAX_OUTPUT_TOKENS
+    global INSIGHTS_COMPRESSION_AI_BASE_URL, INSIGHTS_COMPRESSION_AI_CONFIG_FILE
+    global INSIGHTS_COMPRESSION_AI_CONFIGS_JSON, INSIGHTS_COMPRESSION_AI_PROVIDER
+    global INSIGHTS_COMPRESSION_AI_API_KEY, INSIGHTS_COMPRESSION_AI_MODEL
+    global INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST
+    global INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS
+    global INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS
 
     INSIGHTS_AI_CONFIG_FILE = _env_str("HNREADER_INSIGHTS_AI_CONFIG_FILE", "")
     INSIGHTS_AI_PROVIDER = _env_str(
@@ -1051,6 +1265,56 @@ def _reload_insights_ai_settings_from_process_env() -> None:
     INSIGHTS_AI_MAX_OUTPUT_TOKENS = _require_int_range(
         "HNREADER_INSIGHTS_AI_MAX_OUTPUT_TOKENS",
         _env_optional_int("HNREADER_INSIGHTS_AI_MAX_OUTPUT_TOKENS") or 0,
+        min_value=0,
+        max_value=1_000_000,
+    ) or None
+    INSIGHTS_COMPRESSION_AI_CONFIG_FILE = _env_str(
+        "HNREADER_INSIGHTS_COMPRESSION_AI_CONFIG_FILE",
+        INSIGHTS_AI_CONFIG_FILE,
+    )
+    INSIGHTS_COMPRESSION_AI_PROVIDER = (
+        _env_str("HNREADER_INSIGHTS_COMPRESSION_AI_PROVIDER", "")
+        or INSIGHTS_AI_PROVIDER
+    ).strip().lower()
+    INSIGHTS_COMPRESSION_AI_CONFIGS_JSON = (
+        _env_str("HNREADER_INSIGHTS_COMPRESSION_AI_CONFIGS", "")
+        or INSIGHTS_AI_CONFIGS_JSON
+    )
+    INSIGHTS_COMPRESSION_AI_API_KEY = (
+        _env_str("HNREADER_INSIGHTS_COMPRESSION_AI_API_KEY", "")
+        or INSIGHTS_AI_API_KEY
+    )
+    INSIGHTS_COMPRESSION_AI_MODEL = (
+        _env_str("HNREADER_INSIGHTS_COMPRESSION_AI_MODEL", "")
+        or INSIGHTS_AI_MODEL
+    )
+    INSIGHTS_COMPRESSION_AI_BASE_URL = (
+        _env_str("HNREADER_INSIGHTS_COMPRESSION_AI_BASE_URL", "")
+        or INSIGHTS_AI_BASE_URL
+    )
+    INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST = (
+        _env_csv("HNREADER_INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST")
+        or INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST
+    )
+    INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS = _require_float_range(
+        "HNREADER_INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS",
+        _env_float(
+            "HNREADER_INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS",
+            INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS,
+        ),
+        min_value=0.1,
+        max_value=600.0,
+    )
+    compression_max_tokens = _env_optional_int(
+        "HNREADER_INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS"
+    )
+    INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS = _require_int_range(
+        "HNREADER_INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS",
+        (
+            compression_max_tokens
+            if compression_max_tokens is not None
+            else (INSIGHTS_AI_MAX_OUTPUT_TOKENS or 0)
+        ),
         min_value=0,
         max_value=1_000_000,
     ) or None
@@ -1131,7 +1395,7 @@ def refresh_insights_ai_settings_from_env_files() -> bool:
     new_values: Dict[str, str] = {}
     sources = []
     saw_existing_file = False
-    for path in _insights_ai_env_file_candidates():
+    for path, scope in _insights_ai_env_file_candidates():
         try:
             file_exists = path.is_file()
         except OSError:
@@ -1139,7 +1403,7 @@ def refresh_insights_ai_settings_from_env_files() -> bool:
         if not file_exists:
             continue
         saw_existing_file = True
-        values, source_format = _read_insights_ai_config_file(path)
+        values, source_format = _read_insights_ai_config_file(path, scope=scope)
         new_values.update(values)
         sources.append((str(path), source_format))
 

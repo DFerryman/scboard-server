@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 import logging
+import math
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -92,11 +94,11 @@ def _as_of_label(date: str) -> str:
     return f"{label} · {suffix}"
 
 
-def _clean_comment_text(value: Any, max_chars: int) -> str:
+def _clean_comment_text(value: Any, max_chars: Optional[int]) -> str:
     text = html.unescape(str(value or ""))
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > max_chars:
+    if max_chars is not None and len(text) > max_chars:
         text = text[:max_chars].rstrip()
     return text
 
@@ -136,11 +138,11 @@ def _story_payload(
     *,
     feed_ranks: Mapping[int, Mapping[str, int]],
     include_raw_text: bool = False,
-    raw_text_max_chars: int = 0,
+    raw_text_max_chars: Optional[int] = 0,
     include_domain: bool = False,
     include_insights: bool = False,
     comments: Optional[Sequence[Any]] = None,
-    comment_max_chars: int = 180,
+    comment_max_chars: Optional[int] = 180,
 ) -> Dict[str, Any]:
     story_id = int(row["id"])
     out: Dict[str, Any] = {
@@ -163,7 +165,10 @@ def _story_payload(
     if include_insights and insights:
         out["insights"] = insights
     if include_raw_text:
-        out["rawTextSnippet"] = (row["raw_text"] or "")[: max(0, raw_text_max_chars)]
+        raw_text = row["raw_text"] or ""
+        if raw_text_max_chars is not None:
+            raw_text = raw_text[: max(0, raw_text_max_chars)]
+        out["rawTextSnippet"] = raw_text
     if comments is not None:
         out["comments"] = [
             {
@@ -228,14 +233,26 @@ def _date_list(start_date: str, days: int) -> List[str]:
     return [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
 
 
-def _daily_topic_activity_heat(item: Mapping[str, Any]) -> float:
+def _daily_topic_activity_score(item: Mapping[str, Any]) -> float:
     count = max(0, int(item.get("count") or 0))
     score_sum = max(0, int(item.get("scoreSum") or 0))
     descendants_sum = max(0, int(item.get("descendantsSum") or 0))
     if count <= 0:
         return 0.0
-    raw = count * 18 + score_sum / 18 + descendants_sum / 9
-    return max(0.0, min(100.0, raw))
+    # Raw activity is intentionally unbounded. Display heat is normalized
+    # against today's peer topics later so multiple active topics do not all
+    # flatten into 100.
+    return (
+        count * 14.0
+        + math.log1p(score_sum) * 8.0
+        + math.log1p(descendants_sum) * 10.0
+    )
+
+
+def _relative_topic_heat(score: float, max_today_score: float) -> int:
+    if score <= 0 or max_today_score <= 0:
+        return 0
+    return max(0, min(100, int(round(100.0 * math.sqrt(score / max_today_score)))))
 
 
 def _trend_key(
@@ -295,6 +312,14 @@ def build_trend_heat_input(
             bucket["sampleTitles"].append(title)
 
     scored = []
+    max_today_score = 0.0
+    for topic, bucket in by_topic.items():
+        daily = [bucket["daily"][d] for d in dates]
+        today = daily[-1]
+        today_score = _daily_topic_activity_score(today)
+        bucket["_todayActivityScore"] = today_score
+        max_today_score = max(max_today_score, today_score)
+
     for topic, bucket in by_topic.items():
         daily = [bucket["daily"][d] for d in dates]
         today = daily[-1]
@@ -302,9 +327,14 @@ def build_trend_heat_input(
         prev_count = sum(item["count"] for item in previous) / max(1, len(previous))
         prev_score = sum(item["scoreSum"] for item in previous) / max(1, len(previous))
         prev_desc = sum(item["descendantsSum"] for item in previous) / max(1, len(previous))
-        today_heat = _daily_topic_activity_heat(today)
-        previous_avg_heat = sum(_daily_topic_activity_heat(item) for item in previous) / max(
-            1, len(previous)
+        today_activity_score = float(bucket.get("_todayActivityScore") or 0.0)
+        previous_avg_activity_score = sum(
+            _daily_topic_activity_score(item) for item in previous
+        ) / max(1, len(previous))
+        today_heat = _relative_topic_heat(today_activity_score, max_today_score)
+        previous_avg_heat = _relative_topic_heat(
+            previous_avg_activity_score,
+            max_today_score,
         )
         count_delta = today["count"] - prev_count
         score_delta = today["scoreSum"] - prev_score
@@ -324,6 +354,9 @@ def build_trend_heat_input(
                 "scoreDelta": round(score_delta, 2),
                 "descendantsDelta": round(descendants_delta, 2),
                 "heatDelta": round(heat_delta, 2),
+                "activityScore": round(today_activity_score, 2),
+                "previousAvgActivityScore": round(previous_avg_activity_score, 2),
+                "previousHeat": int(previous_avg_heat),
                 "_todayHeat": today_heat,
                 "_rankScore": rank_score,
                 "trendKey": _trend_key(
@@ -461,6 +494,481 @@ def build_debate_input(
     }
 
 
+def _story_ref(row: Any, feed_ranks: Mapping[int, Mapping[str, int]]) -> Dict[str, Any]:
+    sid = int(row["id"])
+    return {
+        "id": sid,
+        "topic": row["topic"] or "",
+        "topicName": _row_topic_label(row),
+        "titleZh": row["title_zh"] or row["title_en"] or "",
+        "titleEn": row["title_en"] or "",
+        "score": int(row["score"] or 0),
+        "descendants": int(row["descendants"] or 0),
+        "time": int(row["hn_time"] or 0),
+        "feedRanks": dict(feed_ranks.get(sid, {})),
+    }
+
+
+def _story_refs_by_id(
+    rows: Sequence[Any],
+    feed_ranks: Mapping[int, Mapping[str, int]],
+) -> Dict[int, Dict[str, Any]]:
+    return {int(row["id"]): _story_ref(row, feed_ranks) for row in rows}
+
+
+def _insight_row_signal_key(
+    row: Any,
+    feed_ranks: Mapping[int, Mapping[str, int]],
+) -> Tuple[int, int, int, int, int]:
+    sid = int(row["id"])
+    best_feed_rank = _feed_rank_score(feed_ranks.get(sid, {}))
+    feed_signal = 1000 - min(999, best_feed_rank)
+    return (
+        feed_signal,
+        int(row["score"] or 0),
+        int(row["descendants"] or 0),
+        int(row["hn_time"] or 0),
+        -sid,
+    )
+
+
+def _limit_insight_rows(
+    rows: Sequence[Any],
+    *,
+    max_rows: int,
+    feed_ranks: Mapping[int, Mapping[str, int]],
+) -> List[Any]:
+    cap = max(0, int(max_rows))
+    if cap <= 0:
+        return []
+    return sorted(
+        rows,
+        key=lambda row: _insight_row_signal_key(row, feed_ranks),
+        reverse=True,
+    )[:cap]
+
+
+def _select_evidence_rows(
+    window_rows: Sequence[Any],
+    *,
+    today_rows: Sequence[Any],
+    feed_ranks: Mapping[int, Mapping[str, int]],
+    max_rows: int,
+) -> List[Any]:
+    cap = max(0, int(max_rows))
+    if cap <= 0:
+        return []
+    selected: List[Any] = []
+    seen: set[int] = set()
+
+    def add_rows(rows: Sequence[Any]) -> None:
+        for row in rows:
+            if len(selected) >= cap:
+                break
+            sid = int(row["id"])
+            if sid in seen:
+                continue
+            selected.append(row)
+            seen.add(sid)
+
+    add_rows(today_rows)
+    if len(selected) < cap:
+        add_rows(
+            _limit_insight_rows(
+                window_rows,
+                max_rows=cap,
+                feed_ranks=feed_ranks,
+            )
+        )
+    return selected
+
+
+def build_evidence_input(
+    window_rows: Sequence[Any],
+    *,
+    target_date: str,
+    start_date: str,
+    feed_ranks: Mapping[int, Mapping[str, int]],
+    comments_by_story: Mapping[int, Sequence[Any]],
+) -> Dict[str, Any]:
+    rows = sorted(
+        window_rows,
+        key=lambda r: (
+            int(r["hn_time"] or 0),
+            int(r["score"] or 0),
+            int(r["descendants"] or 0),
+        ),
+        reverse=True,
+    )
+    return {
+        "date": target_date,
+        "window": {"startDate": start_date, "endDate": target_date},
+        "storyCount": len(rows),
+        "stories": [
+            _story_payload(
+                row,
+                feed_ranks=feed_ranks,
+                include_raw_text=True,
+                raw_text_max_chars=settings.INSIGHTS_EVIDENCE_RAW_TEXT_MAX_CHARS,
+                include_domain=True,
+                include_insights=True,
+                comments=comments_by_story.get(int(row["id"]), []),
+                comment_max_chars=settings.INSIGHTS_EVIDENCE_COMMENT_MAX_CHARS,
+            )
+            for row in rows
+        ],
+    }
+
+
+def _hash_text(value: Any) -> Dict[str, Any]:
+    text = str(value or "")
+    return {
+        "len": len(text),
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    }
+
+
+def _hash_update_json(hasher: "hashlib._Hash", value: Any) -> None:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    hasher.update(encoded)
+    hasher.update(b"\n")
+
+
+def _insights_evidence_cache_key(
+    *,
+    target_date: str,
+    start_date: str,
+    window_rows: Sequence[Any],
+    feed_ranks: Mapping[int, Mapping[str, int]],
+    comments_by_story: Mapping[int, Sequence[Any]],
+) -> str:
+    hasher = hashlib.sha256()
+    _hash_update_json(
+        hasher,
+        {
+            "stage": "insights-evidence",
+            "schema": 3,
+            "date": target_date,
+            "startDate": start_date,
+            "insightsVersion": INSIGHTS_VERSION,
+            "inputCaps": {
+                "maxStories": int(settings.INSIGHTS_EVIDENCE_MAX_STORIES),
+                "commentLimitPerStory": int(
+                    settings.INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY
+                ),
+                "commentMaxChars": int(settings.INSIGHTS_EVIDENCE_COMMENT_MAX_CHARS),
+                "rawTextMaxChars": int(settings.INSIGHTS_EVIDENCE_RAW_TEXT_MAX_CHARS),
+            },
+        },
+    )
+    for row in sorted(window_rows, key=lambda r: int(r["id"])):
+        sid = int(row["id"])
+        raw_text = str(row["raw_text"] or "")
+        raw_text = raw_text[: max(0, int(settings.INSIGHTS_EVIDENCE_RAW_TEXT_MAX_CHARS))]
+        _hash_update_json(
+            hasher,
+            {
+                "id": sid,
+                "kind": row["kind"] or "story",
+                "topic": row["topic"] or "",
+                "topicName": _row_topic_label(row),
+                "titleZh": row["title_zh"] or "",
+                "titleEn": row["title_en"] or "",
+                "url": row["url"] or "",
+                "domain": row["domain"] or "",
+                "by": row["by"] or "",
+                "score": int(row["score"] or 0),
+                "descendants": int(row["descendants"] or 0),
+                "hnTime": int(row["hn_time"] or 0),
+                "enrichedAt": int(row["enriched_at"] or 0),
+                "feedRanks": dict(feed_ranks.get(sid, {})),
+                "aiSummary": row["ai_summary"] or "",
+                "discussionThemes": row["discussion_themes"] or "[]",
+                "insights": row["insights"] or "[]",
+                "terms": row["terms"] or "[]",
+                "rawText": _hash_text(raw_text),
+            },
+        )
+        for comment in comments_by_story.get(sid, []):
+            comment_text = _clean_comment_text(
+                _row_value(comment, "text", "") or "",
+                settings.INSIGHTS_EVIDENCE_COMMENT_MAX_CHARS,
+            )
+            _hash_update_json(
+                hasher,
+                {
+                    "storyId": sid,
+                    "id": int(_row_value(comment, "id", 0) or 0),
+                    "parentId": int(_row_value(comment, "parent_id", 0) or 0),
+                    "by": _row_value(comment, "by", "") or "",
+                    "hnTime": int(_row_value(comment, "hn_time", 0) or 0),
+                    "depth": int(_row_value(comment, "depth", 0) or 0),
+                    "rank": int(_row_value(comment, "rank", 0) or 0),
+                    "fetchedAt": int(_row_value(comment, "fetched_at", 0) or 0),
+                    "text": _hash_text(comment_text),
+                },
+            )
+    return f"insights:evidence:v3:{target_date}:{hasher.hexdigest()}"
+
+
+def _load_cached_evidence(cache_key: str) -> Optional[Dict[str, Any]]:
+    conn = db.connect()
+    try:
+        row = repository.get_insight_evidence_cache(conn, cache_key)
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    payload = _json_loads(row["payload"], None)
+    return payload if isinstance(payload, dict) else None
+
+
+def _store_cached_evidence(
+    cache_key: str,
+    payload: Mapping[str, Any],
+    story_count: int,
+) -> None:
+    conn = db.connect()
+    try:
+        with db.transaction(conn):
+            repository.upsert_insight_evidence_cache(
+                conn,
+                cache_key,
+                dict(payload),
+                story_count,
+                repository.now_seconds(),
+            )
+    finally:
+        conn.close()
+
+
+def build_topic_scout_input(
+    evidence: Mapping[str, Any],
+    trends_input: Mapping[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "date": trends_input.get("date") or "",
+        "evidenceCoverage": evidence.get("coverage") or {},
+        "evidenceCards": evidence.get("evidenceCards") or [],
+        "excludedStoryIds": evidence.get("excludedStoryIds") or [],
+        "topicDailyStats": trends_input.get("topicDailyStats") or [],
+    }
+
+
+def _topic_stats_by_topic(trends_input: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
+    out: Dict[str, Mapping[str, Any]] = {}
+    for item in trends_input.get("topicDailyStats") or []:
+        if isinstance(item, Mapping):
+            topic = str(item.get("topic") or "")
+            if topic:
+                out[topic] = item
+    return out
+
+
+def _selected_routes(scout: Mapping[str, Any]) -> Dict[str, List[str]]:
+    routes: Dict[str, List[str]] = {}
+    for item in scout.get("selectedTopics") or []:
+        if not isinstance(item, Mapping):
+            continue
+        key = str(item.get("topicKey") or "")
+        if not key:
+            continue
+        raw_routes = item.get("routes") or []
+        routes[key] = [str(route) for route in raw_routes if str(route)]
+    return routes
+
+
+def _excluded_topic_keys(scout: Mapping[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for item in scout.get("excludedTopics") or []:
+        if not isinstance(item, Mapping):
+            continue
+        key = str(item.get("topicKey") or "")
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _scout_summary(scout: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "selectedTopics": scout.get("selectedTopics") or [],
+        "excludedTopics": scout.get("excludedTopics") or [],
+    }
+
+
+def _enrich_evidence_cards(
+    evidence: Mapping[str, Any],
+    *,
+    story_refs: Mapping[int, Mapping[str, Any]],
+    trends_input: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    metrics_by_topic = _topic_stats_by_topic(trends_input)
+    cards = []
+    for item in evidence.get("evidenceCards") or []:
+        if not isinstance(item, Mapping):
+            continue
+        story_ids = []
+        for raw_id in item.get("storyIds") or []:
+            try:
+                sid = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if sid not in story_ids:
+                story_ids.append(sid)
+        topic = str(item.get("topic") or "")
+        cards.append(
+            {
+                "topicKey": str(item.get("topicKey") or ""),
+                "topic": topic,
+                "storyIds": story_ids,
+                "storyRefs": [
+                    dict(story_refs[sid])
+                    for sid in story_ids
+                    if sid in story_refs
+                ],
+                "metrics": dict(metrics_by_topic.get(topic, {})),
+                "synthesis": item.get("synthesis") or "",
+                "painPoints": item.get("painPoints") or [],
+                "opportunityAngles": item.get("opportunityAngles") or [],
+                "debatePoints": item.get("debatePoints") or [],
+                "commentSignals": item.get("commentSignals") or [],
+            }
+        )
+    return cards
+
+
+def _cards_for_route(
+    cards: Sequence[Mapping[str, Any]],
+    scout: Mapping[str, Any],
+    route: str,
+    *,
+    min_cards: int,
+) -> List[Dict[str, Any]]:
+    routes = _selected_routes(scout)
+    excluded_keys = _excluded_topic_keys(scout)
+    selected_keys = [
+        key
+        for key, route_names in routes.items()
+        if key not in excluded_keys and route in route_names
+    ]
+    selected = [
+        dict(card)
+        for card in cards
+        if str(card.get("topicKey") or "") in selected_keys
+    ]
+    if len(selected) >= min_cards:
+        return selected
+    selected_seen = {str(card.get("topicKey") or "") for card in selected}
+    for card in cards:
+        key = str(card.get("topicKey") or "")
+        if key in selected_seen or key in excluded_keys:
+            continue
+        selected.append(dict(card))
+        selected_seen.add(key)
+        if len(selected) >= min_cards:
+            break
+    return selected
+
+
+def _trend_stats_for_scout(
+    trends_input: Mapping[str, Any],
+    scout: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    stats = [
+        dict(item)
+        for item in trends_input.get("topicDailyStats") or []
+        if isinstance(item, Mapping)
+    ]
+    routes = _selected_routes(scout)
+    excluded_keys = _excluded_topic_keys(scout)
+    trend_keys = {
+        key
+        for key, route_names in routes.items()
+        if key not in excluded_keys and "trends" in route_names
+    }
+    topic_keys_by_topic = {
+        str(item.get("topic") or ""): str(item.get("topicKey") or "")
+        for item in scout.get("evidenceCards") or []
+        if isinstance(item, Mapping)
+    }
+    routed = [
+        item
+        for item in stats
+        if topic_keys_by_topic.get(str(item.get("topic") or "")) in trend_keys
+    ]
+    if len(routed) >= TREND_HEAT_MIN_TOPICS:
+        return routed
+    seen_topics = {str(item.get("topic") or "") for item in routed}
+    for item in stats:
+        topic = str(item.get("topic") or "")
+        if topic in seen_topics or topic_keys_by_topic.get(topic) in excluded_keys:
+            continue
+        routed.append(item)
+        seen_topics.add(topic)
+        if len(routed) >= TREND_HEAT_MIN_TOPICS:
+            break
+    return routed
+
+
+def build_routed_insights_inputs(
+    *,
+    target_date: str,
+    today_rows: Sequence[Any],
+    trends_input: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    scout: Mapping[str, Any],
+    story_refs: Mapping[int, Mapping[str, Any]],
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    cards = _enrich_evidence_cards(
+        evidence,
+        story_refs=story_refs,
+        trends_input=trends_input,
+    )
+    scout_with_cards = {**scout, "evidenceCards": cards}
+    compact_scout = _scout_summary(scout)
+    signals_input = {
+        "date": target_date,
+        "topicSummary": _build_today_topic_summary(today_rows),
+        "topicScout": compact_scout,
+        "evidenceCards": _cards_for_route(
+            cards,
+            scout,
+            "signals",
+            min_cards=SIGNALS_MIN_STORIES,
+        ),
+    }
+    routed_trend_stats = _trend_stats_for_scout(trends_input, scout_with_cards)
+    trends_routed_input = {
+        **dict(trends_input),
+        "topicDailyStats": routed_trend_stats,
+        "topicScout": compact_scout,
+    }
+    opportunities_input = {
+        "topicScout": compact_scout,
+        "candidates": _cards_for_route(
+            cards,
+            scout,
+            "opportunities",
+            min_cards=OPPORTUNITY_MIN_CANDIDATES,
+        ),
+    }
+    debates_input = {
+        "topicScout": compact_scout,
+        "candidates": _cards_for_route(
+            cards,
+            scout,
+            "debates",
+            min_cards=DEBATE_MIN_CANDIDATES,
+        ),
+    }
+    return signals_input, trends_routed_input, opportunities_input, debates_input
+
+
 def _collect_story_reference_ids(*payloads: Mapping[str, Any]) -> List[int]:
     ids: List[int] = []
 
@@ -502,6 +1010,14 @@ def _input_count(value: Mapping[str, Any], key: str) -> int:
     return len(items) if isinstance(items, list) else 0
 
 
+def _first_input_count(value: Mapping[str, Any], keys: Sequence[str]) -> int:
+    for key in keys:
+        count = _input_count(value, key)
+        if count > 0:
+            return count
+    return 0
+
+
 def _insights_input_counts(
     *,
     signals_input: Mapping[str, Any],
@@ -510,7 +1026,7 @@ def _insights_input_counts(
     debates_input: Mapping[str, Any],
 ) -> Dict[str, int]:
     return {
-        "signals_stories": _input_count(signals_input, "stories"),
+        "signals_stories": _first_input_count(signals_input, ("stories", "evidenceCards")),
         "trend_topics": _input_count(trends_input, "topicDailyStats"),
         "opportunity_candidates": _input_count(opportunities_input, "candidates"),
         "debate_candidates": _input_count(debates_input, "candidates"),
@@ -532,17 +1048,18 @@ def _insights_input_gaps(counts: Mapping[str, int]) -> List[str]:
     return gaps
 
 
-def _usage_checkpoint(agent: Any) -> Optional[int]:
+def _usage_checkpoint(agent: Any) -> Optional[Any]:
     fn = getattr(agent, "usage_checkpoint", None)
     if not callable(fn):
         return None
     try:
-        return int(fn())
+        checkpoint = fn()
+        return checkpoint if checkpoint is not None else None
     except Exception:  # noqa: BLE001
         return None
 
 
-def _usage_since(agent: Any, checkpoint: Optional[int]) -> Optional[dict]:
+def _usage_since(agent: Any, checkpoint: Optional[Any]) -> Optional[dict]:
     if checkpoint is None:
         return None
     fn = getattr(agent, "usage_summary_since", None)
@@ -693,11 +1210,22 @@ def run_insights_once(
         feed_ranks = repository.insight_feed_ranks_for_story_ids(
             conn, candidate_story_ids
         )
-        comment_ids = candidate_story_ids
+        today_rows = _limit_insight_rows(
+            today_rows,
+            max_rows=settings.INSIGHTS_MAX_TODAY_STORIES,
+            feed_ranks=feed_ranks,
+        )
+        evidence_rows = _select_evidence_rows(
+            window_rows,
+            today_rows=today_rows,
+            feed_ranks=feed_ranks,
+            max_rows=settings.INSIGHTS_EVIDENCE_MAX_STORIES,
+        )
+        comment_ids = [int(row["id"]) for row in evidence_rows]
         comments_by_story = repository.insight_comment_rows_for_story_ids(
             conn,
             comment_ids,
-            limit_per_story=None,
+            limit_per_story=settings.INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY,
         )
     finally:
         conn.close()
@@ -706,27 +1234,93 @@ def run_insights_once(
     usage_checkpoint = None
 
     try:
-        signals_input = build_today_signals_input(
-            today_rows,
-            target_date=target_date,
-            feed_ranks=feed_ranks,
-            comments_by_story=comments_by_story,
-        )
-        trends_input = build_trend_heat_input(
+        trends_seed_input = build_trend_heat_input(
             window_rows,
             target_date=target_date,
             start_date=start_date,
         )
-        opportunities_input = build_opportunity_input(
-            window_rows,
-            target_end_ts=end_ts,
+
+        preflight_counts = {
+            "signals_stories": len(today_rows),
+            "evidence_stories": len(evidence_rows),
+            "trend_topics": _input_count(trends_seed_input, "topicDailyStats"),
+        }
+        preflight_gaps: List[str] = []
+        if preflight_counts["signals_stories"] < SIGNALS_MIN_STORIES:
+            preflight_gaps.append(
+                f"signals stories {preflight_counts['signals_stories']}/{SIGNALS_MIN_STORIES}"
+            )
+        required_evidence_stories = max(
+            SIGNALS_MIN_STORIES,
+            OPPORTUNITY_MIN_CANDIDATES,
+            DEBATE_MIN_CANDIDATES,
+        )
+        if preflight_counts["evidence_stories"] < required_evidence_stories:
+            preflight_gaps.append(
+                "evidence stories "
+                f"{preflight_counts['evidence_stories']}/{required_evidence_stories}"
+            )
+        if preflight_counts["trend_topics"] < TREND_HEAT_MIN_TOPICS:
+            preflight_gaps.append(
+                f"trend topics {preflight_counts['trend_topics']}/{TREND_HEAT_MIN_TOPICS}"
+            )
+        if preflight_gaps:
+            reason = "insufficient_insights_inputs"
+            _finish_run_record(
+                run_id=run_id,
+                date=target_date,
+                started_at=started_at,
+                status="skipped",
+                error=f"{reason}: {'; '.join(preflight_gaps)}",
+            )
+            return {
+                "status": "skipped",
+                "reason": reason,
+                "date": target_date,
+                "input_counts": preflight_counts,
+                "input_gaps": preflight_gaps,
+            }
+
+        evidence_input = build_evidence_input(
+            evidence_rows,
+            target_date=target_date,
+            start_date=start_date,
             feed_ranks=feed_ranks,
             comments_by_story=comments_by_story,
         )
-        debates_input = build_debate_input(
-            window_rows,
+        evidence_cache_key = _insights_evidence_cache_key(
+            target_date=target_date,
+            start_date=start_date,
+            window_rows=evidence_rows,
             feed_ranks=feed_ranks,
             comments_by_story=comments_by_story,
+        )
+
+        agent = ai_agent or InsightsAgentRunner()
+        usage_checkpoint = _usage_checkpoint(agent)
+
+        evidence_cache_status = "hit"
+        evidence_out = _load_cached_evidence(evidence_cache_key)
+        if evidence_out is None:
+            evidence_cache_status = "miss"
+            evidence_out = agent.run_evidence(evidence_input)
+            _store_cached_evidence(
+                evidence_cache_key,
+                evidence_out,
+                len(evidence_input.get("stories") or []),
+            )
+        topic_scout_input = build_topic_scout_input(evidence_out, trends_seed_input)
+        topic_scout_out = agent.run_topic_scout(topic_scout_input)
+        story_refs = _story_refs_by_id(window_rows, feed_ranks)
+        signals_input, trends_input, opportunities_input, debates_input = (
+            build_routed_insights_inputs(
+                target_date=target_date,
+                today_rows=today_rows,
+                trends_input=trends_seed_input,
+                evidence=evidence_out,
+                scout=topic_scout_out,
+                story_refs=story_refs,
+            )
         )
 
         input_counts = _insights_input_counts(
@@ -743,6 +1337,7 @@ def run_insights_once(
                 date=target_date,
                 started_at=started_at,
                 status="skipped",
+                model_usage=_usage_since(agent, usage_checkpoint),
                 error=f"{reason}: {'; '.join(input_gaps)}",
             )
             return {
@@ -752,9 +1347,6 @@ def run_insights_once(
                 "input_counts": input_counts,
                 "input_gaps": input_gaps,
             }
-
-        agent = ai_agent or InsightsAgentRunner()
-        usage_checkpoint = _usage_checkpoint(agent)
 
         signals_out = agent.run_signals(signals_input)
         trends_out = agent.run_trends(trends_input)
@@ -823,6 +1415,7 @@ def run_insights_once(
             "changed": bool(changed),
             "date": target_date,
             "source_story_ids_count": len(set(source_story_ids)),
+            "evidence_cache": evidence_cache_status,
             "agent_usage": model_usage or {},
         }
     except Exception as exc:  # noqa: BLE001
@@ -846,9 +1439,12 @@ def run_insights_once(
 
 
 __all__ = [
+    "build_evidence_input",
     "build_debate_input",
     "build_opportunity_input",
+    "build_routed_insights_inputs",
     "build_today_signals_input",
+    "build_topic_scout_input",
     "build_trend_heat_input",
     "run_insights_once",
 ]

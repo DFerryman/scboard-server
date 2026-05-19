@@ -1006,6 +1006,22 @@ def build_insights_ai_provider_configs() -> List[AiProviderConfig]:
     )
 
 
+def build_insights_compression_ai_provider_configs() -> List[AiProviderConfig]:
+    """Parse the cheaper compression/router insights AI config namespace."""
+    settings.refresh_insights_ai_settings_from_env_files()
+    return build_ai_provider_configs_from_raw(
+        settings.INSIGHTS_COMPRESSION_AI_CONFIGS_JSON,
+        settings.INSIGHTS_COMPRESSION_AI_API_KEY,
+        settings.INSIGHTS_COMPRESSION_AI_MODEL,
+        settings.INSIGHTS_COMPRESSION_AI_BASE_URL,
+        settings.INSIGHTS_COMPRESSION_AI_REQUEST_TIMEOUT_SECONDS,
+        settings.INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST,
+        configs_env_name="HNREADER_INSIGHTS_COMPRESSION_AI_CONFIGS",
+        legacy_max_output_tokens=settings.INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS,
+        allowlist_env_name="HNREADER_INSIGHTS_COMPRESSION_AI_INTERNAL_HOST_ALLOWLIST",
+    )
+
+
 def _build_provider_limiters(
     configs: Sequence[AiProviderConfig],
 ) -> Dict[str, Semaphore]:
@@ -2610,6 +2626,7 @@ __all__ = [
     "build_ai_agent",
     "build_ai_provider_configs",
     "build_ai_provider_configs_from_raw",
+    "build_insights_compression_ai_provider_configs",
     "build_insights_ai_provider_configs",
     "is_ai_capacity_error",
     "is_ai_quota_or_balance_error",
