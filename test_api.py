@@ -2649,6 +2649,55 @@ class CloudSyncReadModel(_SqliteCase):
         ):
             self.assertIn("Output Chinese reader-facing text", prompt)
             self.assertIn("Return strict JSON only", prompt)
+            self.assertIn("unfinished sentence", prompt)
+            self.assertFalse(
+                any("\u4e00" <= ch <= "\u9fff" for ch in prompt),
+                prompt,
+            )
+
+        self.assertGreaterEqual(insights_agents.INSIGHTS_SIGNALS_MAX_TOKENS, 4096)
+        self.assertGreaterEqual(insights_agents.INSIGHTS_OPPORTUNITIES_MAX_TOKENS, 8192)
+        self.assertGreaterEqual(insights_agents.INSIGHTS_DEBATES_MAX_TOKENS, 6144)
+
+    def test_today_signals_agent_normalizes_english_labels(self):
+        from .insights_agents import TodaySignalsAgent
+
+        out = object.__new__(TodaySignalsAgent).validate(
+            {
+                "headline": "headline",
+                "summary": "summary",
+                "signals": [
+                    {
+                        "id": "opportunity",
+                        "label": "opportunity",
+                        "title": "title",
+                        "brief": "brief",
+                        "trend": "+1",
+                        "tone": "up",
+                    },
+                    {
+                        "id": "pattern",
+                        "label": "pattern",
+                        "title": "title",
+                        "brief": "brief",
+                        "trend": "+1",
+                        "tone": "up",
+                    },
+                    {
+                        "id": "risk",
+                        "label": "risk",
+                        "title": "title",
+                        "brief": "brief",
+                        "trend": "-1",
+                        "tone": "down",
+                    },
+                ],
+            }
+        )
+        self.assertEqual(
+            [item["label"] for item in out["signals"]],
+            ["机会", "模式", "风险"],
+        )
 
     def test_run_insights_once_does_not_send_story_before_window_to_agents(self):
         from . import insights

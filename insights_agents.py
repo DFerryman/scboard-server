@@ -100,9 +100,11 @@ TODAY_SIGNALS_SYSTEM_PROMPT = (
     "name. Each brief should explain why the signal matters for builders, "
     "operators, or buyers. Avoid generic hype, do not list stories, and do not "
     "invent evidence beyond the input. Avoid the words HN, HackerNews, "
-    "Hacker News, and Show HN. Return strict JSON only: "
+    "Hacker News, and Show HN. Never end a field with ellipses or an "
+    "unfinished sentence; if evidence is thin, write concise complete fields. "
+    "Return strict JSON only: "
     "{\"headline\":\"\",\"summary\":\"\",\"signals\":[{\"id\":\"\","
-    "\"label\":\"机会|模式|风险|分歧\",\"title\":\"\",\"brief\":\"\","
+    "\"label\":\"opportunity|pattern|risk|debate\",\"title\":\"\",\"brief\":\"\","
     "\"trend\":\"+18\",\"tone\":\"up|down|flat\"}]}. "
     "signals must contain exactly 3 items."
 )
@@ -116,8 +118,10 @@ TREND_HEAT_SYSTEM_PROMPT = (
     "The module answers which themes are warming up and which are merely "
     "ordinary heat. Use a short note only if it helps interpret the ranking. "
     "Output Chinese reader-facing text, but keep JSON keys exactly as shown. "
+    "Never end a field with ellipses or an unfinished sentence; if evidence "
+    "is thin, write concise complete fields. "
     "Avoid the words HN, HackerNews, Hacker News, and Show HN. Return strict "
-    "JSON only: {\"trendHeatmap\":{\"title\":\"趋势温度\",\"note\":\"\","
+    "JSON only: {\"trendHeatmap\":{\"title\":\"\",\"note\":\"\","
     "\"items\":[{\"topic\":\"\",\"heat\":96,"
     "\"deltaText\":\"+18 / 24h\",\"trendKey\":\"burst\"}]}}. "
     "items must contain 5-8 items."
@@ -138,10 +142,12 @@ OPPORTUNITY_SYSTEM_PROMPT = (
     "name specific buyer/user groups. linkedStoryIds must cite the input "
     "stories that support the thesis. Output Chinese reader-facing text, but "
     "keep JSON keys exactly as shown. Avoid the words HN, HackerNews, "
-    "Hacker News, and Show HN. Return strict JSON only: "
+    "Hacker News, and Show HN. Never end a field with ellipses or an "
+    "unfinished sentence; if evidence is thin, write concise complete fields. "
+    "Return strict JSON only: "
     "{\"opportunities\":[{\"rank\":1,\"rankText\":\"01\","
     "\"title\":\"\",\"score\":92,\"category\":\"\","
-    "\"audience\":[\"开发者\"],\"thesis\":\"\",\"whyNow\":\"\","
+    "\"audience\":[\"specific buyer group\"],\"thesis\":\"\",\"whyNow\":\"\","
     "\"risk\":\"\",\"linkedStoryIds\":[123]}]}. Return 3-5 items; "
     "linkedStoryIds must come from input."
 )
@@ -158,12 +164,33 @@ DEBATE_SYSTEM_PROMPT = (
     "strongest counterargument, and watch should be an actionable observation "
     "for builders or buyers. Output Chinese reader-facing text, but keep JSON "
     "keys exactly as shown. Avoid the words HN, HackerNews, Hacker News, and "
-    "Show HN. Return strict JSON only: "
-    "{\"debates\":[{\"topic\":\"\",\"verdict\":\"机会伴随风险\","
+    "Show HN. Never end a field with ellipses or an unfinished sentence; if "
+    "evidence is thin, write concise complete fields. Return strict JSON only: "
+    "{\"debates\":[{\"topic\":\"\",\"verdict\":\"\","
     "\"intensity\":91,\"supportWidth\":57,\"opposeWidth\":43,"
     "\"support\":\"\",\"oppose\":\"\",\"watch\":\"\"}]}. "
     "Return 2-4 items."
 )
+
+
+INSIGHTS_SIGNALS_MAX_TOKENS = 4096
+INSIGHTS_TRENDS_MAX_TOKENS = 3072
+INSIGHTS_OPPORTUNITIES_MAX_TOKENS = 8192
+INSIGHTS_DEBATES_MAX_TOKENS = 6144
+
+
+def _normalize_signal_label(value: Any) -> str:
+    label = _clean_text(value, max_chars=16)
+    mapped = {
+        "opportunity": "机会",
+        "chance": "机会",
+        "pattern": "模式",
+        "mode": "模式",
+        "risk": "风险",
+        "debate": "分歧",
+        "disagreement": "分歧",
+    }.get(label.strip().lower())
+    return mapped or label
 
 
 class InsightsAiClient(RealAiAgent):
@@ -236,7 +263,7 @@ class TodaySignalsAgent:
             purpose=self.purpose,
             system_prompt=TODAY_SIGNALS_SYSTEM_PROMPT,
             user_payload=payload,
-            max_tokens=1800,
+            max_tokens=INSIGHTS_SIGNALS_MAX_TOKENS,
         )
         return self.validate(raw)
 
@@ -258,7 +285,7 @@ class TodaySignalsAgent:
             out["signals"].append(
                 {
                     "id": _slug(_clean_text(obj.get("id"), max_chars=80) or title, f"signal-{index}"),
-                    "label": _clean_text(obj.get("label"), max_chars=8) or "模式",
+                    "label": _normalize_signal_label(obj.get("label")) or "模式",
                     "title": title,
                     "brief": _clean_text(obj.get("brief"), max_chars=140),
                     "trend": _clean_text(obj.get("trend"), max_chars=16) or "+0",
@@ -283,7 +310,7 @@ class TrendHeatAgent:
             purpose=self.purpose,
             system_prompt=TREND_HEAT_SYSTEM_PROMPT,
             user_payload=payload,
-            max_tokens=1600,
+            max_tokens=INSIGHTS_TRENDS_MAX_TOKENS,
         )
         return self.validate(raw, payload)
 
@@ -341,7 +368,7 @@ class OpportunityAgent:
             purpose=self.purpose,
             system_prompt=OPPORTUNITY_SYSTEM_PROMPT,
             user_payload=payload,
-            max_tokens=3200,
+            max_tokens=INSIGHTS_OPPORTUNITIES_MAX_TOKENS,
         )
         return self.validate(raw, payload)
 
@@ -410,7 +437,7 @@ class DebateAgent:
             purpose=self.purpose,
             system_prompt=DEBATE_SYSTEM_PROMPT,
             user_payload=payload,
-            max_tokens=2600,
+            max_tokens=INSIGHTS_DEBATES_MAX_TOKENS,
         )
         return self.validate(raw)
 
@@ -490,6 +517,10 @@ __all__ = [
     "InsightsAiClient",
     "InsightsValidationError",
     "DEBATE_SYSTEM_PROMPT",
+    "INSIGHTS_DEBATES_MAX_TOKENS",
+    "INSIGHTS_OPPORTUNITIES_MAX_TOKENS",
+    "INSIGHTS_SIGNALS_MAX_TOKENS",
+    "INSIGHTS_TRENDS_MAX_TOKENS",
     "OPPORTUNITY_SYSTEM_PROMPT",
     "OpportunityAgent",
     "TODAY_SIGNALS_SYSTEM_PROMPT",
