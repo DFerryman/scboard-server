@@ -197,13 +197,13 @@ def build_today_signals_input(
         today_rows,
         key=lambda r: (int(r["score"] or 0), int(r["descendants"] or 0), int(r["hn_time"] or 0)),
         reverse=True,
-    )[: settings.INSIGHTS_MAX_TODAY_STORIES]
+    )
     stories = []
     for row in rows:
         sid = int(row["id"])
         story_kwargs: Dict[str, Any] = {}
         if comments_by_story is not None and sid in comments_by_story:
-            story_kwargs["comments"] = comments_by_story.get(sid, [])[:4]
+            story_kwargs["comments"] = comments_by_story.get(sid, [])
             story_kwargs["comment_max_chars"] = settings.INSIGHTS_COMMENT_MAX_CHARS
         stories.append(
             _story_payload(
@@ -287,7 +287,7 @@ def build_trend_heat_input(
         title = row["title_zh"] or row["title_en"] or ""
         if day == target_date:
             bucket["todayStoryIds"].append(int(row["id"]))
-        if title and len(bucket["sampleTitles"]) < 4:
+        if title:
             bucket["sampleTitles"].append(title)
 
     scored = []
@@ -332,9 +332,8 @@ def build_trend_heat_input(
             }
         )
     scored.sort(key=lambda item: (item["_rankScore"], len(item["todayStoryIds"])), reverse=True)
-    selected = scored[: max(5, settings.INSIGHTS_MAX_TREND_TOPICS)]
     out_items = []
-    for item in selected[: settings.INSIGHTS_MAX_TREND_TOPICS]:
+    for item in scored:
         heat = int(round(float(item["_todayHeat"])))
         delta = int(round(float(item["heatDelta"])))
         sign = "+" if delta >= 0 else ""
@@ -398,24 +397,17 @@ def build_opportunity_input(
         ),
         reverse=True,
     )
-    rows = [item[3] for item in candidates[: settings.INSIGHTS_MAX_OPPORTUNITY_CANDIDATES]]
-    top_detail_ids = {int(row["id"]) for row in rows[:12]}
+    rows = [item[3] for item in candidates]
     return {
         "candidates": [
             _story_payload(
                 row,
                 feed_ranks=feed_ranks,
-                include_raw_text=int(row["id"]) in top_detail_ids,
+                include_raw_text=True,
                 raw_text_max_chars=settings.INSIGHTS_RAW_TEXT_MAX_CHARS,
                 include_domain=True,
                 include_insights=True,
-                comments=(
-                    comments_by_story.get(int(row["id"]), [])[
-                        : settings.INSIGHTS_COMMENT_LIMIT_OPPORTUNITY
-                    ]
-                    if int(row["id"]) in top_detail_ids
-                    else []
-                ),
+                comments=comments_by_story.get(int(row["id"]), []),
                 comment_max_chars=settings.INSIGHTS_COMMENT_MAX_CHARS,
             )
             for row in rows
@@ -451,7 +443,6 @@ def build_debate_input(
         ),
         reverse=True,
     )
-    rows = candidates[: settings.INSIGHTS_MAX_DEBATE_CANDIDATES]
     return {
         "candidates": [
             _story_payload(
@@ -461,7 +452,7 @@ def build_debate_input(
                 comments=comments_by_story.get(int(row["id"]), []),
                 comment_max_chars=settings.INSIGHTS_COMMENT_MAX_CHARS,
             )
-            for row in rows
+            for row in candidates
         ]
     }
 
@@ -663,42 +654,11 @@ def run_insights_once(
         feed_ranks = repository.insight_feed_ranks_for_story_ids(
             conn, candidate_story_ids
         )
-        opportunity_seed = sorted(
-            candidate_story_ids,
-            key=lambda sid: (
-                int(next((r["score"] for r in window_rows if int(r["id"]) == sid), 0) or 0),
-                int(next((r["descendants"] for r in window_rows if int(r["id"]) == sid), 0) or 0),
-            ),
-            reverse=True,
-        )[: settings.INSIGHTS_MAX_OPPORTUNITY_CANDIDATES]
-        debate_seed = sorted(
-            candidate_story_ids,
-            key=lambda sid: int(
-                next((r["descendants"] for r in window_rows if int(r["id"]) == sid), 0)
-                or 0
-            ),
-            reverse=True,
-        )[: settings.INSIGHTS_MAX_DEBATE_CANDIDATES]
-        today_seed = [
-            int(row["id"])
-            for row in sorted(
-                today_rows,
-                key=lambda r: (
-                    int(r["score"] or 0),
-                    int(r["descendants"] or 0),
-                    int(r["hn_time"] or 0),
-                ),
-                reverse=True,
-            )[:12]
-        ]
-        comment_ids = list(dict.fromkeys(today_seed + opportunity_seed[:12] + debate_seed))
+        comment_ids = candidate_story_ids
         comments_by_story = repository.insight_comment_rows_for_story_ids(
             conn,
             comment_ids,
-            limit_per_story=max(
-                settings.INSIGHTS_COMMENT_LIMIT_OPPORTUNITY,
-                settings.INSIGHTS_COMMENT_LIMIT_DEBATE,
-            ),
+            limit_per_story=None,
         )
     finally:
         conn.close()

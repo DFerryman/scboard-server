@@ -473,42 +473,6 @@ INSIGHTS_MIN_TODAY_STORIES = _require_int_range(
     min_value=0,
     max_value=500,
 )
-INSIGHTS_MAX_TODAY_STORIES = _require_int_range(
-    "HNREADER_INSIGHTS_MAX_TODAY_STORIES",
-    _env_int("HNREADER_INSIGHTS_MAX_TODAY_STORIES", 40),
-    min_value=1,
-    max_value=500,
-)
-INSIGHTS_MAX_TREND_TOPICS = _require_int_range(
-    "HNREADER_INSIGHTS_MAX_TREND_TOPICS",
-    _env_int("HNREADER_INSIGHTS_MAX_TREND_TOPICS", 8),
-    min_value=5,
-    max_value=8,
-)
-INSIGHTS_MAX_OPPORTUNITY_CANDIDATES = _require_int_range(
-    "HNREADER_INSIGHTS_MAX_OPPORTUNITY_CANDIDATES",
-    _env_int("HNREADER_INSIGHTS_MAX_OPPORTUNITY_CANDIDATES", 24),
-    min_value=1,
-    max_value=200,
-)
-INSIGHTS_MAX_DEBATE_CANDIDATES = _require_int_range(
-    "HNREADER_INSIGHTS_MAX_DEBATE_CANDIDATES",
-    _env_int("HNREADER_INSIGHTS_MAX_DEBATE_CANDIDATES", 16),
-    min_value=1,
-    max_value=200,
-)
-INSIGHTS_COMMENT_LIMIT_OPPORTUNITY = _require_int_range(
-    "HNREADER_INSIGHTS_COMMENT_LIMIT_OPPORTUNITY",
-    _env_int("HNREADER_INSIGHTS_COMMENT_LIMIT_OPPORTUNITY", 12),
-    min_value=0,
-    max_value=200,
-)
-INSIGHTS_COMMENT_LIMIT_DEBATE = _require_int_range(
-    "HNREADER_INSIGHTS_COMMENT_LIMIT_DEBATE",
-    _env_int("HNREADER_INSIGHTS_COMMENT_LIMIT_DEBATE", 24),
-    min_value=0,
-    max_value=200,
-)
 INSIGHTS_COMMENT_MAX_CHARS = _require_int_range(
     "HNREADER_INSIGHTS_COMMENT_MAX_CHARS",
     _env_int("HNREADER_INSIGHTS_COMMENT_MAX_CHARS", 180),
@@ -1345,7 +1309,7 @@ CLOUD_PUSH_BATCH_SIZE = _require_int_range(
     "HNREADER_CLOUD_PUSH_BATCH_SIZE",
     _env_int(
         "HNREADER_CLOUD_PUSH_BATCH_SIZE",
-        50,
+        20,
         fallback="HACKERMINI_CLOUD_PUSH_BATCH_SIZE",
     ),
     min_value=1,

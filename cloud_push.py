@@ -28,7 +28,7 @@ decoupled so that:
 Module entry point::
 
     from server.cloud_push import push_read_model, push_dashboard, CloudPushError
-    business_stats = push_read_model(url=..., secret=..., batch_size=50)
+    business_stats = push_read_model(url=..., secret=..., batch_size=20)
     dashboard_stats = push_dashboard(url=..., secret=..., sync_version=v)
 
 CLI entry point (reads credentials from environment variables)::
@@ -42,7 +42,7 @@ Env vars (required, for CLI):
 
 Env vars (optional, for CLI):
     HNREADER_CLOUD_PUSH_BATCH_SIZE / HNREADER_CLOUD_BATCH_SIZE  stories per
-                                batch, default 50
+                                batch, default 20
     HNREADER_CLOUD_PUSH_MAX_BODY_BYTES  max writeBatch request body size,
                                 default 80000
 """
@@ -79,6 +79,8 @@ DEFAULT_TIMEOUT_SECONDS = 120
 # Keep headroom for JSON formatting and gateway accounting instead of riding
 # the exact edge.
 DEFAULT_WRITE_BATCH_MAX_BODY_BYTES = 80_000
+DEFAULT_WRITE_BATCH_MAX_ATTEMPTS = 3
+_WRITE_BATCH_RETRY_DELAYS_SECONDS = (1.0, 2.0)
 # Minimum wall-time budget required before starting a single HTTP call.
 # A push with a deadline_at must abort cleanly at a phase boundary rather
 # than start a call that has nowhere near enough time to complete.
@@ -417,6 +419,33 @@ def _payload_json_bytes(payload: dict) -> bytes:
 
 def _payload_size_bytes(payload: dict) -> int:
     return len(_payload_json_bytes(payload))
+
+
+def _is_retryable_write_batch_response(response: dict) -> bool:
+    if response.get("ok"):
+        return False
+    error = str(response.get("error") or response.get("raw") or "").lower()
+    status = int(response.get("statusCode") or 0)
+    if status in {502, 503, 504}:
+        return True
+    if "network error" in error:
+        return True
+    transient_markers = (
+        "timeout",
+        "timed out",
+        "etimedout",
+        "econnreset",
+        "econnaborted",
+        "temporarily unavailable",
+        "resource system error",
+    )
+    return any(marker in error for marker in transient_markers)
+
+
+def _write_batch_retry_delay(attempt_index: int) -> float:
+    if attempt_index < len(_WRITE_BATCH_RETRY_DELAYS_SECONDS):
+        return _WRITE_BATCH_RETRY_DELAYS_SECONDS[attempt_index]
+    return _WRITE_BATCH_RETRY_DELAYS_SECONDS[-1]
 
 
 def _post(url: str, secret: str, payload: dict, *, timeout: int) -> dict:
@@ -880,9 +909,10 @@ def push_read_model(
     *,
     url: str,
     secret: str,
-    batch_size: int = 50,
+    batch_size: int = 20,
     max_body_bytes: int = DEFAULT_WRITE_BATCH_MAX_BODY_BYTES,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    write_batch_max_attempts: int = DEFAULT_WRITE_BATCH_MAX_ATTEMPTS,
     source_dir: Optional[Path] = None,
     deadline_at: Optional[float] = None,
 ) -> dict:
@@ -970,15 +1000,44 @@ def push_read_model(
         raise CloudPushError(f"ping failed: {r}")
     log.info("[push] ping ok: %s", r)
 
+    if write_batch_max_attempts < 1:
+        raise CloudPushError(
+            f"write_batch_max_attempts must be >= 1 (got {write_batch_max_attempts})"
+        )
+
     # ---------- 2. writeBatch ----------
     sent = {"stories": 0, "topics": 0, "digests": 0, "insights": 0}
     for payload in write_batch_payloads:
-        _abort_if_insufficient(deadline_at, phase="writeBatch")
         payload_bytes = _payload_size_bytes(payload)
-        r = _post(
-            url, secret, payload,
-            timeout=_next_call_timeout(deadline_at, timeout_seconds),
-        )
+        r: dict = {}
+        for attempt in range(write_batch_max_attempts):
+            _abort_if_insufficient(deadline_at, phase="writeBatch")
+            r = _post(
+                url, secret, payload,
+                timeout=_next_call_timeout(deadline_at, timeout_seconds),
+            )
+            if r.get("ok"):
+                break
+            if (
+                attempt + 1 >= write_batch_max_attempts
+                or not _is_retryable_write_batch_response(r)
+            ):
+                break
+            delay = _write_batch_retry_delay(attempt)
+            remaining = _budget_remaining(deadline_at)
+            if remaining is not None and remaining < delay + _MIN_PER_CALL_SECONDS:
+                log.warning(
+                    "[push] writeBatch transient failure not retried: "
+                    "only %.1fs remain after attempt %s/%s: %s",
+                    remaining, attempt + 1, write_batch_max_attempts, r,
+                )
+                break
+            log.warning(
+                "[push] writeBatch transient failure attempt %s/%s; "
+                "retrying in %.1fs: %s",
+                attempt + 1, write_batch_max_attempts, delay, r,
+            )
+            time.sleep(delay)
         if not r.get("ok"):
             raise CloudPushError(f"writeBatch failed: {r}")
         for k in sent:
@@ -1179,7 +1238,7 @@ def main() -> None:
     # Prefer HNREADER_CLOUD_PUSH_BATCH_SIZE (new name), fall back to HNREADER_CLOUD_BATCH_SIZE (old name)
     batch_raw = os.environ.get("HNREADER_CLOUD_PUSH_BATCH_SIZE") \
         or os.environ.get("HNREADER_CLOUD_BATCH_SIZE") \
-        or "50"
+        or "20"
     try:
         batch_size = int(batch_raw)
     except ValueError:

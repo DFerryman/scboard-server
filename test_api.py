@@ -2486,13 +2486,13 @@ class CloudSyncReadModel(_SqliteCase):
         story = payload["stories"][0]
         self.assertEqual(
             [item["text"] for item in story["comments"]],
-            [f"comment evidence {index}" for index in range(4)],
+            [f"comment evidence {index}" for index in range(6)],
         )
         self.assertNotIn("rawTextSnippet", story)
         self.assertNotIn("domain", story)
         self.assertNotIn("insights", story)
 
-    def test_opportunity_input_uses_opportunity_comment_limit(self):
+    def test_opportunity_input_uses_all_loaded_comment_evidence(self):
         from . import insights
 
         target = "2026-05-19"
@@ -2520,17 +2520,16 @@ class CloudSyncReadModel(_SqliteCase):
                     [101],
                     limit_per_story=5,
                 )
-            with patch.object(settings, "INSIGHTS_COMMENT_LIMIT_OPPORTUNITY", 2):
-                payload = insights.build_opportunity_input(
-                    rows,
-                    target_end_ts=start + 86400,
-                    feed_ranks={},
-                    comments_by_story=comments_by_story,
-                )
+            payload = insights.build_opportunity_input(
+                rows,
+                target_end_ts=start + 86400,
+                feed_ranks={},
+                comments_by_story=comments_by_story,
+            )
         finally:
             conn.close()
 
-        self.assertEqual(len(payload["candidates"][0]["comments"]), 2)
+        self.assertEqual(len(payload["candidates"][0]["comments"]), 5)
 
     def test_insights_inputs_preserve_generated_reader_fields(self):
         from . import insights
@@ -2897,7 +2896,7 @@ class CloudSyncReadModel(_SqliteCase):
         conn = db.connect()
         try:
             with db.transaction(conn):
-                for offset in range(8):
+                for offset in range(45):
                     self._insert_done_story(
                         conn,
                         300 + offset,
@@ -2905,6 +2904,15 @@ class CloudSyncReadModel(_SqliteCase):
                         topic=f"topic-{offset}",
                         score=120 + offset,
                         descendants=60 + offset,
+                    )
+                now = repository.now_seconds()
+                for index in range(26):
+                    conn.execute(
+                        """
+                        INSERT INTO comments(id, story_id, text, rank, fetched_at)
+                        VALUES(?, 300, ?, ?, ?)
+                        """,
+                        (9300 + index, f"full comment evidence {index}", index, now),
                     )
                 self._insert_done_story(
                     conn,
@@ -2922,6 +2930,17 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(summary["status"], "ok")
         self.assertNotIn("999", prompts_json)
         self.assertNotIn("OLD_STORY_SHOULD_NOT_REACH_PROMPT", prompts_json)
+        self.assertEqual(len(agent.inputs["signals"]["stories"]), 45)
+        self.assertEqual(len(agent.inputs["trends"]["topicDailyStats"]), 45)
+        self.assertEqual(len(agent.inputs["opportunities"]["candidates"]), 45)
+        self.assertEqual(len(agent.inputs["debates"]["candidates"]), 45)
+        signal_story_300 = next(
+            item for item in agent.inputs["signals"]["stories"] if int(item["id"]) == 300
+        )
+        self.assertEqual(
+            [item["text"] for item in signal_story_300["comments"]],
+            [f"full comment evidence {index}" for index in range(26)],
+        )
         linked_ids = [
             sid
             for item in agent.inputs["opportunities"]["candidates"][:3]
@@ -9736,6 +9755,59 @@ class CloudPushDeadlineBehavior(unittest.TestCase):
         )
         for payload in write_batches:
             self.assertLessEqual(cloud_push._payload_size_bytes(payload), 50000)
+
+    def test_writebatch_retries_transient_cloud_db_timeout(self):
+        from . import cloud_push
+
+        src = self._write_read_model()
+        story = {
+            "_id": "1:retry",
+            "id": 1,
+            "syncVersion": 1,
+            "titleZh": "中文标题",
+            "aiSummary": "这是中文摘要",
+        }
+        (src / "stories.jsonl").write_text(
+            json.dumps(story, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        payloads = []
+        write_batch_attempts = {"count": 0}
+
+        def fake_post(_url, _secret, payload, *, timeout):
+            payloads.append(payload)
+            if payload.get("action") == "writeBatch":
+                write_batch_attempts["count"] += 1
+                if write_batch_attempts["count"] == 1:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "collection.add:fail -501001 resource system "
+                            "error. ETIMEDOUT"
+                        ),
+                        "statusCode": 500,
+                    }
+                return {
+                    "ok": True,
+                    "stories": len(payload.get("stories") or []),
+                }
+            return {"ok": True}
+
+        with patch.object(cloud_push, "_post", side_effect=fake_post), \
+                patch.object(cloud_push.time, "sleep") as sleep:
+            stats = cloud_push.push_read_model(
+                url="https://8.8.8.8/pushSync",
+                secret=VALID_CLOUD_PUSH_SECRET,
+                source_dir=src,
+                write_batch_max_attempts=2,
+            )
+
+        self.assertEqual(stats["stories"], 1)
+        self.assertEqual(write_batch_attempts["count"], 2)
+        sleep.assert_called_once_with(1.0)
+        write_batches = [p for p in payloads if p.get("action") == "writeBatch"]
+        self.assertEqual(len(write_batches), 2)
+        self.assertEqual(write_batches[0], write_batches[1])
 
     def test_single_oversized_writebatch_doc_fails_before_http(self):
         from . import cloud_push

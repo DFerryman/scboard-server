@@ -2139,10 +2139,10 @@ def insight_comment_rows_for_story_ids(
     conn: sqlite3.Connection,
     story_ids: Sequence[int],
     *,
-    limit_per_story: int,
+    limit_per_story: Optional[int],
 ) -> dict[int, List[sqlite3.Row]]:
     ids = _stable_int_ids(story_ids)
-    if not ids or limit_per_story <= 0:
+    if not ids or (limit_per_story is not None and int(limit_per_story) <= 0):
         return {}
     grouped: dict[int, List[sqlite3.Row]] = {sid: [] for sid in ids}
     with id_in_clause(conn, ids) as (clause, params):
@@ -2155,11 +2155,11 @@ def insight_comment_rows_for_story_ids(
             """,
             tuple(params),
         ).fetchall()
-    limit = max(0, int(limit_per_story))
+    limit = None if limit_per_story is None else max(0, int(limit_per_story))
     for row in rows:
         sid = int(row["story_id"])
         bucket = grouped.setdefault(sid, [])
-        if len(bucket) < limit:
+        if limit is None or len(bucket) < limit:
             bucket.append(row)
     return grouped
 
