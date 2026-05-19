@@ -29,7 +29,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import Lock, Semaphore
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -848,6 +848,20 @@ def _dedupe_configs(configs: Sequence[AiProviderConfig]) -> List[AiProviderConfi
     return out
 
 
+def _cap_config_max_output_tokens(
+    config: AiProviderConfig,
+    max_output_tokens: Optional[int],
+) -> AiProviderConfig:
+    if not max_output_tokens or int(max_output_tokens) <= 0:
+        return config
+    cap = int(max_output_tokens)
+    current = config.max_output_tokens
+    effective = cap if current is None else min(int(current), cap)
+    if current == effective:
+        return config
+    return replace(config, max_output_tokens=effective)
+
+
 def build_ai_provider_configs_from_raw(
     raw_configs: str,
     legacy_api_key: str,
@@ -877,12 +891,15 @@ def build_ai_provider_configs_from_raw(
             if not isinstance(item, dict):
                 raise ValueError(f"AI config #{index} must be an object")
             configs.append(
-                _config_from_mapping(
-                    item,
-                    index=index,
-                    default_timeout=default_timeout,
-                    internal_allowlist=internal_allowlist,
-                    allowlist_env_name=allowlist_env_name,
+                _cap_config_max_output_tokens(
+                    _config_from_mapping(
+                        item,
+                        index=index,
+                        default_timeout=default_timeout,
+                        internal_allowlist=internal_allowlist,
+                        allowlist_env_name=allowlist_env_name,
+                    ),
+                    legacy_max_output_tokens,
                 )
             )
         return _dedupe_configs(configs)
@@ -896,18 +913,20 @@ def build_ai_provider_configs_from_raw(
     if not api_key or not model:
         return []
     return [
-        AiProviderConfig(
-            api_key=api_key,
-            model=model,
-            base_url=_normalize_base_url(
-                legacy_base_url,
-                index=1,
-                default_base_url=default_base_url,
-                internal_allowlist=internal_allowlist,
-                allowlist_env_name=allowlist_env_name,
+        _cap_config_max_output_tokens(
+            AiProviderConfig(
+                api_key=api_key,
+                model=model,
+                base_url=_normalize_base_url(
+                    legacy_base_url,
+                    index=1,
+                    default_base_url=default_base_url,
+                    internal_allowlist=internal_allowlist,
+                    allowlist_env_name=allowlist_env_name,
+                ),
+                timeout=default_timeout,
             ),
-            timeout=default_timeout,
-            max_output_tokens=legacy_max_output_tokens,
+            legacy_max_output_tokens,
         )
     ]
 

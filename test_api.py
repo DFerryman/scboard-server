@@ -976,6 +976,15 @@ class SettingsValidation(unittest.TestCase):
                 4 * 3600,
             )
 
+    def test_launcher_insights_interval_default_tracks_ingest_interval_at_4x(self):
+        launcher = (Path(__file__).resolve().parent / "launcher.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'HNREADER_INSIGHTS_UPDATE_INTERVAL_SECONDS="${HNREADER_INSIGHTS_UPDATE_INTERVAL_SECONDS:-$(( HNREADER_INGEST_INTERVAL_SECONDS * 4 ))}"',
+            launcher,
+        )
+
     def test_runtime_int_range_rejects_extreme_worker_count(self):
         with self.assertRaises(RuntimeError):
             settings._require_int_range(  # type: ignore[attr-defined]
@@ -2350,6 +2359,30 @@ class CloudSyncReadModel(_SqliteCase):
             conn.close()
         self.assertEqual([int(r["id"]) for r in rows], [101])
 
+    def test_insights_update_gate_does_not_bypass_interval_when_story_ids_change(self):
+        now = repository.now_seconds()
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.upsert_insight(
+                    conn,
+                    "2026-05-19",
+                    {"headline": "existing"},
+                    [101, 102],
+                    now,
+                    7,
+                )
+                self.assertFalse(
+                    repository.insight_needs_update(
+                        conn,
+                        "2026-05-19",
+                        4 * 60 * 60,
+                        [101, 102, 103],
+                    )
+                )
+        finally:
+            conn.close()
+
     def test_insights_agent_inputs_are_minimal_by_section(self):
         from . import insights
 
@@ -2404,6 +2437,46 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertNotIn("COMMENT_SHOULD_NOT_LEAK", signals_json)
         self.assertNotIn("comments", trends_json)
         self.assertNotIn("RAW_TEXT_SHOULD_NOT_LEAK", trends_json)
+
+    def test_opportunity_input_uses_opportunity_comment_limit(self):
+        from . import insights
+
+        target = "2026-05-19"
+        start, _ = repository.digest_date_epoch_bounds(target)
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                self._insert_done_story(conn, 101, start, score=120, descendants=80)
+                now = repository.now_seconds()
+                for index in range(5):
+                    conn.execute(
+                        """
+                        INSERT INTO comments(id, story_id, text, rank, fetched_at)
+                        VALUES(?, 101, ?, ?, ?)
+                        """,
+                        (9000 + index, f"comment {index}", index, now),
+                    )
+                rows = repository.candidate_rows_for_insights(
+                    conn,
+                    start_ts=start,
+                    end_ts=start + 86400,
+                )
+                comments_by_story = repository.insight_comment_rows_for_story_ids(
+                    conn,
+                    [101],
+                    limit_per_story=5,
+                )
+            with patch.object(settings, "INSIGHTS_COMMENT_LIMIT_OPPORTUNITY", 2):
+                payload = insights.build_opportunity_input(
+                    rows,
+                    target_end_ts=start + 86400,
+                    feed_ranks={},
+                    comments_by_story=comments_by_story,
+                )
+        finally:
+            conn.close()
+
+        self.assertEqual(len(payload["candidates"][0]["comments"]), 2)
 
     def test_trend_heat_agent_uses_server_metrics_not_model_inventions(self):
         from .insights_agents import TrendHeatAgent
@@ -2565,6 +2638,64 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(summary["status"], "ok")
         self.assertNotIn("999", prompts_json)
         self.assertNotIn("OLD_STORY_SHOULD_NOT_REACH_PROMPT", prompts_json)
+        linked_ids = [
+            sid
+            for item in agent.inputs["opportunities"]["candidates"][:3]
+            for sid in [int(item["id"])]
+        ]
+        conn = db.connect()
+        try:
+            row = repository.get_insight_row(conn, target)
+            self.assertIsNotNone(row)
+            stored_ids = json.loads(row["source_story_ids"])
+            payload = json.loads(row["payload"])
+        finally:
+            conn.close()
+        self.assertEqual(stored_ids, linked_ids)
+        self.assertLess(len(stored_ids), len(agent.inputs["opportunities"]["candidates"]))
+        self.assertEqual(payload["stats"][1]["value"], str(len(linked_ids)))
+
+    def test_run_insights_once_records_agent_construction_failure(self):
+        from . import insights
+
+        target = "2026-05-19"
+        target_start, _ = repository.digest_date_epoch_bounds(target)
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                for offset in range(8):
+                    self._insert_done_story(
+                        conn,
+                        500 + offset,
+                        target_start + offset * 60,
+                        topic=f"topic-{offset}",
+                        score=120 + offset,
+                        descendants=60 + offset,
+                    )
+        finally:
+            conn.close()
+
+        with patch.object(
+            insights,
+            "InsightsAgentRunner",
+            side_effect=RuntimeError("bad insights config"),
+        ):
+            summary = insights.run_insights_once(date=target, force=True)
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertIn("bad insights config", summary["error"])
+        conn = db.connect()
+        try:
+            rows = conn.execute(
+                "SELECT status, error FROM insights_runs WHERE date=?",
+                (target,),
+            ).fetchall()
+            self.assertIsNone(repository.get_insight_row(conn, target))
+        finally:
+            conn.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "failed")
+        self.assertIn("bad insights config", rows[0]["error"])
 
     def test_run_insights_once_rejects_story_ids_outside_window_from_agent_output(self):
         from . import insights
@@ -4713,6 +4844,7 @@ class RealAiAgentFailover(unittest.TestCase):
             "AI_BASE_URL": settings.AI_BASE_URL,
             "AI_REQUEST_TIMEOUT_SECONDS": settings.AI_REQUEST_TIMEOUT_SECONDS,
             "AI_INTERNAL_HOST_ALLOWLIST": settings.AI_INTERNAL_HOST_ALLOWLIST,
+            "INSIGHTS_AI_CONFIG_FILE": settings.INSIGHTS_AI_CONFIG_FILE,
             "INSIGHTS_AI_CONFIGS_JSON": settings.INSIGHTS_AI_CONFIGS_JSON,
             "INSIGHTS_AI_API_KEY": settings.INSIGHTS_AI_API_KEY,
             "INSIGHTS_AI_MODEL": settings.INSIGHTS_AI_MODEL,
@@ -4729,6 +4861,7 @@ class RealAiAgentFailover(unittest.TestCase):
             settings.AI_REQUEST_TIMEOUT_SECONDS = 61.0  # type: ignore[assignment]
             settings.AI_INTERNAL_HOST_ALLOWLIST = ()  # type: ignore[assignment]
 
+            settings.INSIGHTS_AI_CONFIG_FILE = ""  # type: ignore[assignment]
             settings.INSIGHTS_AI_CONFIGS_JSON = ""  # type: ignore[assignment]
             settings.INSIGHTS_AI_API_KEY = "insights-secret"  # type: ignore[assignment]
             settings.INSIGHTS_AI_MODEL = "insights-model"  # type: ignore[assignment]
@@ -4737,8 +4870,15 @@ class RealAiAgentFailover(unittest.TestCase):
             settings.INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST = ()  # type: ignore[assignment]
             settings.INSIGHTS_AI_MAX_OUTPUT_TOKENS = 4096  # type: ignore[assignment]
 
-            story_configs = build_ai_provider_configs()
-            insights_configs = build_insights_ai_provider_configs()
+            with patch.dict(
+                os.environ,
+                {
+                    "HNREADER_AI_CONFIG_FILE": "",
+                    "HNREADER_INSIGHTS_AI_CONFIG_FILE": "",
+                },
+            ):
+                story_configs = build_ai_provider_configs()
+                insights_configs = build_insights_ai_provider_configs()
         finally:
             for name, value in old_values.items():
                 setattr(settings, name, value)
@@ -4752,6 +4892,55 @@ class RealAiAgentFailover(unittest.TestCase):
         self.assertEqual(insights_configs[0].base_url, "https://insights.example/v1")
         self.assertEqual(insights_configs[0].timeout, 122.0)
         self.assertEqual(insights_configs[0].max_output_tokens, 4096)
+
+    def test_insights_ai_global_max_output_tokens_caps_json_configs(self):
+        old_values = {
+            "INSIGHTS_AI_CONFIG_FILE": settings.INSIGHTS_AI_CONFIG_FILE,
+            "INSIGHTS_AI_CONFIGS_JSON": settings.INSIGHTS_AI_CONFIGS_JSON,
+            "INSIGHTS_AI_API_KEY": settings.INSIGHTS_AI_API_KEY,
+            "INSIGHTS_AI_MODEL": settings.INSIGHTS_AI_MODEL,
+            "INSIGHTS_AI_BASE_URL": settings.INSIGHTS_AI_BASE_URL,
+            "INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS": settings.INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS,
+            "INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST": settings.INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST,
+            "INSIGHTS_AI_MAX_OUTPUT_TOKENS": settings.INSIGHTS_AI_MAX_OUTPUT_TOKENS,
+        }
+        try:
+            settings.INSIGHTS_AI_CONFIG_FILE = ""  # type: ignore[assignment]
+            settings.INSIGHTS_AI_CONFIGS_JSON = json.dumps(
+                [
+                    {
+                        "api_key": "secret-one",
+                        "model": "m1",
+                        "base_url": "https://one.example/v1",
+                    },
+                    {
+                        "api_key": "secret-two",
+                        "model": "m2",
+                        "base_url": "https://two.example/v1",
+                        "max_output_tokens": 8000,
+                    },
+                    {
+                        "api_key": "secret-three",
+                        "model": "m3",
+                        "base_url": "https://three.example/v1",
+                        "max_output_tokens": 1024,
+                    },
+                ]
+            )  # type: ignore[assignment]
+            settings.INSIGHTS_AI_API_KEY = ""  # type: ignore[assignment]
+            settings.INSIGHTS_AI_MODEL = ""  # type: ignore[assignment]
+            settings.INSIGHTS_AI_BASE_URL = ""  # type: ignore[assignment]
+            settings.INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS = 122.0  # type: ignore[assignment]
+            settings.INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST = ()  # type: ignore[assignment]
+            settings.INSIGHTS_AI_MAX_OUTPUT_TOKENS = 4096  # type: ignore[assignment]
+
+            with patch.dict(os.environ, {"HNREADER_INSIGHTS_AI_CONFIG_FILE": ""}):
+                configs = build_insights_ai_provider_configs()
+        finally:
+            for name, value in old_values.items():
+                setattr(settings, name, value)
+
+        self.assertEqual([cfg.max_output_tokens for cfg in configs], [4096, 4096, 1024])
 
     def test_process_story_tries_next_config_after_provider_error(self):
         class ProviderErrorThenSuccessAgent(RealAiAgent):

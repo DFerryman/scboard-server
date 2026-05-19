@@ -2076,13 +2076,6 @@ def insight_needs_update(
     row = get_insight_row(conn, date)
     if row is None:
         return True
-    current_ids = _stable_int_ids(current_candidate_story_ids)
-    previous_ids_raw = _json_loads(row["source_story_ids"], [])
-    previous_ids = (
-        _stable_int_ids(previous_ids_raw) if isinstance(previous_ids_raw, list) else []
-    )
-    if previous_ids != current_ids:
-        return True
     interval = int(min_interval_seconds)
     if interval <= 0:
         return True

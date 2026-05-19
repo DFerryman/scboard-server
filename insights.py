@@ -348,7 +348,13 @@ def build_opportunity_input(
                 raw_text_max_chars=settings.INSIGHTS_RAW_TEXT_MAX_CHARS,
                 include_domain=True,
                 include_insights=True,
-                comments=comments_by_story.get(int(row["id"]), []) if int(row["id"]) in top_detail_ids else [],
+                comments=(
+                    comments_by_story.get(int(row["id"]), [])[
+                        : settings.INSIGHTS_COMMENT_LIMIT_OPPORTUNITY
+                    ]
+                    if int(row["id"]) in top_detail_ids
+                    else []
+                ),
                 comment_max_chars=settings.INSIGHTS_COMMENT_MAX_CHARS,
             )
             for row in rows
@@ -399,28 +405,25 @@ def build_debate_input(
     }
 
 
-def _collect_ids_from_payloads(*payloads: Mapping[str, Any]) -> List[int]:
+def _collect_story_reference_ids(*payloads: Mapping[str, Any]) -> List[int]:
     ids: List[int] = []
+
+    def add_id(value: Any) -> None:
+        try:
+            ids.append(int(value))
+        except (TypeError, ValueError):
+            pass
 
     def visit(value: Any) -> None:
         if isinstance(value, dict):
-            if "id" in value:
-                try:
-                    ids.append(int(value["id"]))
-                except (TypeError, ValueError):
-                    pass
-            if "linkedStoryIds" in value and isinstance(value["linkedStoryIds"], list):
-                for sid in value["linkedStoryIds"]:
-                    try:
-                        ids.append(int(sid))
-                    except (TypeError, ValueError):
-                        pass
-            if "todayStoryIds" in value and isinstance(value["todayStoryIds"], list):
-                for sid in value["todayStoryIds"]:
-                    try:
-                        ids.append(int(sid))
-                    except (TypeError, ValueError):
-                        pass
+            for key in ("storyId", "linkedStoryId", "todayStoryId"):
+                if key in value:
+                    add_id(value[key])
+            for key in ("linkedStoryIds", "todayStoryIds", "storyIds"):
+                if key not in value or not isinstance(value[key], list):
+                    continue
+                for sid in value[key]:
+                    add_id(sid)
             for child in value.values():
                 visit(child)
         elif isinstance(value, list):
@@ -491,10 +494,9 @@ def _validate_final_payload(payload: Mapping[str, Any], allowed_story_ids: Seque
     if not (2 <= len(payload.get("debates") or []) <= 4):
         raise InsightsValidationError("debates must contain 2-4 items")
     allowed = {int(sid) for sid in allowed_story_ids}
-    for item in payload.get("opportunities") or []:
-        for sid in item.get("linkedStoryIds") or []:
-            if int(sid) not in allowed:
-                raise InsightsValidationError(f"linkedStoryId {sid} outside 7-day window")
+    for sid in _collect_story_reference_ids(payload):
+        if int(sid) not in allowed:
+            raise InsightsValidationError(f"linkedStoryId {sid} outside 7-day window")
     if contains_forbidden_words(payload):
         raise InsightsValidationError("insights payload contains forbidden words")
 
@@ -628,10 +630,13 @@ def run_insights_once(
     finally:
         conn.close()
 
-    agent = ai_agent or InsightsAgentRunner()
-    usage_checkpoint = _usage_checkpoint(agent)
+    agent = None
+    usage_checkpoint = None
 
     try:
+        agent = ai_agent or InsightsAgentRunner()
+        usage_checkpoint = _usage_checkpoint(agent)
+
         signals_input = build_today_signals_input(
             today_rows,
             target_date=target_date,
@@ -659,12 +664,11 @@ def run_insights_once(
         opportunities_out = agent.run_opportunities(opportunities_input)
         debates_out = agent.run_debates(debates_input)
 
-        source_story_ids = _collect_ids_from_payloads(
-            signals_input,
-            trends_input,
-            opportunities_input,
-            debates_input,
+        source_story_ids = _collect_story_reference_ids(
+            signals_out,
+            trends_out,
             opportunities_out,
+            debates_out,
         )
         debates = debates_out["debates"]
         payload = {
