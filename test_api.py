@@ -2424,7 +2424,7 @@ class CloudSyncReadModel(_SqliteCase):
         finally:
             conn.close()
 
-    def test_opportunity_and_debate_inputs_backfill_low_signal_windows(self):
+    def test_opportunity_and_debate_inputs_do_not_backfill_low_signal_windows(self):
         from . import insights
 
         target = "2026-05-19"
@@ -2461,8 +2461,47 @@ class CloudSyncReadModel(_SqliteCase):
         finally:
             conn.close()
 
-        self.assertEqual(len(opportunities["candidates"]), 3)
-        self.assertEqual(len(debates["candidates"]), 2)
+        self.assertEqual(opportunities["candidates"], [])
+        self.assertEqual(debates["candidates"], [])
+
+    def test_run_insights_once_skips_when_opportunity_or_debate_inputs_are_insufficient(self):
+        from . import insights
+
+        target = "2026-05-19"
+        start, _ = repository.digest_date_epoch_bounds(target)
+
+        class ExplodingAgent:
+            def run_signals(self, _payload):
+                raise AssertionError("agent should not run when inputs are insufficient")
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                for offset in range(5):
+                    self._insert_done_story(
+                        conn,
+                        400 + offset,
+                        start + offset * 60,
+                        topic=f"topic-{offset}",
+                        score=10 + offset,
+                        descendants=1,
+                    )
+                conn.execute("UPDATE stories SET discussion_themes='[]', insights='[]'")
+        finally:
+            conn.close()
+
+        summary = insights.run_insights_once(
+            date=target,
+            force=True,
+            ai_agent=ExplodingAgent(),
+        )
+        self.assertEqual(summary["status"], "skipped")
+        self.assertEqual(summary["reason"], "insufficient_insights_inputs")
+        self.assertEqual(summary["input_counts"]["trend_topics"], 5)
+        self.assertEqual(summary["input_counts"]["opportunity_candidates"], 0)
+        self.assertEqual(summary["input_counts"]["debate_candidates"], 0)
+        self.assertIn("opportunity candidates 0/3", summary["input_gaps"])
+        self.assertIn("debate candidates 0/2", summary["input_gaps"])
 
     def test_run_insights_once_skips_when_trend_topics_are_insufficient(self):
         from . import insights

@@ -177,35 +177,6 @@ def _story_payload(
     return out
 
 
-def _story_strength_key(row: Any) -> Tuple[int, int, int, int]:
-    return (
-        int(row["score"] or 0),
-        int(row["descendants"] or 0),
-        int(row["hn_time"] or 0),
-        -int(row["id"] or 0),
-    )
-
-
-def _ensure_min_story_rows(
-    selected_rows: Sequence[Any],
-    fallback_rows: Sequence[Any],
-    min_count: int,
-) -> List[Any]:
-    rows = list(selected_rows)
-    seen = {int(row["id"]) for row in rows}
-    if len(rows) >= min_count:
-        return rows
-    for row in sorted(fallback_rows, key=_story_strength_key, reverse=True):
-        sid = int(row["id"])
-        if sid in seen:
-            continue
-        rows.append(row)
-        seen.add(sid)
-        if len(rows) >= min_count:
-            break
-    return rows
-
-
 def _build_today_topic_summary(rows: Sequence[Any]) -> List[Dict[str, Any]]:
     counts: Dict[str, int] = {}
     score_sum: Dict[str, int] = {}
@@ -430,11 +401,7 @@ def build_opportunity_input(
         ),
         reverse=True,
     )
-    rows = _ensure_min_story_rows(
-        [item[3] for item in candidates],
-        window_rows,
-        OPPORTUNITY_MIN_CANDIDATES,
-    )
+    rows = [item[3] for item in candidates]
     return {
         "candidates": [
             _story_payload(
@@ -472,11 +439,6 @@ def build_debate_input(
         ):
             continue
         candidates.append(row)
-    candidates = _ensure_min_story_rows(
-        candidates,
-        window_rows,
-        DEBATE_MIN_CANDIDATES,
-    )
     candidates.sort(
         key=lambda row: (
             int(row["descendants"] or 0),
