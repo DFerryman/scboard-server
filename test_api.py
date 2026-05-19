@@ -38,6 +38,7 @@ from .ai_agent import (
     _summarize_usage_records,
     build_ai_agent,
     build_ai_provider_configs,
+    build_insights_ai_provider_configs,
     validate_ai_output,
 )
 from .digest import run_digester_once
@@ -2264,6 +2265,537 @@ class IngestRoundBehavior(_SqliteCase):
 
 
 class CloudSyncReadModel(_SqliteCase):
+    def _insert_done_story(
+        self,
+        conn,
+        story_id: int,
+        hn_time: int,
+        *,
+        topic: str = "ai",
+        score: int = 100,
+        descendants: int = 50,
+        raw_text: str = "raw article text",
+    ) -> None:
+        now = repository.now_seconds()
+        conn.execute(
+            """
+            INSERT INTO stories(
+                id, kind, title_en, title_zh, url, domain, by,
+                score, descendants, hn_time, raw_text, raw_json,
+                topic, ai_summary, discussion_themes, insights, terms,
+                enrich_status, enriched_at, fetched_at, last_seen_at
+            ) VALUES(
+                ?, 'story', ?, ?, ?, 'example.com', 'alice',
+                ?, ?, ?, ?, '{}',
+                ?, ?, ?, ?, '[]',
+                'done', ?, ?, ?
+            )
+            """,
+            (
+                story_id,
+                f"Story {story_id}",
+                f"故事 {story_id}",
+                f"https://example.com/{story_id}",
+                score,
+                descendants,
+                hn_time,
+                raw_text,
+                topic,
+                "这是一条中文 AI 摘要。",
+                json.dumps(
+                    [
+                        {"title": "主题一", "summary": "讨论主题"},
+                        {"title": "主题二", "summary": "另一条主题"},
+                    ],
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    [{"author": "bob", "score": 1, "text": "代表观点"}],
+                    ensure_ascii=False,
+                ),
+                now,
+                now,
+                now,
+            ),
+        )
+
+    def test_insights_candidate_query_excludes_stories_before_window(self):
+        from . import insights
+
+        target = "2026-05-19"
+        start_ts, end_ts, _ = insights._window_bounds(target, 7)
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                self._insert_done_story(conn, 101, start_ts, topic="ai")
+                self._insert_done_story(conn, 102, start_ts - 1, topic="old")
+            rows = repository.candidate_rows_for_insights(
+                conn, start_ts=start_ts, end_ts=end_ts
+            )
+        finally:
+            conn.close()
+        self.assertEqual([int(r["id"]) for r in rows], [101])
+
+    def test_insights_agent_inputs_are_minimal_by_section(self):
+        from . import insights
+
+        target = "2026-05-19"
+        start, _ = repository.digest_date_epoch_bounds(target)
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                for offset in range(8):
+                    self._insert_done_story(
+                        conn,
+                        200 + offset,
+                        start + offset * 60,
+                        topic=f"topic-{offset}",
+                        raw_text="RAW_TEXT_SHOULD_NOT_LEAK",
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO comments(id, story_id, text, fetched_at)
+                        VALUES(?, ?, 'COMMENT_SHOULD_NOT_LEAK', ?)
+                        """,
+                        (9000 + offset, 200 + offset, repository.now_seconds()),
+                    )
+                rows = repository.candidate_rows_for_insights(
+                    conn,
+                    start_ts=start,
+                    end_ts=start + 86400,
+                )
+                ranks = repository.insight_feed_ranks_for_story_ids(
+                    conn, [int(r["id"]) for r in rows]
+                )
+            signals_input = insights.build_today_signals_input(
+                rows,
+                target_date=target,
+                feed_ranks=ranks,
+            )
+            trends_input = insights.build_trend_heat_input(
+                rows,
+                target_date=target,
+                start_date=target,
+            )
+        finally:
+            conn.close()
+
+        signals_json = json.dumps(signals_input, ensure_ascii=False)
+        trends_json = json.dumps(trends_input, ensure_ascii=False)
+        self.assertNotIn("rawTextSnippet", signals_json)
+        self.assertNotIn("comments", signals_json)
+        self.assertNotIn("insights", signals_json)
+        self.assertNotIn("example.com", signals_json)
+        self.assertNotIn("RAW_TEXT_SHOULD_NOT_LEAK", signals_json)
+        self.assertNotIn("COMMENT_SHOULD_NOT_LEAK", signals_json)
+        self.assertNotIn("comments", trends_json)
+        self.assertNotIn("RAW_TEXT_SHOULD_NOT_LEAK", trends_json)
+
+    def test_trend_heat_agent_uses_server_metrics_not_model_inventions(self):
+        from .insights_agents import TrendHeatAgent
+
+        agent = object.__new__(TrendHeatAgent)
+        payload = {
+            "topicDailyStats": [
+                {
+                    "topic": f"Topic {i}",
+                    "heat": 60 + i,
+                    "deltaText": f"+{i} / 24h",
+                    "trendKey": "rising" if i % 2 else "stable",
+                }
+                for i in range(5)
+            ]
+        }
+        raw = {
+            "trendHeatmap": {
+                "title": "瓒嬪娍娓╁害",
+                "note": "妯″瀷鍙啓瑙ｉ噴",
+                "items": [
+                    {
+                        "topic": f"Topic {i}",
+                        "heat": 0,
+                        "deltaText": "-99 / 24h",
+                        "trendKey": "cooling",
+                    }
+                    for i in range(5)
+                ],
+            }
+        }
+
+        out = agent.validate(raw, payload)
+        items = out["trendHeatmap"]["items"]
+        self.assertEqual([item["heat"] for item in items], [60, 61, 62, 63, 64])
+        self.assertEqual([item["deltaText"] for item in items], [f"+{i} / 24h" for i in range(5)])
+        self.assertEqual(
+            [item["trendKey"] for item in items],
+            ["stable", "rising", "stable", "rising", "stable"],
+        )
+
+    def test_run_insights_once_does_not_send_story_before_window_to_agents(self):
+        from . import insights
+
+        target = "2026-05-19"
+        target_start, _ = repository.digest_date_epoch_bounds(target)
+        start_ts, _end_ts, _start_date = insights._window_bounds(target, 7)
+
+        class CapturingInsightsAgent:
+            def __init__(self):
+                self.inputs = {}
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint):
+                return checkpoint, {}
+
+            def run_signals(self, payload):
+                self.inputs["signals"] = payload
+                return {
+                    "headline": "headline",
+                    "summary": "summary",
+                    "signals": [
+                        {
+                            "id": f"s-{i}",
+                            "label": "模式",
+                            "title": f"signal {i}",
+                            "brief": "brief",
+                            "trend": "+0",
+                            "tone": "flat",
+                        }
+                        for i in range(3)
+                    ],
+                }
+
+            def run_trends(self, payload):
+                self.inputs["trends"] = payload
+                return {
+                    "trendHeatmap": {
+                        "title": "趋势温度",
+                        "note": "note",
+                        "items": [
+                            {
+                                "topic": item["topic"],
+                                "heat": item["heat"],
+                                "deltaText": item["deltaText"],
+                                "trendKey": item["trendKey"],
+                            }
+                            for item in payload["topicDailyStats"][:5]
+                        ],
+                    }
+                }
+
+            def run_opportunities(self, payload):
+                self.inputs["opportunities"] = payload
+                ids = [item["id"] for item in payload["candidates"][:3]]
+                return {
+                    "opportunities": [
+                        {
+                            "rank": i + 1,
+                            "rankText": f"{i + 1:02d}",
+                            "title": f"opp {i}",
+                            "score": 80 + i,
+                            "category": "tool",
+                            "audience": ["dev"],
+                            "thesis": "thesis",
+                            "whyNow": "now",
+                            "risk": "risk",
+                            "linkedStoryIds": [sid],
+                        }
+                        for i, sid in enumerate(ids)
+                    ]
+                }
+
+            def run_debates(self, payload):
+                self.inputs["debates"] = payload
+                return {
+                    "debates": [
+                        {
+                            "topic": f"debate {i}",
+                            "verdict": "观察",
+                            "intensity": 50,
+                            "supportWidth": 50,
+                            "opposeWidth": 50,
+                            "support": "support",
+                            "oppose": "oppose",
+                            "watch": "watch",
+                        }
+                        for i in range(2)
+                    ]
+                }
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                for offset in range(8):
+                    self._insert_done_story(
+                        conn,
+                        300 + offset,
+                        target_start + offset * 60,
+                        topic=f"topic-{offset}",
+                        score=120 + offset,
+                        descendants=60 + offset,
+                    )
+                self._insert_done_story(
+                    conn,
+                    999,
+                    start_ts - 1,
+                    topic="old",
+                    raw_text="OLD_STORY_SHOULD_NOT_REACH_PROMPT",
+                )
+        finally:
+            conn.close()
+
+        agent = CapturingInsightsAgent()
+        summary = insights.run_insights_once(date=target, force=True, ai_agent=agent)
+        prompts_json = json.dumps(agent.inputs, ensure_ascii=False)
+        self.assertEqual(summary["status"], "ok")
+        self.assertNotIn("999", prompts_json)
+        self.assertNotIn("OLD_STORY_SHOULD_NOT_REACH_PROMPT", prompts_json)
+
+    def test_run_insights_once_rejects_story_ids_outside_window_from_agent_output(self):
+        from . import insights
+
+        target = "2026-05-19"
+        target_start, _ = repository.digest_date_epoch_bounds(target)
+        start_ts, _end_ts, _start_date = insights._window_bounds(target, 7)
+
+        class OldIdAgent:
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint):
+                return checkpoint, {}
+
+            def run_signals(self, _payload):
+                return {
+                    "headline": "headline",
+                    "summary": "summary",
+                    "signals": [
+                        {
+                            "id": f"s-{i}",
+                            "label": "模式",
+                            "title": f"signal {i}",
+                            "brief": "brief",
+                            "trend": "+0",
+                            "tone": "flat",
+                        }
+                        for i in range(3)
+                    ],
+                }
+
+            def run_trends(self, payload):
+                return {
+                    "trendHeatmap": {
+                        "title": "趋势温度",
+                        "note": "note",
+                        "items": [
+                            {
+                                "topic": item["topic"],
+                                "heat": item["heat"],
+                                "deltaText": item["deltaText"],
+                                "trendKey": item["trendKey"],
+                            }
+                            for item in payload["topicDailyStats"][:5]
+                        ],
+                    }
+                }
+
+            def run_opportunities(self, _payload):
+                return {
+                    "opportunities": [
+                        {
+                            "rank": i + 1,
+                            "rankText": f"{i + 1:02d}",
+                            "title": f"opp {i}",
+                            "score": 80 + i,
+                            "category": "tool",
+                            "audience": ["dev"],
+                            "thesis": "thesis",
+                            "whyNow": "now",
+                            "risk": "risk",
+                            "linkedStoryIds": [999],
+                        }
+                        for i in range(3)
+                    ]
+                }
+
+            def run_debates(self, _payload):
+                return {
+                    "debates": [
+                        {
+                            "topic": f"debate {i}",
+                            "verdict": "观察",
+                            "intensity": 50,
+                            "supportWidth": 50,
+                            "opposeWidth": 50,
+                            "support": "support",
+                            "oppose": "oppose",
+                            "watch": "watch",
+                        }
+                        for i in range(2)
+                    ]
+                }
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                for offset in range(8):
+                    self._insert_done_story(
+                        conn,
+                        400 + offset,
+                        target_start + offset * 60,
+                        topic=f"topic-{offset}",
+                        score=120 + offset,
+                        descendants=60 + offset,
+                    )
+                self._insert_done_story(conn, 999, start_ts - 1, topic="old")
+        finally:
+            conn.close()
+
+        summary = insights.run_insights_once(date=target, force=True, ai_agent=OldIdAgent())
+        self.assertEqual(summary["status"], "failed")
+        self.assertIn("outside 7-day window", summary["error"])
+        conn = db.connect()
+        try:
+            self.assertIsNone(repository.get_insight_row(conn, target))
+        finally:
+            conn.close()
+
+    def test_opportunity_agent_rejects_linked_story_ids_outside_candidates(self):
+        from .insights_agents import InsightsValidationError, OpportunityAgent
+
+        agent = object.__new__(OpportunityAgent)
+        raw = {
+            "opportunities": [
+                {
+                    "title": f"机会 {i}",
+                    "score": 80,
+                    "category": "工具",
+                    "audience": ["开发者"],
+                    "thesis": "判断",
+                    "whyNow": "现在",
+                    "risk": "风险",
+                    "linkedStoryIds": [999 if i == 0 else 101],
+                }
+                for i in range(3)
+            ]
+        }
+        with self.assertRaises(InsightsValidationError):
+            agent.validate(raw, {"candidates": [{"id": 101}]})
+
+    def test_debate_agent_normalizes_support_and_oppose_to_100(self):
+        from .insights_agents import DebateAgent
+
+        agent = object.__new__(DebateAgent)
+        out = agent.validate(
+            {
+                "debates": [
+                    {
+                        "topic": f"议题 {i}",
+                        "verdict": "机会伴随风险",
+                        "intensity": 120,
+                        "supportWidth": 20,
+                        "opposeWidth": 20,
+                        "support": "支持",
+                        "oppose": "反对",
+                        "watch": "观察",
+                    }
+                    for i in range(2)
+                ]
+            }
+        )
+        for item in out["debates"]:
+            self.assertEqual(item["supportWidth"] + item["opposeWidth"], 100)
+            self.assertEqual(item["intensity"], 100)
+
+    def test_insights_forbidden_words_are_cleaned(self):
+        from .insights_agents import contains_forbidden_words, sanitize_forbidden_words
+
+        cleaned = sanitize_forbidden_words(
+            {"headline": "Hacker News and Show HN are HN labels"}
+        )
+        self.assertFalse(contains_forbidden_words(cleaned), cleaned)
+
+    def test_upsert_insight_bumps_catalog_only_when_content_changes(self):
+        payload = {
+            "_id": "old:2026-05-19",
+            "syncVersion": 3,
+            "version": 1,
+            "date": "2026-05-19",
+            "asOf": "2026-05-19",
+            "asOfLabel": "2026.05.19 · UTC+8",
+            "generatedAt": "2026-05-19T08:00:00+08:00",
+            "window": "24h",
+            "access": {"unlocked": True, "tier": "pro"},
+            "headline": "判断",
+            "summary": "摘要",
+            "stats": [],
+            "signals": [],
+            "trendHeatmap": {"items": []},
+            "opportunities": [],
+            "debates": [],
+        }
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                v0 = repository.get_catalog_version(conn)
+                changed = repository.upsert_insight(
+                    conn, "2026-05-19", payload, [101], 1, 7
+                )
+                if changed:
+                    repository.bump_catalog_version(conn)
+                v1 = repository.get_catalog_version(conn)
+                changed_again = repository.upsert_insight(
+                    conn, "2026-05-19", payload, [101], 2, 7
+                )
+                if changed_again:
+                    repository.bump_catalog_version(conn)
+                v2 = repository.get_catalog_version(conn)
+        finally:
+            conn.close()
+        self.assertNotEqual(v0, v1)
+        self.assertFalse(changed_again)
+        self.assertEqual(v1, v2)
+
+    def test_build_read_model_writes_versioned_insights(self):
+        from . import cloud_sync
+
+        payload = {
+            "version": 1,
+            "date": "2026-05-19",
+            "asOf": "2026-05-19",
+            "asOfLabel": "2026.05.19 · UTC+8",
+            "generatedAt": "2026-05-19T08:00:00+08:00",
+            "window": "24h",
+            "access": {"unlocked": True, "tier": "pro"},
+            "headline": "判断",
+            "summary": "摘要",
+            "stats": [],
+            "signals": [],
+            "trendHeatmap": {"title": "趋势温度", "items": []},
+            "opportunities": [],
+            "debates": [],
+        }
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "catalog_version", "7")
+                repository.upsert_insight(conn, "2026-05-19", payload, [101], 1, 7)
+        finally:
+            conn.close()
+
+        out_dir = Path(self.tmpdir) / "insights-read-model"
+        stats = cloud_sync.build_read_model(out_dir, include_dashboard=False)
+        docs = [
+            json.loads(line)
+            for line in (out_dir / "insights.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(stats["insights"], 1)
+        self.assertEqual(docs[0]["_id"], "7:2026-05-19")
+        self.assertEqual(docs[0]["syncVersion"], 7)
+        self.assertEqual(docs[0]["headline"], "判断")
+
     def test_build_read_model_excludes_raw_or_placeholder_ai_output(self):
         from . import cloud_sync
 
@@ -4158,6 +4690,54 @@ class RealAiAgentFailover(unittest.TestCase):
                 timeout=1.0,
             ),
         ]
+
+    def test_insights_ai_config_is_independent_from_story_ai_config(self):
+        old_values = {
+            "AI_CONFIGS_JSON": settings.AI_CONFIGS_JSON,
+            "AI_API_KEY": settings.AI_API_KEY,
+            "AI_MODEL": settings.AI_MODEL,
+            "AI_BASE_URL": settings.AI_BASE_URL,
+            "AI_REQUEST_TIMEOUT_SECONDS": settings.AI_REQUEST_TIMEOUT_SECONDS,
+            "AI_INTERNAL_HOST_ALLOWLIST": settings.AI_INTERNAL_HOST_ALLOWLIST,
+            "INSIGHTS_AI_CONFIGS_JSON": settings.INSIGHTS_AI_CONFIGS_JSON,
+            "INSIGHTS_AI_API_KEY": settings.INSIGHTS_AI_API_KEY,
+            "INSIGHTS_AI_MODEL": settings.INSIGHTS_AI_MODEL,
+            "INSIGHTS_AI_BASE_URL": settings.INSIGHTS_AI_BASE_URL,
+            "INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS": settings.INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS,
+            "INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST": settings.INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST,
+            "INSIGHTS_AI_MAX_OUTPUT_TOKENS": settings.INSIGHTS_AI_MAX_OUTPUT_TOKENS,
+        }
+        try:
+            settings.AI_CONFIGS_JSON = ""  # type: ignore[assignment]
+            settings.AI_API_KEY = "story-secret"  # type: ignore[assignment]
+            settings.AI_MODEL = "story-model"  # type: ignore[assignment]
+            settings.AI_BASE_URL = "https://story.example/v1"  # type: ignore[assignment]
+            settings.AI_REQUEST_TIMEOUT_SECONDS = 61.0  # type: ignore[assignment]
+            settings.AI_INTERNAL_HOST_ALLOWLIST = ()  # type: ignore[assignment]
+
+            settings.INSIGHTS_AI_CONFIGS_JSON = ""  # type: ignore[assignment]
+            settings.INSIGHTS_AI_API_KEY = "insights-secret"  # type: ignore[assignment]
+            settings.INSIGHTS_AI_MODEL = "insights-model"  # type: ignore[assignment]
+            settings.INSIGHTS_AI_BASE_URL = "https://insights.example/v1"  # type: ignore[assignment]
+            settings.INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS = 122.0  # type: ignore[assignment]
+            settings.INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST = ()  # type: ignore[assignment]
+            settings.INSIGHTS_AI_MAX_OUTPUT_TOKENS = 4096  # type: ignore[assignment]
+
+            story_configs = build_ai_provider_configs()
+            insights_configs = build_insights_ai_provider_configs()
+        finally:
+            for name, value in old_values.items():
+                setattr(settings, name, value)
+
+        self.assertEqual(story_configs[0].model, "story-model")
+        self.assertEqual(story_configs[0].base_url, "https://story.example/v1")
+        self.assertEqual(story_configs[0].timeout, 61.0)
+        self.assertIsNone(story_configs[0].max_output_tokens)
+
+        self.assertEqual(insights_configs[0].model, "insights-model")
+        self.assertEqual(insights_configs[0].base_url, "https://insights.example/v1")
+        self.assertEqual(insights_configs[0].timeout, 122.0)
+        self.assertEqual(insights_configs[0].max_output_tokens, 4096)
 
     def test_process_story_tries_next_config_after_provider_error(self):
         class ProviderErrorThenSuccessAgent(RealAiAgent):
@@ -8251,6 +8831,7 @@ class CloudPushDeadlineBehavior(unittest.TestCase):
         (tmp / "stories.jsonl").write_text("", encoding="utf-8")
         (tmp / "topics.jsonl").write_text("", encoding="utf-8")
         (tmp / "digests.jsonl").write_text("", encoding="utf-8")
+        (tmp / "insights.jsonl").write_text("", encoding="utf-8")
         return tmp
 
     def test_aborts_before_first_http_call_when_deadline_passed(self):
@@ -8552,6 +9133,13 @@ class CloudPushDeadlineBehavior(unittest.TestCase):
             ) + "\n",
             encoding="utf-8",
         )
+        (src / "insights.jsonl").write_text(
+            json.dumps(
+                {"_id": "1:2026-05-12", "syncVersion": 1, "date": "2026-05-12"},
+                ensure_ascii=False,
+            ) + "\n",
+            encoding="utf-8",
+        )
         payloads = []
 
         def fake_post(_url, _secret, payload, *, timeout):
@@ -8579,6 +9167,7 @@ class CloudPushDeadlineBehavior(unittest.TestCase):
                 "stories": ["1:101"],
                 "topics": ["1:ai"],
                 "digests": ["1:2026-05-12"],
+                "insights": ["1:2026-05-12"],
             },
         )
         self.assertNotIn("dashboardIngestRuns", switch_payload["meta"]["manifest"])
@@ -9616,6 +10205,7 @@ class CloudPushBusinessDashboardSeparation(unittest.TestCase):
         (tmp / "stories.jsonl").write_text("", encoding="utf-8")
         (tmp / "topics.jsonl").write_text("", encoding="utf-8")
         (tmp / "digests.jsonl").write_text("", encoding="utf-8")
+        (tmp / "insights.jsonl").write_text("", encoding="utf-8")
         meta = {
             "_id": "catalog",
             "currentVersion": 5,
@@ -9689,6 +10279,28 @@ class CloudPushBusinessDashboardSeparation(unittest.TestCase):
         self.assertNotIn("dashboardSummary", first_batch)
         self.assertNotIn("dashboardIngestRuns", first_batch)
         self.assertNotIn("dashboardCloudSyncRuns", first_batch)
+
+    def test_business_writebatch_and_manifest_include_insights(self):
+        src = self._write_read_model(with_dashboard=True)
+        (src / "insights.jsonl").write_text(
+            json.dumps(
+                {"_id": "5:2026-05-19", "syncVersion": 5, "date": "2026-05-19"},
+                ensure_ascii=False,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        payloads = self._capture_payloads(src)
+
+        first_batch = next(p for p in payloads if p.get("action") == "writeBatch")
+        switch = next(p for p in payloads if p.get("action") == "switchMeta")
+        self.assertEqual(
+            [doc["_id"] for doc in first_batch.get("insights") or []],
+            ["5:2026-05-19"],
+        )
+        self.assertEqual(
+            switch["meta"]["manifest"]["insights"],
+            ["5:2026-05-19"],
+        )
 
     def test_business_switchmeta_does_not_carry_dashboard_summary_at(self):
         """Protocol boundary: switchMeta.meta no longer carries

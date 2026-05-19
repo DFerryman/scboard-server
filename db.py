@@ -139,6 +139,28 @@ CREATE TABLE IF NOT EXISTS digests (
   generated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS insights (
+  date TEXT PRIMARY KEY,
+  payload TEXT NOT NULL DEFAULT '{}',
+  source_story_ids TEXT NOT NULL DEFAULT '[]',
+  generated_at INTEGER NOT NULL,
+  window_days INTEGER NOT NULL DEFAULT 7,
+  model_usage TEXT
+);
+
+CREATE TABLE IF NOT EXISTS insights_runs (
+  run_id TEXT PRIMARY KEY,
+  date TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  status TEXT NOT NULL,
+  model_usage TEXT,
+  error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_insights_runs_started
+ON insights_runs(started_at DESC);
+
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,
@@ -174,6 +196,7 @@ CREATE TABLE IF NOT EXISTS cloud_sync_runs (
   stories INTEGER,
   topics INTEGER,
   digests INTEGER,
+  insights INTEGER,
   elapsed_seconds REAL,
   error TEXT,
   -- cleanupOld is the best-effort stage at the end of push_read_model; when it
@@ -256,6 +279,7 @@ INGEST_RUN_COLUMN_MIGRATIONS = {
 }
 
 CLOUD_SYNC_RUN_COLUMN_MIGRATIONS = {
+    "insights": "ALTER TABLE cloud_sync_runs ADD COLUMN insights INTEGER",
     "cleanup_status": (
         "ALTER TABLE cloud_sync_runs ADD COLUMN cleanup_status TEXT"
     ),

@@ -2044,7 +2044,7 @@ def _write_cloud_sync_run(
                         """
                         UPDATE cloud_sync_runs
                         SET finished_at=?, status=?, sync_version=?,
-                            stories=?, topics=?, digests=?,
+                            stories=?, topics=?, digests=?, insights=?,
                             elapsed_seconds=?, error=?, cleanup_status=?
                         WHERE run_id=? AND started_at=?
                         """,
@@ -2055,6 +2055,7 @@ def _write_cloud_sync_run(
                             push_stats.get("stories"),
                             push_stats.get("topics"),
                             push_stats.get("digests"),
+                            push_stats.get("insights"),
                             elapsed_seconds,
                             (error or None),
                             cleanup_status,
@@ -2068,9 +2069,9 @@ def _write_cloud_sync_run(
                     """
                     INSERT INTO cloud_sync_runs
                         (run_id, started_at, finished_at, status, sync_version,
-                         stories, topics, digests, elapsed_seconds, error,
+                         stories, topics, digests, insights, elapsed_seconds, error,
                          cleanup_status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -2081,6 +2082,7 @@ def _write_cloud_sync_run(
                         push_stats.get("stories"),
                         push_stats.get("topics"),
                         push_stats.get("digests"),
+                        push_stats.get("insights"),
                         elapsed_seconds,
                         (error or None),
                         cleanup_status,
@@ -2353,6 +2355,7 @@ def run_ingest_round(
         "enrich": None,
         "digest": None,
         "digest_checkpoints": [],
+        "insights": None,
         "publish": None,
         "cleanup": None,
     }
@@ -2678,6 +2681,30 @@ def run_ingest_round(
         else:
             _finish_run(run_id, "completed")
             summary["status"] = "completed"
+
+        try:
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    repository.update_ingest_run(conn, run_id, phase="insights")
+            finally:
+                conn.close()
+            from .insights import run_insights_once
+
+            insights_summary = run_insights_once()
+            summary["insights"] = insights_summary
+            if insights_summary.get("status") == "failed":
+                log.warning("insights failed: %s", insights_summary)
+            else:
+                log.info("insights: %s", insights_summary)
+        except Exception as exc:  # noqa: BLE001
+            # Insights is an additive read model. It must never roll back or
+            # block stories/topics/digests publication.
+            log.exception("insights failed unexpectedly: %s", exc)
+            summary["insights"] = {
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
         if run_cleanup:
             try:
@@ -3298,6 +3325,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--fetch", action="store_true", help="Run Fetcher only")
     parser.add_argument("--enrich", action="store_true", help="Run Enricher only")
     parser.add_argument("--digest", action="store_true", help="Run Digester only")
+    parser.add_argument("--insights", action="store_true", help="Run Insights only")
+    parser.add_argument(
+        "--force-insights",
+        action="store_true",
+        help="Regenerate insights even when the update interval gate says not due",
+    )
+    parser.add_argument("--date", default="", help="Target date for --insights (YYYY-MM-DD)")
     parser.add_argument("--cleanup", action="store_true", help="Run Cleanup only")
     parser.add_argument(
         "--reset-failed",
@@ -3358,6 +3392,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "fetch": args.fetch,
         "enrich": args.enrich,
         "digest": args.digest,
+        "insights": args.insights,
         "cleanup": args.cleanup,
     }
     full_round_requested = args.once or args.loop
@@ -3387,6 +3422,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                 log.info("digester: %s", summary)
             except Exception as exc:  # noqa: BLE001
                 log.exception("digester failed: %s", exc)
+        if requested["insights"]:
+            try:
+                from .insights import run_insights_once
+
+                summary = run_insights_once(
+                    date=args.date or None,
+                    force=bool(args.force_insights),
+                )
+                log.info("insights: %s", summary)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("insights failed: %s", exc)
         if requested["cleanup"]:
             try:
                 from .cleanup import run_cleanup_once

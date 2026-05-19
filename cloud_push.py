@@ -547,6 +547,7 @@ def _write_batch_payload(
     stories: Optional[List[dict]] = None,
     topics: Optional[List[dict]] = None,
     digests: Optional[List[dict]] = None,
+    insights: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "action": "writeBatch",
@@ -557,6 +558,8 @@ def _write_batch_payload(
         payload["topics"] = topics
     if digests is not None:
         payload["digests"] = digests
+    if insights is not None:
+        payload["insights"] = insights
     return payload
 
 
@@ -628,6 +631,7 @@ def _write_batch_payloads(
     stories: List[dict],
     topics: List[dict],
     digests: List[dict],
+    insights: List[dict],
     batch_size: int,
     max_body_bytes: int,
 ) -> List[Dict[str, Any]]:
@@ -643,7 +647,7 @@ def _write_batch_payloads(
     remaining_stories = list(stories)
 
     # Preserve the original cloud protocol shape when it fits: the first
-    # writeBatch carries topics + digests and as many complete story docs as
+    # writeBatch carries topics + digests + insights and as many complete story docs as
     # fit. This avoids truncation while staying compatible with the deployed
     # pushSync implementation that already accepts the old first-batch layout.
     first_story_chunk: List[dict] = []
@@ -652,6 +656,7 @@ def _write_batch_payloads(
         stories=first_story_chunk,
         topics=topics,
         digests=digests,
+        insights=insights,
     )
     if _payload_size_bytes(first_payload) <= max_body_bytes:
         while remaining_stories and len(first_story_chunk) < batch_size:
@@ -661,6 +666,7 @@ def _write_batch_payloads(
                 stories=candidate,
                 topics=topics,
                 digests=digests,
+                insights=insights,
             )
             if _payload_size_bytes(candidate_payload) > max_body_bytes:
                 break
@@ -673,13 +679,14 @@ def _write_batch_payloads(
                 stories=first_story_chunk,
                 topics=topics,
                 digests=digests,
+                insights=insights,
             )
         )
     else:
-        # Rare fallback: if topics+digests alone exceed the request limit,
+        # Rare fallback: if topics+digests+insights alone exceed the request limit,
         # split each collection without dropping fields. Single oversized docs
         # fail locally with a clear error instead of being truncated.
-        for field, docs in (("topics", topics), ("digests", digests)):
+        for field, docs in (("topics", topics), ("digests", digests), ("insights", insights)):
             payloads.extend(
                 _chunk_write_batch_docs(
                     current_version=current_version,
@@ -920,16 +927,19 @@ def push_read_model(
     stories = _load_required_jsonl(out_dir / "stories.jsonl")
     topics = _load_required_jsonl(out_dir / "topics.jsonl")
     digests = _load_required_jsonl(out_dir / "digests.jsonl")
+    insights = _load_required_jsonl(out_dir / "insights.jsonl")
     current_version = int(meta["currentVersion"])
     previous_version = meta.get("previousVersion")
     _validate_versioned_docs("stories", stories, current_version)
     _validate_versioned_docs("topics", topics, current_version)
     _validate_versioned_docs("digests", digests, current_version)
+    _validate_versioned_docs("insights", insights, current_version)
     write_batch_payloads = _write_batch_payloads(
         current_version=current_version,
         stories=stories,
         topics=topics,
         digests=digests,
+        insights=insights,
         batch_size=batch_size,
         max_body_bytes=max_body_bytes,
     )
@@ -941,12 +951,13 @@ def push_read_model(
         "stories": [str(doc["_id"]) for doc in stories if doc.get("_id")],
         "topics": [str(doc["_id"]) for doc in topics if doc.get("_id")],
         "digests": [str(doc["_id"]) for doc in digests if doc.get("_id")],
+        "insights": [str(doc["_id"]) for doc in insights if doc.get("_id")],
     }
 
     log.info(
-        "[push] target version=%d previous=%s stories=%d topics=%d digests=%d url=%s",
+        "[push] target version=%d previous=%s stories=%d topics=%d digests=%d insights=%d url=%s",
         current_version, previous_version,
-        len(stories), len(topics), len(digests), _redacted_url_for_log(url),
+        len(stories), len(topics), len(digests), len(insights), _redacted_url_for_log(url),
     )
 
     # ---------- 1. ping ----------
@@ -960,7 +971,7 @@ def push_read_model(
     log.info("[push] ping ok: %s", r)
 
     # ---------- 2. writeBatch ----------
-    sent = {"stories": 0, "topics": 0, "digests": 0}
+    sent = {"stories": 0, "topics": 0, "digests": 0, "insights": 0}
     for payload in write_batch_payloads:
         _abort_if_insufficient(deadline_at, phase="writeBatch")
         payload_bytes = _payload_size_bytes(payload)
@@ -973,9 +984,9 @@ def push_read_model(
         for k in sent:
             sent[k] += int(r.get(k, 0) or 0)
         log.info(
-            "[push] writeBatch chunk: stories+%s topics+%s digests+%s bytes=%s/%s",
+            "[push] writeBatch chunk: stories+%s topics+%s digests+%s insights+%s bytes=%s/%s",
             r.get("stories", 0), r.get("topics", 0), r.get("digests", 0),
-            payload_bytes, max_body_bytes,
+            r.get("insights", 0), payload_bytes, max_body_bytes,
         )
 
     # ---------- 3. switchMeta ----------
@@ -1032,6 +1043,7 @@ def push_read_model(
         "stories": sent["stories"],
         "topics": sent["topics"],
         "digests": sent["digests"],
+        "insights": sent["insights"],
         "cleanup": cleanup_result,
     }
 

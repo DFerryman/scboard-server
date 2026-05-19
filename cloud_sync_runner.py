@@ -208,6 +208,7 @@ def run_business_once(
                 "stories": 0,
                 "topics": 0,
                 "digests": 0,
+                "insights": 0,
                 "businessSkipped": True,
             },
         )
@@ -247,9 +248,10 @@ def run_business_once(
         cloud_sync.default_output_dir(), expected_version=sync_version
     )
     log.info(
-        "[cloud_sync] business OK run_id=%s v=%s took=%.1fs stories=%s topics=%s digests=%s",
+        "[cloud_sync] business OK run_id=%s v=%s took=%.1fs stories=%s topics=%s digests=%s insights=%s",
         run_id, sync_version, elapsed,
         push_stats.get("stories"), push_stats.get("topics"), push_stats.get("digests"),
+        push_stats.get("insights"),
     )
     return CloudBusinessResult(
         ok=True,

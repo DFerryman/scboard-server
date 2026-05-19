@@ -127,6 +127,10 @@ def _cloud_sync_row_summary(row: sqlite3.Row) -> Dict[str, Any]:
         cleanup_status = row["cleanup_status"]
     except (IndexError, KeyError):
         cleanup_status = None
+    try:
+        insights = row["insights"]
+    except (IndexError, KeyError):
+        insights = None
     return {
         "run_id": row["run_id"],
         "started_at": int(row["started_at"]) if row["started_at"] is not None else None,
@@ -140,6 +144,7 @@ def _cloud_sync_row_summary(row: sqlite3.Row) -> Dict[str, Any]:
         "stories": int(row["stories"]) if row["stories"] is not None else None,
         "topics": int(row["topics"]) if row["topics"] is not None else None,
         "digests": int(row["digests"]) if row["digests"] is not None else None,
+        "insights": int(insights) if insights is not None else None,
         "elapsed_seconds": (
             float(row["elapsed_seconds"])
             if row["elapsed_seconds"] is not None

@@ -9,6 +9,7 @@ systemd ``ReadWritePaths``):
     stories.jsonl                    one doc per line, versioned _id = "${v}:${id}"
     topics.jsonl                     versioned _id = "${v}:${topicId}"
     digests.jsonl                    self-contained; versioned _id = "${v}:${date}"
+    insights.jsonl                   versioned _id = "${v}:${date}"
     meta.json                        single doc, _id = "catalog"
     dashboard_summary.json           dashboard pipeline snapshot; _id = "summary"
     dashboard_ingest_runs.jsonl      most recent N ingest runs
@@ -358,6 +359,29 @@ def build_read_model(
             })
         _write_jsonl_atomic(digests_path, digest_docs)
 
+        # ---------- insights.jsonl (self-contained, versioned) ----------
+        insight_rows = repository.list_insight_rows(conn)
+        insights_path = out_dir / "insights.jsonl"
+        insight_docs = []
+        for r in insight_rows:
+            try:
+                payload = json.loads(r["payload"] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            date = str(r["date"] or payload.get("date") or "")
+            if not date:
+                continue
+            doc = dict(payload)
+            doc["_id"] = f"{current_version}:{date}"
+            doc["syncVersion"] = current_version
+            doc["date"] = payload.get("date") or date
+            doc["version"] = int(payload.get("version") or 1)
+            doc.setdefault("access", {"unlocked": True, "tier": "pro"})
+            insight_docs.append(doc)
+        insight_count = _write_jsonl_atomic(insights_path, insight_docs)
+
         # ---------- meta.json ----------
         #
         # previousVersion must point at a version number that actually still
@@ -397,6 +421,7 @@ def build_read_model(
             "stories": story_count,
             "topics": len(topics),
             "digests": len(digest_rows),
+            "insights": insight_count,
             "feedCounts": meta["feedCounts"],
             "outputDir": str(out_dir),
         }

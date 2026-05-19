@@ -501,7 +501,10 @@ def _is_internal_host(hostname: Optional[str]) -> bool:
     return any(_is_internal_address(a) for a in resolved)
 
 
-def _is_host_in_internal_allowlist(hostname: Optional[str]) -> bool:
+def _is_host_in_internal_allowlist(
+    hostname: Optional[str],
+    allowlist: Optional[Sequence[str]] = None,
+) -> bool:
     """Check the operator-provided escape hatch for legitimate internal hosts.
 
     ``HNREADER_AI_INTERNAL_HOST_ALLOWLIST`` is a comma-separated list of
@@ -510,7 +513,8 @@ def _is_host_in_internal_allowlist(hostname: Optional[str]) -> bool:
     """
     if not hostname:
         return False
-    allowlist = getattr(settings, "AI_INTERNAL_HOST_ALLOWLIST", ())
+    if allowlist is None:
+        allowlist = getattr(settings, "AI_INTERNAL_HOST_ALLOWLIST", ())
     if not allowlist:
         return False
     target = hostname.lower().strip("[]")
@@ -535,6 +539,8 @@ def _normalize_base_url(
     *,
     index: int,
     default_base_url: Optional[str] = None,
+    internal_allowlist: Optional[Sequence[str]] = None,
+    allowlist_env_name: str = "HNREADER_AI_INTERNAL_HOST_ALLOWLIST",
 ) -> str:
     source = (
         value
@@ -556,12 +562,23 @@ def _normalize_base_url(
             f"AI config #{index} base_url must not contain credentials, query, or fragment"
         )
     _enforce_url_host_policy(
-        parts, index=index, field_name="base_url"
+        parts,
+        index=index,
+        field_name="base_url",
+        internal_allowlist=internal_allowlist,
+        allowlist_env_name=allowlist_env_name,
     )
     return raw.rstrip("/")
 
 
-def _normalize_optional_url(value: Any, *, field_name: str, index: int) -> str:
+def _normalize_optional_url(
+    value: Any,
+    *,
+    field_name: str,
+    index: int,
+    internal_allowlist: Optional[Sequence[str]] = None,
+    allowlist_env_name: str = "HNREADER_AI_INTERNAL_HOST_ALLOWLIST",
+) -> str:
     raw = _clean_config_text(value, field_name=field_name, index=index)
     if not raw:
         return ""
@@ -573,12 +590,23 @@ def _normalize_optional_url(value: Any, *, field_name: str, index: int) -> str:
             f"AI config #{index} {field_name} must not contain credentials, "
             "query, or fragment"
         )
-    _enforce_url_host_policy(parts, index=index, field_name=field_name)
+    _enforce_url_host_policy(
+        parts,
+        index=index,
+        field_name=field_name,
+        internal_allowlist=internal_allowlist,
+        allowlist_env_name=allowlist_env_name,
+    )
     return raw.rstrip("/")
 
 
 def _enforce_url_host_policy(
-    parts: urllib.parse.SplitResult, *, index: int, field_name: str
+    parts: urllib.parse.SplitResult,
+    *,
+    index: int,
+    field_name: str,
+    internal_allowlist: Optional[Sequence[str]] = None,
+    allowlist_env_name: str = "HNREADER_AI_INTERNAL_HOST_ALLOWLIST",
 ) -> None:
     """Reject base / probe URLs that would leak a bearer token.
 
@@ -594,25 +622,31 @@ def _enforce_url_host_policy(
       metadata service.
     """
     hostname = parts.hostname
-    if _is_host_in_internal_allowlist(hostname):
+    if _is_host_in_internal_allowlist(hostname, internal_allowlist):
         return
     if parts.scheme == "http" and not _is_local_host(hostname):
         raise ValueError(
             f"AI config #{index} {field_name} must use https "
-            "(only loopback may use http; allowlist via "
-            "HNREADER_AI_INTERNAL_HOST_ALLOWLIST)"
+            f"(only loopback may use http; allowlist via {allowlist_env_name})"
         )
     if _is_internal_host(hostname):
         raise ValueError(
             f"AI config #{index} {field_name} points at a private / "
-            "link-local / metadata address; allowlist via "
-            "HNREADER_AI_INTERNAL_HOST_ALLOWLIST if intentional"
+            f"link-local / metadata address; allowlist via {allowlist_env_name} "
+            "if intentional"
         )
 
 
-def _normalize_timeout(value: Any, *, index: int) -> float:
+def _normalize_timeout(
+    value: Any,
+    *,
+    index: int,
+    default_timeout: Optional[float] = None,
+) -> float:
     if value is None or value == "":
-        return settings.AI_REQUEST_TIMEOUT_SECONDS
+        if default_timeout is None:
+            return settings.AI_REQUEST_TIMEOUT_SECONDS
+        return float(default_timeout)
     try:
         timeout = float(value)
     except (TypeError, ValueError) as exc:
@@ -678,7 +712,14 @@ def _first_config_value(raw: Mapping[str, Any], *keys: str) -> Any:
     return None
 
 
-def _config_from_mapping(raw: Mapping[str, Any], *, index: int) -> AiProviderConfig:
+def _config_from_mapping(
+    raw: Mapping[str, Any],
+    *,
+    index: int,
+    default_timeout: Optional[float] = None,
+    internal_allowlist: Optional[Sequence[str]] = None,
+    allowlist_env_name: str = "HNREADER_AI_INTERNAL_HOST_ALLOWLIST",
+) -> AiProviderConfig:
     unknown = set(raw.keys()) - _AI_CONFIG_KEYS
     if unknown:
         raise ValueError(f"AI config #{index} has unsupported fields")
@@ -700,15 +741,20 @@ def _config_from_mapping(raw: Mapping[str, Any], *, index: int) -> AiProviderCon
     base_url = _normalize_base_url(
         raw.get("base_url") or raw.get("baseURL"),
         index=index,
+        internal_allowlist=internal_allowlist,
+        allowlist_env_name=allowlist_env_name,
     )
     balance_url = _normalize_optional_url(
         _first_config_value(raw, "balance_url", "balanceUrl", "balanceURL"),
         field_name="balance_url",
         index=index,
+        internal_allowlist=internal_allowlist,
+        allowlist_env_name=allowlist_env_name,
     )
     timeout = _normalize_timeout(
         raw.get("timeout_seconds") if "timeout_seconds" in raw else raw.get("timeout"),
         index=index,
+        default_timeout=default_timeout,
     )
     max_concurrent_requests = _normalize_max_concurrent_requests(
         raw.get("max_concurrent_requests")
@@ -802,39 +848,51 @@ def _dedupe_configs(configs: Sequence[AiProviderConfig]) -> List[AiProviderConfi
     return out
 
 
-def build_ai_provider_configs() -> List[AiProviderConfig]:
-    """Parse AI provider config without exposing secrets in diagnostics.
-
-    ``HNREADER_AI_CONFIGS`` is a JSON array of objects:
-    ``{"api_key": "...", "model": "...", "base_url": "...", "timeout_seconds": 60}``.
-    When present, it is the source of truth. The legacy single-key env vars
-    remain a compatibility fallback when the JSON list is unset.
-    """
-    settings.refresh_ai_settings_from_env_files()
-
-    raw_configs = (settings.AI_CONFIGS_JSON or "").strip()
+def build_ai_provider_configs_from_raw(
+    raw_configs: str,
+    legacy_api_key: str,
+    legacy_model: str,
+    legacy_base_url: str,
+    default_timeout: float,
+    internal_allowlist: Sequence[str] = (),
+    *,
+    configs_env_name: str = "HNREADER_AI_CONFIGS",
+    default_base_url: str = _DEFAULT_AI_BASE_URL,
+    legacy_max_output_tokens: Optional[int] = None,
+    allowlist_env_name: str = "HNREADER_AI_INTERNAL_HOST_ALLOWLIST",
+) -> List[AiProviderConfig]:
+    """Parse OpenAI-compatible provider config without exposing secrets."""
+    raw_configs = (raw_configs or "").strip()
     if raw_configs:
         try:
             parsed = json.loads(raw_configs)
         except json.JSONDecodeError as exc:
             raise ValueError(
-                f"HNREADER_AI_CONFIGS is not valid JSON: {exc.msg}"
+                f"{configs_env_name} is not valid JSON: {exc.msg}"
             ) from exc
         if not isinstance(parsed, list):
-            raise ValueError("HNREADER_AI_CONFIGS must be a JSON array")
+            raise ValueError(f"{configs_env_name} must be a JSON array")
         configs: List[AiProviderConfig] = []
         for index, item in enumerate(parsed, start=1):
             if not isinstance(item, dict):
                 raise ValueError(f"AI config #{index} must be an object")
-            configs.append(_config_from_mapping(item, index=index))
+            configs.append(
+                _config_from_mapping(
+                    item,
+                    index=index,
+                    default_timeout=default_timeout,
+                    internal_allowlist=internal_allowlist,
+                    allowlist_env_name=allowlist_env_name,
+                )
+            )
         return _dedupe_configs(configs)
 
     api_key = _clean_config_text(
-        settings.AI_API_KEY,
+        legacy_api_key,
         field_name="api_key",
         index=1,
     )
-    model = _clean_config_text(settings.AI_MODEL, field_name="model", index=1)
+    model = _clean_config_text(legacy_model, field_name="model", index=1)
     if not api_key or not model:
         return []
     return [
@@ -842,13 +900,45 @@ def build_ai_provider_configs() -> List[AiProviderConfig]:
             api_key=api_key,
             model=model,
             base_url=_normalize_base_url(
-                settings.AI_BASE_URL,
+                legacy_base_url,
                 index=1,
-                default_base_url=_DEFAULT_AI_BASE_URL,
+                default_base_url=default_base_url,
+                internal_allowlist=internal_allowlist,
+                allowlist_env_name=allowlist_env_name,
             ),
-            timeout=settings.AI_REQUEST_TIMEOUT_SECONDS,
+            timeout=default_timeout,
+            max_output_tokens=legacy_max_output_tokens,
         )
     ]
+
+
+def build_ai_provider_configs() -> List[AiProviderConfig]:
+    """Parse normal story/digest AI provider config."""
+    settings.refresh_ai_settings_from_env_files()
+    return build_ai_provider_configs_from_raw(
+        settings.AI_CONFIGS_JSON,
+        settings.AI_API_KEY,
+        settings.AI_MODEL,
+        settings.AI_BASE_URL,
+        settings.AI_REQUEST_TIMEOUT_SECONDS,
+        settings.AI_INTERNAL_HOST_ALLOWLIST,
+    )
+
+
+def build_insights_ai_provider_configs() -> List[AiProviderConfig]:
+    """Parse the independent insights AI provider config namespace."""
+    settings.refresh_insights_ai_settings_from_env_files()
+    return build_ai_provider_configs_from_raw(
+        settings.INSIGHTS_AI_CONFIGS_JSON,
+        settings.INSIGHTS_AI_API_KEY,
+        settings.INSIGHTS_AI_MODEL,
+        settings.INSIGHTS_AI_BASE_URL,
+        settings.INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS,
+        settings.INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST,
+        configs_env_name="HNREADER_INSIGHTS_AI_CONFIGS",
+        legacy_max_output_tokens=settings.INSIGHTS_AI_MAX_OUTPUT_TOKENS,
+        allowlist_env_name="HNREADER_INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST",
+    )
 
 
 def _build_provider_limiters(
@@ -2454,6 +2544,8 @@ __all__ = [
     "RealAiAgent",
     "build_ai_agent",
     "build_ai_provider_configs",
+    "build_ai_provider_configs_from_raw",
+    "build_insights_ai_provider_configs",
     "is_ai_capacity_error",
     "is_ai_quota_or_balance_error",
     "validate_ai_output",

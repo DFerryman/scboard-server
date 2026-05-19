@@ -105,6 +105,20 @@ def _env_int(name: str, default: int, *, fallback: Optional[str] = None) -> int:
         raise RuntimeError(f"{source} must be an integer") from exc
 
 
+def _env_optional_int(name: str, *, fallback: Optional[str] = None) -> Optional[int]:
+    raw = os.environ.get(name)
+    source = name
+    if (raw is None or raw == "") and fallback:
+        raw = os.environ.get(fallback)
+        source = fallback
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{source} must be an integer") from exc
+
+
 def _env_float(name: str, default: float, *, fallback: Optional[str] = None) -> float:
     raw = os.environ.get(name)
     source = name
@@ -427,6 +441,76 @@ DIGEST_TIMEZONE = _require_timezone(
     ),
 )
 
+# ---------- Insights cadence and gates ----------
+
+INSIGHTS_ENABLED = _env_bool("HNREADER_INSIGHTS_ENABLED", True)
+INSIGHTS_WINDOW_DAYS = _require_int_range(
+    "HNREADER_INSIGHTS_WINDOW_DAYS",
+    _env_int("HNREADER_INSIGHTS_WINDOW_DAYS", 7),
+    min_value=1,
+    max_value=14,
+)
+INSIGHTS_UPDATE_INTERVAL_SECONDS = _require_int_range(
+    "HNREADER_INSIGHTS_UPDATE_INTERVAL_SECONDS",
+    _env_int("HNREADER_INSIGHTS_UPDATE_INTERVAL_SECONDS", 30 * 60),
+    min_value=0,
+    max_value=24 * 60 * 60,
+)
+INSIGHTS_MIN_TODAY_STORIES = _require_int_range(
+    "HNREADER_INSIGHTS_MIN_TODAY_STORIES",
+    _env_int("HNREADER_INSIGHTS_MIN_TODAY_STORIES", 5),
+    min_value=0,
+    max_value=500,
+)
+INSIGHTS_MAX_TODAY_STORIES = _require_int_range(
+    "HNREADER_INSIGHTS_MAX_TODAY_STORIES",
+    _env_int("HNREADER_INSIGHTS_MAX_TODAY_STORIES", 40),
+    min_value=1,
+    max_value=500,
+)
+INSIGHTS_MAX_TREND_TOPICS = _require_int_range(
+    "HNREADER_INSIGHTS_MAX_TREND_TOPICS",
+    _env_int("HNREADER_INSIGHTS_MAX_TREND_TOPICS", 8),
+    min_value=5,
+    max_value=8,
+)
+INSIGHTS_MAX_OPPORTUNITY_CANDIDATES = _require_int_range(
+    "HNREADER_INSIGHTS_MAX_OPPORTUNITY_CANDIDATES",
+    _env_int("HNREADER_INSIGHTS_MAX_OPPORTUNITY_CANDIDATES", 24),
+    min_value=1,
+    max_value=200,
+)
+INSIGHTS_MAX_DEBATE_CANDIDATES = _require_int_range(
+    "HNREADER_INSIGHTS_MAX_DEBATE_CANDIDATES",
+    _env_int("HNREADER_INSIGHTS_MAX_DEBATE_CANDIDATES", 16),
+    min_value=1,
+    max_value=200,
+)
+INSIGHTS_COMMENT_LIMIT_OPPORTUNITY = _require_int_range(
+    "HNREADER_INSIGHTS_COMMENT_LIMIT_OPPORTUNITY",
+    _env_int("HNREADER_INSIGHTS_COMMENT_LIMIT_OPPORTUNITY", 12),
+    min_value=0,
+    max_value=200,
+)
+INSIGHTS_COMMENT_LIMIT_DEBATE = _require_int_range(
+    "HNREADER_INSIGHTS_COMMENT_LIMIT_DEBATE",
+    _env_int("HNREADER_INSIGHTS_COMMENT_LIMIT_DEBATE", 24),
+    min_value=0,
+    max_value=200,
+)
+INSIGHTS_COMMENT_MAX_CHARS = _require_int_range(
+    "HNREADER_INSIGHTS_COMMENT_MAX_CHARS",
+    _env_int("HNREADER_INSIGHTS_COMMENT_MAX_CHARS", 180),
+    min_value=20,
+    max_value=2000,
+)
+INSIGHTS_RAW_TEXT_MAX_CHARS = _require_int_range(
+    "HNREADER_INSIGHTS_RAW_TEXT_MAX_CHARS",
+    _env_int("HNREADER_INSIGHTS_RAW_TEXT_MAX_CHARS", 800),
+    min_value=0,
+    max_value=8000,
+)
+
 # Keep the dynamic classification taxonomy broad enough to cover the product
 # surface without letting one-off story topics proliferate.
 TOPIC_MAX_ACTIVE_TOPICS = _require_int_range(
@@ -560,6 +644,32 @@ AI_ENRICH_COMMENT_MAX_CHARS = _require_int_range(
     max_value=2000,
 )
 
+# ---------- Insights AI provider ----------
+
+INSIGHTS_AI_CONFIG_FILE = _env_str("HNREADER_INSIGHTS_AI_CONFIG_FILE", "")
+INSIGHTS_AI_PROVIDER = _env_str(
+    "HNREADER_INSIGHTS_AI_PROVIDER", "enabled"
+).strip().lower()
+INSIGHTS_AI_CONFIGS_JSON = _env_str("HNREADER_INSIGHTS_AI_CONFIGS", "")
+INSIGHTS_AI_API_KEY = _env_str("HNREADER_INSIGHTS_AI_API_KEY", "")
+INSIGHTS_AI_MODEL = _env_str("HNREADER_INSIGHTS_AI_MODEL", "")
+INSIGHTS_AI_BASE_URL = _env_str("HNREADER_INSIGHTS_AI_BASE_URL", "")
+INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST = _env_csv(
+    "HNREADER_INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST"
+)
+INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS = _require_float_range(
+    "HNREADER_INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS",
+    _env_float("HNREADER_INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS", 120.0),
+    min_value=0.1,
+    max_value=600.0,
+)
+INSIGHTS_AI_MAX_OUTPUT_TOKENS = _require_int_range(
+    "HNREADER_INSIGHTS_AI_MAX_OUTPUT_TOKENS",
+    _env_optional_int("HNREADER_INSIGHTS_AI_MAX_OUTPUT_TOKENS") or 0,
+    min_value=0,
+    max_value=1_000_000,
+) or None
+
 
 _AI_ENV_NAMES = {
     "HNREADER_AI_CONFIG_FILE",
@@ -603,6 +713,29 @@ _AI_JSON_FIELD_ENV_NAMES = {
     "enrich_body_max_chars": "HNREADER_AI_ENRICH_BODY_MAX_CHARS",
     "enrich_comment_limit": "HNREADER_AI_ENRICH_COMMENT_LIMIT",
     "enrich_comment_max_chars": "HNREADER_AI_ENRICH_COMMENT_MAX_CHARS",
+}
+
+_INSIGHTS_AI_ENV_NAMES = {
+    "HNREADER_INSIGHTS_AI_CONFIG_FILE",
+    "HNREADER_INSIGHTS_AI_PROVIDER",
+    "HNREADER_INSIGHTS_AI_CONFIGS",
+    "HNREADER_INSIGHTS_AI_API_KEY",
+    "HNREADER_INSIGHTS_AI_MODEL",
+    "HNREADER_INSIGHTS_AI_BASE_URL",
+    "HNREADER_INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST",
+    "HNREADER_INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS",
+    "HNREADER_INSIGHTS_AI_MAX_OUTPUT_TOKENS",
+}
+
+_INSIGHTS_AI_JSON_FIELD_ENV_NAMES = {
+    "provider": "HNREADER_INSIGHTS_AI_PROVIDER",
+    "configs": "HNREADER_INSIGHTS_AI_CONFIGS",
+    "api_key": "HNREADER_INSIGHTS_AI_API_KEY",
+    "model": "HNREADER_INSIGHTS_AI_MODEL",
+    "base_url": "HNREADER_INSIGHTS_AI_BASE_URL",
+    "internal_host_allowlist": "HNREADER_INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST",
+    "request_timeout_seconds": "HNREADER_INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS",
+    "max_output_tokens": "HNREADER_INSIGHTS_AI_MAX_OUTPUT_TOKENS",
 }
 
 
@@ -751,6 +884,93 @@ def _read_ai_config_file(path: Path) -> Tuple[Dict[str, str], str]:
     return _read_ai_env_file(path), "env"
 
 
+def _insights_ai_env_file_candidates() -> Tuple[Path, ...]:
+    explicit = _env_first("HNREADER_INSIGHTS_AI_CONFIG_FILE")
+    if not explicit:
+        return ()
+    return _split_config_files(explicit)
+
+
+def _read_insights_ai_env_file(path: Path) -> Dict[str, str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return {}
+
+    values: Dict[str, str] = {}
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in _INSIGHTS_AI_ENV_NAMES:
+            continue
+        values[key] = _unquote_env_value(value)
+    return values
+
+
+def _read_insights_ai_json_file(path: Path) -> Dict[str, str]:
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return {}
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{path} is not valid insights AI JSON config: {exc.msg}"
+        ) from exc
+
+    values: Dict[str, str] = {}
+    if isinstance(parsed, list):
+        values["HNREADER_INSIGHTS_AI_PROVIDER"] = "enabled"
+        values["HNREADER_INSIGHTS_AI_CONFIGS"] = json.dumps(
+            parsed, ensure_ascii=False, separators=(",", ":")
+        )
+        return values
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{path} insights AI JSON config must be an object or array")
+
+    for key, value in parsed.items():
+        if key in _INSIGHTS_AI_ENV_NAMES:
+            values[key] = _json_value_to_env(value, key=key)
+
+    for field, env_name in _INSIGHTS_AI_JSON_FIELD_ENV_NAMES.items():
+        if field not in parsed:
+            continue
+        values[env_name] = _json_value_to_env(parsed[field], key=field)
+
+    if (
+        "HNREADER_INSIGHTS_AI_CONFIGS" in values
+        and "HNREADER_INSIGHTS_AI_PROVIDER" not in values
+    ):
+        values["HNREADER_INSIGHTS_AI_PROVIDER"] = "enabled"
+
+    if not values:
+        raise ValueError(
+            f"{path} insights AI JSON config must contain a provider/configs "
+            "object or HNREADER_INSIGHTS_AI_* keys"
+        )
+    return values
+
+
+def _read_insights_ai_config_file(path: Path) -> Tuple[Dict[str, str], str]:
+    if path.suffix.lower() == ".json":
+        return _read_insights_ai_json_file(path), "json"
+    return _read_insights_ai_env_file(path), "env"
+
+
 def _reload_ai_settings_from_process_env() -> None:
     global AI_BASE_URL, AI_CONFIG_FILE, AI_CONFIGS_JSON, AI_PROVIDER
     global AI_API_KEY, AI_MODEL, AI_INTERNAL_HOST_ALLOWLIST
@@ -830,14 +1050,54 @@ def _reload_ai_settings_from_process_env() -> None:
     )
 
 
+def _reload_insights_ai_settings_from_process_env() -> None:
+    global INSIGHTS_AI_BASE_URL, INSIGHTS_AI_CONFIG_FILE, INSIGHTS_AI_CONFIGS_JSON
+    global INSIGHTS_AI_PROVIDER, INSIGHTS_AI_API_KEY, INSIGHTS_AI_MODEL
+    global INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST, INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS
+    global INSIGHTS_AI_MAX_OUTPUT_TOKENS
+
+    INSIGHTS_AI_CONFIG_FILE = _env_str("HNREADER_INSIGHTS_AI_CONFIG_FILE", "")
+    INSIGHTS_AI_PROVIDER = _env_str(
+        "HNREADER_INSIGHTS_AI_PROVIDER", "enabled"
+    ).strip().lower()
+    INSIGHTS_AI_CONFIGS_JSON = _env_str("HNREADER_INSIGHTS_AI_CONFIGS", "")
+    INSIGHTS_AI_API_KEY = _env_str("HNREADER_INSIGHTS_AI_API_KEY", "")
+    INSIGHTS_AI_MODEL = _env_str("HNREADER_INSIGHTS_AI_MODEL", "")
+    INSIGHTS_AI_BASE_URL = _env_str("HNREADER_INSIGHTS_AI_BASE_URL", "")
+    INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST = _env_csv(
+        "HNREADER_INSIGHTS_AI_INTERNAL_HOST_ALLOWLIST"
+    )
+    INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS = _require_float_range(
+        "HNREADER_INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS",
+        _env_float("HNREADER_INSIGHTS_AI_REQUEST_TIMEOUT_SECONDS", 120.0),
+        min_value=0.1,
+        max_value=600.0,
+    )
+    INSIGHTS_AI_MAX_OUTPUT_TOKENS = _require_int_range(
+        "HNREADER_INSIGHTS_AI_MAX_OUTPUT_TOKENS",
+        _env_optional_int("HNREADER_INSIGHTS_AI_MAX_OUTPUT_TOKENS") or 0,
+        min_value=0,
+        max_value=1_000_000,
+    ) or None
+
+
 _last_applied_ai_env_keys: set = set()
 _last_ai_config_sources: Tuple[Tuple[str, str], ...] = ()
+_last_applied_insights_ai_env_keys: set = set()
+_last_insights_ai_config_sources: Tuple[Tuple[str, str], ...] = ()
 
 
 def get_ai_config_sources() -> Tuple[Dict[str, str], ...]:
     return tuple(
         {"path": path, "format": fmt}
         for path, fmt in _last_ai_config_sources
+    )
+
+
+def get_insights_ai_config_sources() -> Tuple[Dict[str, str], ...]:
+    return tuple(
+        {"path": path, "format": fmt}
+        for path, fmt in _last_insights_ai_config_sources
     )
 
 
@@ -886,6 +1146,42 @@ def refresh_ai_settings_from_env_files() -> bool:
     _last_applied_ai_env_keys = new_keys
     _last_ai_config_sources = tuple(sources)
     _reload_ai_settings_from_process_env()
+    return True
+
+
+def refresh_insights_ai_settings_from_env_files() -> bool:
+    """Reload only ``HNREADER_INSIGHTS_AI_*`` settings from configured files."""
+    global _last_insights_ai_config_sources, _last_applied_insights_ai_env_keys
+
+    new_values: Dict[str, str] = {}
+    sources = []
+    saw_existing_file = False
+    for path in _insights_ai_env_file_candidates():
+        try:
+            file_exists = path.is_file()
+        except OSError:
+            file_exists = False
+        if not file_exists:
+            continue
+        saw_existing_file = True
+        values, source_format = _read_insights_ai_config_file(path)
+        new_values.update(values)
+        sources.append((str(path), source_format))
+
+    if not saw_existing_file:
+        _last_insights_ai_config_sources = ()
+        return False
+
+    new_keys = set(new_values.keys())
+    for key in _last_applied_insights_ai_env_keys - new_keys:
+        os.environ.pop(key, None)
+
+    if new_values:
+        os.environ.update(new_values)
+
+    _last_applied_insights_ai_env_keys = new_keys
+    _last_insights_ai_config_sources = tuple(sources)
+    _reload_insights_ai_settings_from_process_env()
     return True
 
 

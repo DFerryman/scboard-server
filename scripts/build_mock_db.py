@@ -15,12 +15,20 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from server import db, settings
-from server.repository import (
-    digest_date_epoch_bounds,
-    digest_date_minus_days,
-    today_in_digest_tz,
-)
+try:
+    from server import db, settings
+    from server.repository import (
+        digest_date_epoch_bounds,
+        digest_date_minus_days,
+        today_in_digest_tz,
+    )
+except ModuleNotFoundError:
+    from .. import db, settings
+    from ..repository import (
+        digest_date_epoch_bounds,
+        digest_date_minus_days,
+        today_in_digest_tz,
+    )
 
 
 # ---------- helpers ----------

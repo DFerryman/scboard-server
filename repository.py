@@ -1979,6 +1979,233 @@ def upsert_digest(
     return True
 
 
+# ---------- insights reads/writes ----------
+
+def get_insight_row(conn: sqlite3.Connection, date: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM insights WHERE date=?", (date,)).fetchone()
+
+
+def list_insight_rows(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    return conn.execute("SELECT * FROM insights ORDER BY date").fetchall()
+
+
+def _stable_json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _stable_int_ids(ids: Sequence[int]) -> List[int]:
+    out: List[int] = []
+    seen: set[int] = set()
+    for raw in ids:
+        try:
+            sid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if sid in seen:
+            continue
+        seen.add(sid)
+        out.append(sid)
+    return out
+
+
+def upsert_insight(
+    conn: sqlite3.Connection,
+    date: str,
+    payload: dict,
+    source_story_ids: Sequence[int],
+    generated_at: int,
+    window_days: int,
+    model_usage: Optional[dict] = None,
+) -> bool:
+    """Insert/update one insights payload.
+
+    Returns True only when publishable content changed. Caller owns the
+    transaction and bumps ``catalog_version`` on True.
+    """
+    encoded_payload = _stable_json_dumps(payload if isinstance(payload, dict) else {})
+    encoded_source_ids = _stable_json_dumps(_stable_int_ids(source_story_ids))
+    encoded_usage = (
+        _stable_json_dumps(model_usage)
+        if isinstance(model_usage, dict)
+        else None
+    )
+    existing = conn.execute(
+        """
+        SELECT payload, source_story_ids, window_days
+        FROM insights
+        WHERE date=?
+        """,
+        (date,),
+    ).fetchone()
+    changed = not (
+        existing
+        and (existing["payload"] or "{}") == encoded_payload
+        and (existing["source_story_ids"] or "[]") == encoded_source_ids
+        and int(existing["window_days"] or 0) == int(window_days)
+    )
+    conn.execute(
+        """
+        INSERT INTO insights(
+            date, payload, source_story_ids, generated_at, window_days, model_usage
+        ) VALUES(?, ?, ?, ?, ?, ?)
+        ON CONFLICT(date) DO UPDATE SET
+            payload=excluded.payload,
+            source_story_ids=excluded.source_story_ids,
+            generated_at=excluded.generated_at,
+            window_days=excluded.window_days,
+            model_usage=excluded.model_usage
+        """,
+        (
+            date,
+            encoded_payload,
+            encoded_source_ids,
+            int(generated_at),
+            int(window_days),
+            encoded_usage,
+        ),
+    )
+    return changed
+
+
+def insight_needs_update(
+    conn: sqlite3.Connection,
+    date: str,
+    min_interval_seconds: int,
+    current_candidate_story_ids: Sequence[int],
+) -> bool:
+    row = get_insight_row(conn, date)
+    if row is None:
+        return True
+    current_ids = _stable_int_ids(current_candidate_story_ids)
+    previous_ids_raw = _json_loads(row["source_story_ids"], [])
+    previous_ids = (
+        _stable_int_ids(previous_ids_raw) if isinstance(previous_ids_raw, list) else []
+    )
+    if previous_ids != current_ids:
+        return True
+    interval = int(min_interval_seconds)
+    if interval <= 0:
+        return True
+    generated_at = int(row["generated_at"] or 0)
+    return now_seconds() - generated_at >= interval
+
+
+def candidate_rows_for_insights(
+    conn: sqlite3.Connection,
+    *,
+    start_ts: int,
+    end_ts: int,
+    limit: Optional[int] = None,
+) -> List[sqlite3.Row]:
+    limit_clause = ""
+    params: List[Any] = [int(start_ts), int(end_ts)]
+    if limit is not None:
+        limit_clause = "LIMIT ?"
+        params.append(max(1, int(limit)))
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM stories
+        WHERE enrich_status='done'
+          AND enriched_at IS NOT NULL
+          AND needs_reenrich=0
+          AND hn_time >= ? AND hn_time < ?
+        ORDER BY hn_time DESC, score DESC, descendants DESC, id ASC
+        {limit_clause}
+        """,
+        tuple(params),
+    ).fetchall()
+    return list(rows)
+
+
+def insight_feed_ranks_for_story_ids(
+    conn: sqlite3.Connection,
+    story_ids: Sequence[int],
+) -> dict[int, dict[str, int]]:
+    ids = _stable_int_ids(story_ids)
+    if not ids:
+        return {}
+    out: dict[int, dict[str, int]] = {sid: {} for sid in ids}
+    with id_in_clause(conn, ids) as (clause, params):
+        rows = conn.execute(
+            f"""
+            SELECT story_id, feed, rank
+            FROM rankings
+            WHERE story_id {clause}
+            ORDER BY story_id ASC, rank ASC
+            """,
+            tuple(params),
+        ).fetchall()
+    for row in rows:
+        out.setdefault(int(row["story_id"]), {})[str(row["feed"])] = int(row["rank"])
+    return out
+
+
+def insight_comment_rows_for_story_ids(
+    conn: sqlite3.Connection,
+    story_ids: Sequence[int],
+    *,
+    limit_per_story: int,
+) -> dict[int, List[sqlite3.Row]]:
+    ids = _stable_int_ids(story_ids)
+    if not ids or limit_per_story <= 0:
+        return {}
+    grouped: dict[int, List[sqlite3.Row]] = {sid: [] for sid in ids}
+    with id_in_clause(conn, ids) as (clause, params):
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM comments
+            WHERE story_id {clause}
+            ORDER BY story_id ASC, rank ASC
+            """,
+            tuple(params),
+        ).fetchall()
+    limit = max(0, int(limit_per_story))
+    for row in rows:
+        sid = int(row["story_id"])
+        bucket = grouped.setdefault(sid, [])
+        if len(bucket) < limit:
+            bucket.append(row)
+    return grouped
+
+
+def record_insight_run(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    date: str,
+    started_at: int,
+    finished_at: Optional[int],
+    status: str,
+    model_usage: Optional[dict] = None,
+    error: str = "",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO insights_runs(
+            run_id, date, started_at, finished_at, status, model_usage, error
+        ) VALUES(?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_id) DO UPDATE SET
+            date=excluded.date,
+            started_at=excluded.started_at,
+            finished_at=excluded.finished_at,
+            status=excluded.status,
+            model_usage=excluded.model_usage,
+            error=excluded.error
+        """,
+        (
+            run_id,
+            date,
+            int(started_at),
+            finished_at,
+            status,
+            _stable_json_dumps(model_usage) if isinstance(model_usage, dict) else None,
+            error[:1000] if error else None,
+        ),
+    )
+
+
 def candidate_done_stories_for_digest(
     conn: sqlite3.Connection,
     date: str,
@@ -2389,6 +2616,14 @@ __all__ = [
     "list_story_comments",
     "purge_old_comments",
     "upsert_digest",
+    "get_insight_row",
+    "list_insight_rows",
+    "upsert_insight",
+    "insight_needs_update",
+    "candidate_rows_for_insights",
+    "insight_feed_ranks_for_story_ids",
+    "insight_comment_rows_for_story_ids",
+    "record_insight_run",
     "candidate_done_stories_for_digest",
     "count_today_done_stories",
     "done_story_ids_for_digest_date",
