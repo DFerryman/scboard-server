@@ -153,6 +153,25 @@ _BATCH_ENRICH_OUTPUT_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
 }
 
+_DIGEST_SELECTION_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "story_ids": {"type": "array", "items": {"type": "integer"}},
+        "reason": {"type": "string"},
+    },
+    "required": ["story_ids", "reason"],
+    "additionalProperties": False,
+}
+
+_DIGEST_INTRO_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "intro": {"type": "string"},
+    },
+    "required": ["intro"],
+    "additionalProperties": False,
+}
+
 
 def _clamp_int(value: int, lower: int, upper: int) -> int:
     return max(lower, min(upper, int(value)))
@@ -1979,10 +1998,93 @@ class CodexFirstAiAgent(AiAgent):
         candidates: Sequence[Any],
         max_count: int,
     ) -> List[int]:
-        return self.fallback_agent.select_digest_story_ids(date, candidates, max_count)
+        if not candidates or max_count <= 0:
+            return []
+        payload_items = []
+        for row in candidates:
+            payload_items.append(
+                {
+                    "id": int(row["id"]),
+                    "kind": row["kind"] or "story",
+                    "topic": row["topic"] or DEFAULT_TOPIC_ID,
+                    "score": int(row["score"] or 0),
+                    "descendants": int(row["descendants"] or 0),
+                    "titleZh": row["title_zh"] or row["title_en"] or "",
+                    "titleEn": row["title_en"] or "",
+                    "summary": row["ai_summary"] or "",
+                }
+            )
+        candidate_ids = [int(r["id"]) for r in candidates]
+        user_content = (
+            f"Select up to {int(max_count)} story ids for the {date} daily digest. "
+            "Act as the editor: choose the most worthwhile, varied, non-duplicate "
+            "set from the candidates only. Return strict JSON with story_ids and "
+            "a short Chinese reason. story_ids must contain only candidate ids.\n\n"
+            + json.dumps(payload_items, ensure_ascii=False)
+        )
+        try:
+            raw = self.codex_client.complete_json(
+                purpose="digest-selection",
+                system_prompt=(
+                    "You are the editor for a Chinese Hacker News daily digest. "
+                    "Select story ids only from the provided candidates. Return "
+                    "one strict JSON object matching the schema."
+                ),
+                user_content=user_content,
+                output_schema=_DIGEST_SELECTION_OUTPUT_SCHEMA,
+                reasoning_effort=_CODEX_INGEST_REASONING_EFFORT,
+            )
+            return validate_digest_selection(
+                raw,
+                candidate_ids=candidate_ids,
+                max_count=max_count,
+            )
+        except (CodexCliError, subprocess.SubprocessError, OSError, ValueError) as exc:
+            return self._fallback(
+                "select_digest_story_ids",
+                date,
+                candidates,
+                max_count,
+                error=exc,
+            )
 
     def write_digest_intro(self, date: str, story_rows: Sequence[Any]) -> str:
-        return self.fallback_agent.write_digest_intro(date, story_rows)
+        if not story_rows:
+            return ""
+        bullets = []
+        for row in story_rows:
+            title = row["title_zh"] or row["title_en"] or ""
+            summary = row["ai_summary"] or ""
+            bullets.append(f"- {title}: {summary}")
+        user_content = (
+            f"Write a 100-150-character Chinese intro for the daily digest "
+            f"on {date}. Summarize the themes and highlights of today's "
+            "selected entries. Use a measured, professional tone; no emoji. "
+            "Return strict JSON with the intro field only.\n\n"
+            "Today's entries (title: summary):\n" + "\n".join(bullets)
+        )
+        try:
+            raw = self.codex_client.complete_json(
+                purpose="digest",
+                system_prompt=(
+                    "You write the daily digest intro for a Chinese Hacker News "
+                    "reader. Return one strict JSON object matching the schema."
+                ),
+                user_content=user_content,
+                output_schema=_DIGEST_INTRO_OUTPUT_SCHEMA,
+                reasoning_effort=_CODEX_INGEST_REASONING_EFFORT,
+            )
+            intro = raw.get("intro")
+            if not isinstance(intro, str):
+                raise ValueError("digest intro requires intro string")
+            return intro.strip()
+        except (CodexCliError, subprocess.SubprocessError, OSError, ValueError) as exc:
+            return self._fallback(
+                "write_digest_intro",
+                date,
+                story_rows,
+                error=exc,
+            )
 
 
 # ---------- Real agent ----------

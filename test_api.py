@@ -8142,6 +8142,8 @@ class CodexFirstAiAgentTests(unittest.TestCase):
 
         assert_strict_objects(ai_agent_module._STORY_OUTPUT_SCHEMA)
         assert_strict_objects(ai_agent_module._BATCH_ENRICH_OUTPUT_SCHEMA)
+        assert_strict_objects(ai_agent_module._DIGEST_SELECTION_OUTPUT_SCHEMA)
+        assert_strict_objects(ai_agent_module._DIGEST_INTRO_OUTPUT_SCHEMA)
 
     def test_codex_first_usage_summary_accepts_purpose_filter(self):
         class UsageClient:
@@ -8328,6 +8330,104 @@ class CodexFirstAiAgentTests(unittest.TestCase):
             "Return one strict JSON object with a results array",
             codex.calls[0]["system_prompt"],
         )
+
+    def test_codex_digest_uses_codex_first_then_falls_back(self):
+        class FakeCodex:
+            model = "codex-test"
+            timeout = 1.0
+
+            def __init__(self):
+                self.calls = []
+
+            def complete_json(self, **kwargs):
+                self.calls.append(kwargs)
+                if kwargs["purpose"] == "digest-selection":
+                    return {"story_ids": [202], "reason": "精选"}
+                if kwargs["purpose"] == "digest":
+                    return {"intro": "今日精选围绕开发工具与基础设施展开。"}
+                raise AssertionError(f"unexpected purpose {kwargs['purpose']}")
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint, *, purposes=None):
+                return checkpoint, {}
+
+        class ExistingAgent(FallbackAiAgent):
+            def __init__(self):
+                self.selection_calls = 0
+                self.intro_calls = 0
+
+            def select_digest_story_ids(self, date, candidates, max_count):
+                self.selection_calls += 1
+                return [int(candidates[0]["id"])]
+
+            def write_digest_intro(self, date, story_rows):
+                self.intro_calls += 1
+                return "fallback intro"
+
+        candidates = [
+            {
+                "id": 202,
+                "kind": "story",
+                "topic": "devtools",
+                "score": 120,
+                "descendants": 35,
+                "title_zh": "开发工具",
+                "title_en": "Dev tools",
+                "ai_summary": "工具链更新",
+            },
+            {
+                "id": 303,
+                "kind": "show",
+                "topic": "infra",
+                "score": 80,
+                "descendants": 12,
+                "title_zh": "基础设施",
+                "title_en": "Infra",
+                "ai_summary": "部署体验",
+            },
+        ]
+        codex = FakeCodex()
+        fallback = ExistingAgent()
+        agent = ai_agent_module.CodexFirstAiAgent(
+            codex_client=codex,  # type: ignore[arg-type]
+            fallback_agent=fallback,
+        )
+
+        selected = agent.select_digest_story_ids("2026-05-20", candidates, 7)
+        intro = agent.write_digest_intro("2026-05-20", candidates[:1])
+
+        self.assertEqual(selected, [202])
+        self.assertEqual(intro, "今日精选围绕开发工具与基础设施展开。")
+        self.assertEqual(fallback.selection_calls, 0)
+        self.assertEqual(fallback.intro_calls, 0)
+        self.assertEqual([call["purpose"] for call in codex.calls], ["digest-selection", "digest"])
+        self.assertEqual(codex.calls[0]["reasoning_effort"], "medium")
+        self.assertEqual(codex.calls[1]["reasoning_effort"], "medium")
+        self.assertEqual(
+            codex.calls[0]["output_schema"],
+            ai_agent_module._DIGEST_SELECTION_OUTPUT_SCHEMA,
+        )
+        self.assertEqual(
+            codex.calls[1]["output_schema"],
+            ai_agent_module._DIGEST_INTRO_OUTPUT_SCHEMA,
+        )
+
+        class FailingCodex(FakeCodex):
+            def complete_json(self, **kwargs):
+                raise ai_agent_module.CodexCliError("codex down")
+
+        fallback = ExistingAgent()
+        agent = ai_agent_module.CodexFirstAiAgent(
+            codex_client=FailingCodex(),  # type: ignore[arg-type]
+            fallback_agent=fallback,
+        )
+
+        self.assertEqual(agent.select_digest_story_ids("2026-05-20", candidates, 7), [202])
+        self.assertEqual(agent.write_digest_intro("2026-05-20", candidates[:1]), "fallback intro")
+        self.assertEqual(fallback.selection_calls, 1)
+        self.assertEqual(fallback.intro_calls, 1)
 
     def test_codex_cli_invocation_is_read_only_and_uses_system_user_config(self):
         from .codex_cli import CodexCliJsonClient
