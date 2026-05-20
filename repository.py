@@ -380,8 +380,12 @@ def ensure_topic(
     )
     known_by_id = {t.id: t for t in known_topics}
     if normalized_id not in known_by_id and len(known_topics) >= max_topics:
-        fallback = known_topics[0]
-        normalized_id, normalized_name = fallback.id, fallback.name
+        if normalized_id != DEFAULT_TOPIC_ID:
+            fallback = known_by_id.get(DEFAULT_TOPIC_ID)
+            if fallback is not None:
+                normalized_id, normalized_name = fallback.id, fallback.name
+            else:
+                normalized_id, normalized_name = DEFAULT_TOPIC_ID, DEFAULT_TOPIC_NAME
     now = now_seconds()
     last_seen = int(seen_at if seen_at is not None else now)
     conn.execute(

@@ -642,65 +642,26 @@ def _archived_env_values(
     return values
 
 
-def _allowed_absolute_targets_from_archived_env(
-    manifest: Mapping[str, Any],
-    extracted_root: Path,
+def _allowed_absolute_targets_from_current_config(
     *,
-    project_dir: Path,
+    current_runtime: Mapping[str, Path],
+    current_ai_config_files: Iterable[Path],
     service_env_file: Path,
     include_service_env: bool,
+    explicit_allowlist: Optional[Iterable[str | Path]] = None,
 ) -> set[Path]:
-    env = _archived_env_values(manifest, extracted_root)
-    allowed: set[Path] = set()
-
-    db_value = _env_first(env, "HNREADER_DB_PATH", "HACKERMINI_DB_PATH")
-    if db_value:
-        allowed.add(_abs_from_project(project_dir, db_value).parent.resolve())
-
-    log_value = env.get("HNREADER_LOG_DIR") or ""
-    if log_value:
-        allowed.add(_abs_from_project(project_dir, log_value).resolve())
-
-    cloud_value = _env_first(
-        env,
-        "HNREADER_CLOUD_SYNC_OUTPUT_DIR",
-        "HACKERMINI_CLOUD_SYNC_OUTPUT_DIR",
-    )
-    if cloud_value:
-        allowed.add(_abs_from_project(project_dir, cloud_value).resolve())
-
-    alert_value = _env_first(
-        env,
-        "HNREADER_ALERT_OUTBOX_PATH",
-        "HACKERMINI_ALERT_OUTBOX_PATH",
-    )
-    if alert_value:
-        allowed.add(_abs_from_project(project_dir, alert_value).resolve())
-
-    cache_value = _env_first(
-        env,
-        "HNREADER_AI_CONFIG_STATUS_CACHE_PATH",
-        "HACKERMINI_AI_CONFIG_STATUS_CACHE_PATH",
-    )
-    if cache_value:
-        allowed.add(_abs_from_project(project_dir, cache_value).resolve())
-
-    ai_config_value = _env_first(
-        env,
-        "HNREADER_AI_CONFIG_FILE",
-        "HACKERMINI_AI_CONFIG_FILE",
-    )
-    if ai_config_value:
-        for part in ai_config_value.split(os.pathsep):
-            clean = part.strip()
-            if not clean:
-                continue
-            path = _abs_from_project(project_dir, clean).resolve()
-            if include_service_env or path != service_env_file.resolve():
-                allowed.add(path)
-
+    allowed: set[Path] = {
+        current_runtime["db_dir"].resolve(),
+        current_runtime["log_dir"].resolve(),
+        current_runtime["cloud_sync_output_dir"].resolve(),
+        current_runtime["alert_outbox_path"].resolve(),
+        current_runtime["ai_status_cache_path"].resolve(),
+    }
+    allowed.update(path.resolve() for path in current_ai_config_files)
     if include_service_env:
         allowed.add(service_env_file.resolve())
+    for item in explicit_allowlist or ():
+        allowed.add(Path(item).resolve())
     return allowed
 
 
@@ -837,6 +798,7 @@ def import_archive(
     project_dir: str | Path = ".",
     service_env_file: str | Path = "/etc/hnreader/server.env",
     include_service_env: bool = False,
+    allowed_absolute_targets: Optional[Iterable[str | Path]] = None,
     assume_yes: bool = False,
     stop_services: bool = True,
     service_prefix: str = "hnreader",
@@ -859,13 +821,6 @@ def import_archive(
         with tarfile.open(archive, "r:gz") as tf:
             _safe_extract(tf, extracted_root)
         _verify_extracted_payload(manifest, extracted_root)
-        allowed_absolute_targets = _allowed_absolute_targets_from_archived_env(
-            manifest,
-            extracted_root,
-            project_dir=project,
-            service_env_file=service_env,
-            include_service_env=include_service_env,
-        )
 
         current_runtime = _runtime_paths(project, server)
         env_targets = _env_files_for_project(project, server)
@@ -874,6 +829,13 @@ def import_archive(
             for path in _runtime_ai_config_files(project, server)
             if include_service_env or not _same_path(path, service_env)
         ]
+        safe_absolute_targets = _allowed_absolute_targets_from_current_config(
+            current_runtime=current_runtime,
+            current_ai_config_files=current_ai_config_files,
+            service_env_file=service_env,
+            include_service_env=include_service_env,
+            explicit_allowlist=allowed_absolute_targets,
+        )
         dir_targets = {
             current_runtime["db_dir"].resolve(),
             current_runtime["log_dir"].resolve(),
@@ -900,10 +862,10 @@ def import_archive(
             if (
                 entry.get("target_type") == "absolute"
                 and entry.get("kind") != "service_env_file"
-                and target.resolve() not in allowed_absolute_targets
+                and target.resolve() not in safe_absolute_targets
             ):
                 raise SystemExit(
-                    f"manifest absolute target is not declared by archived env: {target}"
+                    f"manifest absolute target is not allowed on this machine: {target}"
                 )
             if str(entry.get("kind") or "").endswith("_dir"):
                 dir_targets.add(target.resolve())
@@ -979,6 +941,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="also replace the generated service env file from the archive",
     )
     p_import.add_argument(
+        "--allow-absolute-target",
+        action="append",
+        default=[],
+        help=(
+            "explicitly allow one absolute import target outside the project; "
+            "repeat for each machine-local path"
+        ),
+    )
+    p_import.add_argument(
         "--yes",
         action="store_true",
         help="skip the IMPORT confirmation prompt",
@@ -1016,6 +987,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             project_dir=args.project_dir,
             service_env_file=args.service_env_file,
             include_service_env=args.include_service_env,
+            allowed_absolute_targets=args.allow_absolute_target,
             assume_yes=args.yes,
             stop_services=not args.no_stop_services,
             service_prefix=args.service_prefix,

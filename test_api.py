@@ -14,6 +14,7 @@ import os
 import signal
 import socket
 import sqlite3
+import stat
 import tempfile
 import time
 import unittest
@@ -263,6 +264,50 @@ class AdminAlertReliability(_SqliteCase):
         outbox = settings.get_alert_outbox_path()
         self.assertTrue(outbox.exists())
         self.assertIn("first failure", outbox.read_text(encoding="utf-8"))
+
+    def test_alert_outbox_redacts_secret_values(self):
+        from .notifications import send_admin_alert
+
+        saved = self._save()
+        old_api_key = settings.AI_API_KEY
+        try:
+            settings.ADMIN_EMAIL_ENABLED = False  # type: ignore[assignment]
+            settings.ALERT_COOLDOWN_SECONDS = 0  # type: ignore[assignment]
+            settings.AI_API_KEY = "sk-test-redaction-secret-1234567890"  # type: ignore[assignment]
+            send_admin_alert(
+                "ingest_failed",
+                "subject",
+                "failed with api_key=sk-test-redaction-secret-1234567890",
+                fields={
+                    "authorization": "Bearer should-not-survive",
+                    "nested": {"password": "plain-password-value"},
+                },
+            )
+        finally:
+            settings.AI_API_KEY = old_api_key  # type: ignore[assignment]
+            self._restore(saved)
+
+        text = settings.get_alert_outbox_path().read_text(encoding="utf-8")
+        self.assertIn("<redacted>", text)
+        self.assertNotIn("sk-test-redaction-secret-1234567890", text)
+        self.assertNotIn("should-not-survive", text)
+        self.assertNotIn("plain-password-value", text)
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits required for this test")
+    def test_alert_outbox_is_owner_only(self):
+        from .notifications import send_admin_alert
+
+        saved = self._save()
+        try:
+            settings.ADMIN_EMAIL_ENABLED = False  # type: ignore[assignment]
+            send_admin_alert("ingest_failed", "subject", "first failure")
+        finally:
+            self._restore(saved)
+
+        self.assertEqual(
+            stat.S_IMODE(settings.get_alert_outbox_path().stat().st_mode),
+            0o600,
+        )
 
     def test_failed_alert_obeys_cooldown(self):
         from .notifications import send_admin_alert
@@ -1321,7 +1366,7 @@ class EmptyDbContract(_SqliteCase):
             [(301, 100), (302, 90)],
         )
 
-    def test_topics_are_capped_and_overflow_reuses_existing_topic(self):
+    def test_topic_cap_overflow_uses_general_instead_of_polluting_existing_topic(self):
         old = settings.TOPIC_MAX_ACTIVE_TOPICS
         settings.TOPIC_MAX_ACTIVE_TOPICS = 2  # type: ignore[assignment]
         now = repository.now_seconds()
@@ -1370,12 +1415,23 @@ class EmptyDbContract(_SqliteCase):
             finally:
                 conn.close()
 
-            body = _h_topics()
+            conn = db.connect()
+            try:
+                counts = {
+                    "topic-a": repository.topic_count(conn, "topic-a"),
+                    "topic-b": repository.topic_count(conn, "topic-b"),
+                    "topic-c": repository.topic_count(conn, "topic-c"),
+                    "general": repository.topic_count(conn, "general"),
+                }
+            finally:
+                conn.close()
         finally:
             settings.TOPIC_MAX_ACTIVE_TOPICS = old  # type: ignore[assignment]
 
-        self.assertLessEqual(len(body.list), 2)
-        self.assertEqual(sum(entry.count for entry in body.list), 3)
+        self.assertEqual(counts["topic-a"], 1)
+        self.assertEqual(counts["topic-b"], 1)
+        self.assertEqual(counts["topic-c"], 0)
+        self.assertEqual(counts["general"], 1)
 
     def test_digest_empty_db_returns_today(self):
         body = _h_digest(None)
@@ -4208,6 +4264,20 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(out["selectedTopics"][0]["routes"], ["signals", "opportunities"])
         self.assertEqual(out["excludedTopics"], [{"topicKey": "b", "reason": "未进入本轮核心主题"}])
 
+    def test_topic_scout_agent_fails_when_model_selects_no_topics(self):
+        from .insights_agents import InsightsValidationError, TopicScoutAgent
+
+        agent = object.__new__(TopicScoutAgent)
+        with self.assertRaisesRegex(InsightsValidationError, "selected no topics"):
+            agent.validate(
+                {"selectedTopics": [], "excludedTopics": []},
+                {
+                    "evidenceCards": [
+                        {"topicKey": "a", "topic": "A", "storyIds": [101]},
+                    ]
+                },
+            )
+
     def test_debate_agent_normalizes_support_and_oppose_to_100(self):
         from .insights_agents import DebateAgent
 
@@ -4522,6 +4592,86 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(digest_docs[0]["_id"], f"1:{digest_date}")
         self.assertEqual(digest_docs[0]["syncVersion"], 1)
         self.assertEqual([s["id"] for s in digest_docs[0]["stories"]], [101])
+
+    def test_build_read_model_skips_digest_doc_when_no_ai_ready_stories(self):
+        from . import cloud_sync
+
+        now = repository.now_seconds()
+        digest_date = repository.date_in_digest_tz(1700000000)
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "catalog_version", "3")
+                conn.execute(
+                    """
+                    INSERT INTO stories(
+                        id, kind, title_en, title_zh, score, descendants, hn_time,
+                        enrich_status, fetched_at, last_seen_at
+                    ) VALUES(201, 'story', 'Raw', 'Raw', 1, 0, 1700000000,
+                        'pending', ?, ?)
+                    """,
+                    (now, now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO digests(date, intro, story_ids, generated_at)
+                    VALUES(?, 'empty after filtering', '[201]', ?)
+                    """,
+                    (digest_date, now),
+                )
+        finally:
+            conn.close()
+
+        out_dir = Path(self.tmpdir) / "empty-digest-read-model"
+        stats = cloud_sync.build_read_model(out_dir, include_dashboard=False)
+        digest_text = (out_dir / "digests.jsonl").read_text(encoding="utf-8")
+
+        self.assertEqual(stats["digests"], 0)
+        self.assertEqual(digest_text, "")
+
+    def test_build_read_model_assigns_topic_rank_for_cursor_pagination(self):
+        from . import cloud_sync
+
+        now = repository.now_seconds()
+        digest_date = repository.date_in_digest_tz(1700000000)
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "catalog_version", "4")
+                self._insert_done_story(conn, 101, 1700000010, score=10)
+                self._insert_done_story(conn, 102, 1700000005, score=30)
+                self._insert_done_story(conn, 103, 1700000020, score=30)
+                self._insert_done_story(conn, 104, 1700000030, score=100)
+                conn.execute(
+                    """
+                    UPDATE stories
+                    SET enriched_score=score,
+                        enriched_descendants=descendants,
+                        enriched_hn_time=hn_time
+                    WHERE id IN (101, 102, 103, 104)
+                    """
+                )
+                repository.replace_feed_ranking(conn, "top", [101, 102, 103])
+                conn.execute(
+                    """
+                    INSERT INTO digests(date, intro, story_ids, generated_at)
+                    VALUES(?, 'digest-only', '[104]', ?)
+                    """,
+                    (digest_date, now),
+                )
+        finally:
+            conn.close()
+
+        out_dir = Path(self.tmpdir) / "topic-rank-read-model"
+        cloud_sync.build_read_model(out_dir, include_dashboard=False)
+        docs = [
+            json.loads(line)
+            for line in (out_dir / "stories.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        ranks = {doc["id"]: doc["topicRank"] for doc in docs}
+
+        self.assertEqual(ranks, {101: 3, 102: 2, 103: 1, 104: 0})
 
     def test_cloud_sync_diff_uses_ai_ready_read_model_contract(self):
         from . import cloud_sync, cloud_sync_diff
@@ -6183,8 +6333,8 @@ class AiValidation(unittest.TestCase):
             )
         finally:
             settings.TOPIC_MAX_ACTIVE_TOPICS = old  # type: ignore[assignment]
-        self.assertEqual(out["topic"], "ai-tools")
-        self.assertEqual(out["topicName"], "AI 工具")
+        self.assertEqual(out["topic"], "general")
+        self.assertEqual(out["topicName"], "综合技术")
 
     def test_prompt_describes_dynamic_topic_rules(self):
         self.assertIn("dynamic and content-based", ai_agent_module._SYSTEM_PROMPT)
@@ -13075,8 +13225,7 @@ class CloudPushBusinessDashboardSeparation(unittest.TestCase):
         self.assertEqual(cleanup["keepVersions"], [5])
 
     def test_push_dashboard_sends_writeDashboard_action(self):
-        """push_dashboard, as a standalone function, sends a single
-        action=writeDashboard request."""
+        """push_dashboard sends docs first, then a summary-only commit."""
         from . import cloud_push
 
         src = self._write_read_model(with_dashboard=True)
@@ -13084,8 +13233,12 @@ class CloudPushBusinessDashboardSeparation(unittest.TestCase):
 
         def fake_post(_url, _secret, payload, *, timeout):
             payloads.append(payload)
-            return {"ok": True, "dashboardSummary": 1,
-                    "dashboardIngestRuns": 1, "dashboardCloudSyncRuns": 1}
+            return {
+                "ok": True,
+                "dashboardSummary": 1 if payload.get("dashboardSummary") else 0,
+                "dashboardIngestRuns": len(payload.get("dashboardIngestRuns") or []),
+                "dashboardCloudSyncRuns": len(payload.get("dashboardCloudSyncRuns") or []),
+            }
 
         with patch.object(cloud_push, "_post", side_effect=fake_post), \
                 patch.object(
@@ -13099,17 +13252,24 @@ class CloudPushBusinessDashboardSeparation(unittest.TestCase):
                 source_dir=src,
             )
 
-        self.assertEqual(len(payloads), 1)
-        msg = payloads[0]
-        self.assertEqual(msg["action"], "writeDashboard")
-        self.assertEqual(msg["syncVersion"], 5)
-        self.assertEqual(msg["dashboardSummary"]["_id"], "summary")
-        self.assertEqual([d["_id"] for d in msg["dashboardIngestRuns"]], ["5:run-A"])
+        self.assertEqual(len(payloads), 3)
+        ingest_msg, cloud_msg, summary_msg = payloads
+        for msg in payloads:
+            self.assertEqual(msg["action"], "writeDashboard")
+            self.assertEqual(msg["syncVersion"], 5)
+        self.assertNotIn("dashboardSummary", ingest_msg)
+        self.assertNotIn("dashboardSummary", cloud_msg)
+        self.assertEqual([d["_id"] for d in ingest_msg["dashboardIngestRuns"]], ["5:run-A"])
         self.assertEqual(
-            [d["_id"] for d in msg["dashboardCloudSyncRuns"]],
+            [d["_id"] for d in cloud_msg["dashboardCloudSyncRuns"]],
             ["5:run-A:1700000000"],
         )
+        self.assertNotIn("dashboardIngestRuns", summary_msg)
+        self.assertNotIn("dashboardCloudSyncRuns", summary_msg)
+        self.assertEqual(summary_msg["dashboardSummary"]["_id"], "summary")
         self.assertEqual(stats["dashboardSummary"], 1)
+        self.assertEqual(stats["dashboardIngestRuns"], 1)
+        self.assertEqual(stats["dashboardCloudSyncRuns"], 1)
 
     def test_push_dashboard_splits_large_run_history_without_dropping_fields(self):
         from . import cloud_push, dashboard_projection
@@ -13143,7 +13303,7 @@ class CloudPushBusinessDashboardSeparation(unittest.TestCase):
             payloads.append(payload)
             return {
                 "ok": True,
-                "dashboardSummary": 1,
+                "dashboardSummary": 1 if payload.get("dashboardSummary") else 0,
                 "dashboardIngestRuns": len(payload.get("dashboardIngestRuns") or []),
                 "dashboardCloudSyncRuns": len(payload.get("dashboardCloudSyncRuns") or []),
             }
@@ -13163,12 +13323,18 @@ class CloudPushBusinessDashboardSeparation(unittest.TestCase):
             )
 
         self.assertGreater(len(payloads), 1)
+        self.assertEqual([p.get("dashboardSummary") is not None for p in payloads].count(True), 1)
+        self.assertIn("dashboardSummary", payloads[-1])
+        self.assertNotIn("dashboardIngestRuns", payloads[-1])
+        self.assertNotIn("dashboardCloudSyncRuns", payloads[-1])
         self.assertEqual(stats["dashboardIngestRuns"], len(ingest_docs))
         sent = [
             doc
             for payload in payloads
             for doc in (payload.get("dashboardIngestRuns") or [])
         ]
+        for payload in payloads[:-1]:
+            self.assertNotIn("dashboardSummary", payload)
         self.assertEqual([doc["_id"] for doc in sent], [doc["_id"] for doc in ingest_docs])
         self.assertIn("by_step", sent[0]["ai_usage"])
         self.assertIn("by_model", sent[0]["ai_usage"])

@@ -758,15 +758,16 @@ def _write_batch_payloads(
 def _dashboard_payload(
     *,
     sync_version: int,
-    summary: Dict[str, Any],
+    summary: Optional[Dict[str, Any]] = None,
     ingest_runs: Optional[List[dict]] = None,
     cloud_sync_runs: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "action": "writeDashboard",
         "syncVersion": int(sync_version),
-        "dashboardSummary": summary,
     }
+    if summary is not None:
+        payload["dashboardSummary"] = summary
     if ingest_runs is not None:
         payload["dashboardIngestRuns"] = ingest_runs
     if cloud_sync_runs is not None:
@@ -777,7 +778,6 @@ def _dashboard_payload(
 def _chunk_dashboard_docs(
     *,
     sync_version: int,
-    summary: Dict[str, Any],
     field: str,
     docs: List[dict],
     max_body_bytes: int,
@@ -793,7 +793,6 @@ def _chunk_dashboard_docs(
         candidate = chunk + [doc]
         candidate_payload = _dashboard_payload(
             sync_version=sync_version,
-            summary=summary,
             ingest_runs=candidate if field == "dashboardIngestRuns" else None,
             cloud_sync_runs=(
                 candidate if field == "dashboardCloudSyncRuns" else None
@@ -807,7 +806,6 @@ def _chunk_dashboard_docs(
             payloads.append(
                 _dashboard_payload(
                     sync_version=sync_version,
-                    summary=summary,
                     ingest_runs=chunk if field == "dashboardIngestRuns" else None,
                     cloud_sync_runs=(
                         chunk if field == "dashboardCloudSyncRuns" else None
@@ -817,7 +815,6 @@ def _chunk_dashboard_docs(
             chunk = [doc]
             single_payload = _dashboard_payload(
                 sync_version=sync_version,
-                summary=summary,
                 ingest_runs=chunk if field == "dashboardIngestRuns" else None,
                 cloud_sync_runs=(
                     chunk if field == "dashboardCloudSyncRuns" else None
@@ -841,7 +838,6 @@ def _chunk_dashboard_docs(
         payloads.append(
             _dashboard_payload(
                 sync_version=sync_version,
-                summary=summary,
                 ingest_runs=chunk if field == "dashboardIngestRuns" else None,
                 cloud_sync_runs=(
                     chunk if field == "dashboardCloudSyncRuns" else None
@@ -875,20 +871,10 @@ def _dashboard_payloads(
             f"HNREADER_CLOUD_PUSH_MAX_BODY_BYTES={max_body_bytes}"
         )
 
-    full_payload = _dashboard_payload(
-        sync_version=sync_version,
-        summary=summary,
-        ingest_runs=ingest_runs if ingest_runs else None,
-        cloud_sync_runs=cloud_sync_runs if cloud_sync_runs else None,
-    )
-    if _payload_size_bytes(full_payload) <= max_body_bytes:
-        return [full_payload]
-
     payloads: List[Dict[str, Any]] = []
     payloads.extend(
         _chunk_dashboard_docs(
             sync_version=sync_version,
-            summary=summary,
             field="dashboardIngestRuns",
             docs=ingest_runs,
             max_body_bytes=max_body_bytes,
@@ -897,13 +883,13 @@ def _dashboard_payloads(
     payloads.extend(
         _chunk_dashboard_docs(
             sync_version=sync_version,
-            summary=summary,
             field="dashboardCloudSyncRuns",
             docs=cloud_sync_runs,
             max_body_bytes=max_body_bytes,
         )
     )
-    return payloads or [summary_payload]
+    payloads.append(summary_payload)
+    return payloads
 
 
 def push_read_model(

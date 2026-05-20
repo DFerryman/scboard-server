@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import smtplib
+import urllib.parse
 from collections import deque
 from email.message import EmailMessage
 from pathlib import Path
@@ -19,6 +20,17 @@ log = logging.getLogger("server.notifications")
 
 _ALERT_SENDING_ORPHAN_SECONDS = 60
 _ALERT_SENDING_STALE_SECONDS = 15 * 60
+_PRIVATE_FILE_MODE = 0o600
+_GENERIC_SECRET_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_/=])(?:sk|sess|pat|api)-[A-Za-z0-9][A-Za-z0-9_\-]{15,}"
+)
+_KEY_VALUE_SECRET_PATTERN = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|bearer|password|secret|token)\b"
+    r"(\s*[:=]\s*)(['\"]?)[^'\"\s,;]{6,}"
+)
+_SECRET_FIELD_PATTERN = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|bearer|password|secret|token)\b"
+)
 
 _ALERT_TITLES = {
     "fetch_failed": "Fetch produced no publishable candidates",
@@ -63,6 +75,73 @@ _FIELD_LABELS = {
     "target_count": "Target count",
     "timeout_seconds": "Timeout",
 }
+
+
+def _configured_secret_values() -> list[str]:
+    values: list[str] = []
+    for name in dir(settings):
+        upper = name.upper()
+        if not any(part in upper for part in ("API_KEY", "PASSWORD", "SECRET", "TOKEN")):
+            continue
+        try:
+            value = getattr(settings, name)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(value, str) and len(value) >= 8:
+            values.append(value)
+    for key, value in os.environ.items():
+        upper = key.upper()
+        if not any(part in upper for part in ("API_KEY", "PASSWORD", "SECRET", "TOKEN")):
+            continue
+        if len(value) >= 8:
+            values.append(value)
+    return sorted(set(values), key=len, reverse=True)
+
+
+def _redact_text(value: Any) -> str:
+    out = str(value)
+    for secret in _configured_secret_values():
+        out = out.replace(secret, "<redacted>")
+        encoded = urllib.parse.quote(secret, safe="")
+        if encoded and encoded != secret:
+            out = out.replace(encoded, "<redacted>")
+    out = _GENERIC_SECRET_PATTERN.sub("<redacted>", out)
+    out = _KEY_VALUE_SECRET_PATTERN.sub(r"\1\2\3<redacted>", out)
+    return out
+
+
+def _redact_value(value: Any, *, key: Optional[str] = None) -> Any:
+    if key and _SECRET_FIELD_PATTERN.search(key):
+        if value in (None, ""):
+            return value
+        return "<redacted>"
+    if isinstance(value, Mapping):
+        return {str(k): _redact_value(v, key=str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_text(value)
+    return value
+
+
+def _redact_fields(fields: Optional[Mapping[str, Any]]) -> dict:
+    if not fields:
+        return {}
+    return {
+        str(key): _redact_value(value, key=str(key))
+        for key, value in fields.items()
+    }
+
+
+def _chmod_private_file(path: Path) -> None:
+    if os.name != "posix":
+        return
+    try:
+        os.chmod(path, _PRIVATE_FILE_MODE)
+    except OSError as exc:
+        log.warning("failed to chmod alert file %s: %s", path, exc)
 
 
 def _cooldown_key(event_type: str) -> str:
@@ -483,6 +562,7 @@ def _field_label(key: str) -> str:
 
 
 def _format_field_value(key: str, value: Any) -> str:
+    value = _redact_value(value)
     if value is None:
         return ""
     if key in {
@@ -495,7 +575,7 @@ def _format_field_value(key: str, value: Any) -> str:
     }:
         return f"{_format_seconds(value)} s"
     if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        return _redact_text(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
     if isinstance(value, str):
         stripped = value.strip()
         if not stripped:
@@ -504,10 +584,10 @@ def _format_field_value(key: str, value: Any) -> str:
             try:
                 parsed = json.loads(stripped)
             except json.JSONDecodeError:
-                return stripped
-            return json.dumps(parsed, ensure_ascii=False, sort_keys=True, default=str)
-        return stripped
-    return str(value)
+                return _redact_text(stripped)
+            return _redact_text(json.dumps(parsed, ensure_ascii=False, sort_keys=True, default=str))
+        return _redact_text(stripped)
+    return _redact_text(str(value))
 
 
 def _format_field_lines(fields: Optional[Mapping[str, Any]]) -> list[str]:
@@ -545,6 +625,9 @@ def _format_body(
     message: str,
     fields: Optional[Mapping[str, Any]],
 ) -> str:
+    subject = _redact_text(subject)
+    message = _redact_text(message)
+    fields = _redact_fields(fields)
     title = _alert_title(event_type, subject)
     actions = _recommendations(event_type, message, fields)
     error_codes = _ai_http_error_codes(_text_blob(message, fields))
@@ -594,9 +677,9 @@ def _alert_record(
     return {
         "created_at": int(now),
         "event_type": str(event_type),
-        "subject": str(subject),
-        "message": str(message),
-        "fields": dict(fields or {}),
+        "subject": _redact_text(subject),
+        "message": _redact_text(message),
+        "fields": _redact_fields(fields),
     }
 
 
@@ -683,7 +766,9 @@ def _write_alert_sending_lease(sending_path: Path) -> None:
     try:
         tmp = lease_path.with_name(lease_path.name + ".tmp")
         tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        _chmod_private_file(tmp)
         tmp.replace(lease_path)
+        _chmod_private_file(lease_path)
     except OSError as exc:
         log.warning("failed to write alert sending lease %s: %s", lease_path, exc)
 
@@ -742,7 +827,9 @@ def _trim_alert_outbox(path: Path) -> None:
         tmp = path.with_name(path.name + ".trim")
         with tmp.open("w", encoding="utf-8") as fh:
             fh.writelines(kept)
+        _chmod_private_file(tmp)
         tmp.replace(path)
+        _chmod_private_file(path)
     except Exception as exc:  # noqa: BLE001
         log.exception("failed to trim alert outbox %s: %s", path, exc)
 
@@ -754,6 +841,7 @@ def _append_alert_outbox_records(records: Iterable[Mapping[str, Any]]) -> bool:
         with path.open("a", encoding="utf-8") as fh:
             for record in records:
                 _write_alert_record(fh, record)
+        _chmod_private_file(path)
         _trim_alert_outbox(path)
         return True
     except Exception as exc:  # noqa: BLE001
@@ -783,7 +871,9 @@ def _replace_alert_outbox_records(
         with tmp.open("w", encoding="utf-8") as fh:
             for record in kept:
                 _write_alert_record(fh, record)
+        _chmod_private_file(tmp)
         tmp.replace(path)
+        _chmod_private_file(path)
         return True
     except Exception as exc:  # noqa: BLE001
         log.exception("failed to recover alert outbox %s: %s", path, exc)
@@ -806,6 +896,7 @@ def _recover_stale_sending_outbox(path: Path) -> None:
 
     try:
         sending.rename(path)
+        _chmod_private_file(path)
         _clear_alert_sending_lease(sending)
         log.warning("recovered stale alert sending outbox %s", sending)
     except FileNotFoundError:
@@ -831,6 +922,7 @@ def _claim_alert_outbox() -> Optional[Path]:
         return None
     try:
         path.rename(sending)
+        _chmod_private_file(sending)
         try:
             os.utime(sending, None)
         except OSError:
@@ -892,15 +984,15 @@ def _format_outbox(records: Sequence[Mapping[str, Any]]) -> str:
         return ""
     lines = ["", "Local alerts pending re-send:"]
     for record in records:
-        fields = record.get("fields") or {}
+        fields = _redact_fields(record.get("fields") or {})
         event_type = str(record.get("event_type", "unknown"))
-        title = _alert_title(event_type, str(record.get("subject", "")))
+        title = _alert_title(event_type, _redact_text(record.get("subject", "")))
         lines.append(
             "- {title} ({event_type}, created_at={created_at}): {message}".format(
                 title=title,
                 event_type=event_type,
                 created_at=record.get("created_at", ""),
-                message=record.get("message", ""),
+                message=_redact_text(record.get("message", "")),
             )
         )
         lines.extend("  " + line for line in _format_field_lines(fields))

@@ -852,17 +852,8 @@ class TopicScoutAgent:
             )
             seen.add(key)
 
-        if not selected:
-            for card in cards[:8]:
-                key = str(card.get("topicKey"))
-                selected.append(
-                    {
-                        "topicKey": key,
-                        "reason": "按服务端热度和证据密度保底入选",
-                        "routes": ["signals", "trends", "opportunities", "debates"],
-                    }
-                )
-                seen.add(key)
+        if cards and not selected:
+            raise InsightsValidationError("topic scout selected no topics")
 
         for card in cards:
             key = str(card.get("topicKey"))

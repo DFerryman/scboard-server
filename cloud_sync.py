@@ -133,6 +133,27 @@ def _story_to_doc(
     }
 
 
+def _assign_topic_ranks(story_docs: List[dict]) -> None:
+    """Add cursor-friendly per-topic ordering for topicStories."""
+    by_topic: Dict[str, List[dict]] = {}
+    for doc in story_docs:
+        doc["topicRank"] = 0
+        if not doc.get("inAnyRanking"):
+            continue
+        topic = str(doc.get("topic") or DEFAULT_TOPIC_ID)
+        by_topic.setdefault(topic, []).append(doc)
+    for docs in by_topic.values():
+        docs.sort(
+            key=lambda item: (
+                -int(item.get("score") or 0),
+                -int(item.get("time") or 0),
+                int(item.get("id") or 0),
+            )
+        )
+        for index, doc in enumerate(docs, start=1):
+            doc["topicRank"] = index
+
+
 def _client_story_dict_from_story(story: Story) -> dict:
     """Shape the read cloud function will return -- used inside digest docs."""
     return {
@@ -320,6 +341,7 @@ def build_read_model(
                 feed_ranks=feed_ranks_index.get(sid, {}),
                 default_type=_story_default_type(row["kind"]),
             ))
+        _assign_topic_ranks(story_docs)
         story_count = _write_jsonl_atomic(stories_path, story_docs)
 
         # ---------- topics.jsonl (preserves repository.list_topics order) ----------
@@ -350,6 +372,8 @@ def build_read_model(
         for r in digest_rows:
             date, intro, stories = repository.get_digest(conn, r["date"])
             stories = [s for s in stories if _story_is_ai_ready(s)]
+            if not stories:
+                continue
             digest_docs.append({
                 "_id": f"{current_version}:{date}",
                 "syncVersion": current_version,
@@ -357,7 +381,7 @@ def build_read_model(
                 "intro": intro,
                 "stories": [_client_story_dict_from_story(s) for s in stories],
             })
-        _write_jsonl_atomic(digests_path, digest_docs)
+        digest_count = _write_jsonl_atomic(digests_path, digest_docs)
 
         # ---------- insights.jsonl (self-contained, versioned) ----------
         insight_rows = repository.list_insight_rows(conn)
@@ -420,7 +444,7 @@ def build_read_model(
             "previousVersion": previous_version,
             "stories": story_count,
             "topics": len(topics),
-            "digests": len(digest_rows),
+            "digests": digest_count,
             "insights": insight_count,
             "feedCounts": meta["feedCounts"],
             "outputDir": str(out_dir),

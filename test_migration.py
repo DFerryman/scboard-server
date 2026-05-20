@@ -471,7 +471,7 @@ class MigrationArchiveTest(unittest.TestCase):
                             stop_services=False,
                         )
 
-                    self.assertIn("absolute target is not declared", str(ctx.exception))
+                    self.assertIn("absolute target is not allowed", str(ctx.exception))
                     self.assertEqual(
                         (victim / "keep.txt").read_text(encoding="utf-8"),
                         "keep",
@@ -479,6 +479,51 @@ class MigrationArchiveTest(unittest.TestCase):
                     self.assertEqual(
                         self._read_db_marker(dest / "data" / "hnreader.db"),
                         "current-db",
+                    )
+
+    def test_import_allows_explicit_machine_local_absolute_target(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hnreader-migration-src-") as src_tmp:
+            source = Path(src_tmp)
+            self._make_project(source)
+            self._make_db(source / "data" / "hnreader.db", "new-db")
+            archive = source / "migration.tar.gz"
+            migration.export_archive(
+                archive,
+                project_dir=source,
+                include_service_env=False,
+            )
+
+            with tempfile.TemporaryDirectory(prefix="hnreader-migration-victim-") as victim_tmp:
+                victim = Path(victim_tmp) / "allowed-data"
+                victim.mkdir()
+                (victim / "stale.txt").write_text("stale", encoding="utf-8")
+
+                def _point_data_dir_elsewhere(manifest):
+                    for entry in manifest["entries"]:
+                        if entry["kind"] == "data_dir":
+                            entry["target_type"] = "absolute"
+                            entry["target"] = str(victim)
+
+                self._rewrite_manifest(archive, _point_data_dir_elsewhere)
+
+                with tempfile.TemporaryDirectory(prefix="hnreader-migration-dst-") as dst_tmp:
+                    dest = Path(dst_tmp)
+                    self._make_project(dest)
+
+                    result = migration.import_archive(
+                        archive,
+                        project_dir=dest,
+                        include_service_env=False,
+                        allowed_absolute_targets=[victim],
+                        assume_yes=True,
+                        stop_services=False,
+                    )
+
+                    self.assertIn(str(victim), result["imported_targets"])
+                    self.assertFalse((victim / "stale.txt").exists())
+                    self.assertEqual(
+                        self._read_db_marker(victim / "hnreader.db"),
+                        "new-db",
                     )
 
     def test_stop_services_aborts_when_loaded_unit_cannot_stop(self) -> None:

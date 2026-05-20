@@ -1602,7 +1602,7 @@ def validate_ai_output(
     """Apply field-level downgrades per plan §B.
 
     Bad/missing fields drop to safe placeholders; the story can still be
-    served. ``titleZh`` falls back to ``fallback_title``; topic to ``web``.
+    served. ``titleZh`` falls back to ``fallback_title``; topic to ``general``.
     """
     out: Dict[str, Any] = {
         "titleZh": str(fallback_title or "").strip(),
@@ -1629,8 +1629,11 @@ def validate_ai_output(
     if existing_topics and len(existing_topics) >= max(1, settings.TOPIC_MAX_ACTIVE_TOPICS):
         existing_by_id = {t.id: t for t in existing_topics}
         if topic_id not in existing_by_id:
-            fallback_topic = existing_by_id.get(DEFAULT_TOPIC_ID) or existing_topics[0]
-            topic_id, topic_name = fallback_topic.id, fallback_topic.name
+            fallback_topic = existing_by_id.get(DEFAULT_TOPIC_ID)
+            if fallback_topic is not None:
+                topic_id, topic_name = fallback_topic.id, fallback_topic.name
+            else:
+                topic_id, topic_name = DEFAULT_TOPIC_ID, DEFAULT_TOPIC_NAME
     out["topic"] = topic_id
     out["topicName"] = topic_name
 
