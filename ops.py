@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional, Sequence
 
 from . import ai_config_status, db, repository, settings
 from .ai_agent import AiProviderConfig, build_ai_agent, build_ai_provider_configs
+from .codex_cli import inspect_codex_runtime
 
 
 def _provider_enabled(provider: str) -> bool:
@@ -77,14 +78,23 @@ def collect_ai_check(*, probe: bool) -> Dict[str, Any]:
         }
     provider = (settings.AI_PROVIDER or "none").strip().lower()
     enabled = _provider_enabled(provider)
+    codex = inspect_codex_runtime()
     out: Dict[str, Any] = {
         "enabled": enabled,
         "provider": provider,
         "status": "disabled" if not enabled else "unknown",
         "configs": [],
         "sources": _ai_config_sources(),
+        "codex": codex,
     }
     if not enabled:
+        if not _codex_check_exit_ok(codex):
+            out.update(
+                {
+                    "status": "err",
+                    "config_error": f"Codex CLI unavailable: {codex.get('error')}",
+                }
+            )
         return out
     if "REPLACE_WITH" in (settings.AI_CONFIGS_JSON or "") or "REPLACE_WITH" in (
         settings.AI_API_KEY or ""
@@ -127,7 +137,17 @@ def collect_ai_check(*, probe: bool) -> Dict[str, Any]:
 
 
 def _ai_check_exit_ok(status: Mapping[str, Any]) -> bool:
-    return str(status.get("status") or "") in ("disabled", "parse_ok", "ok")
+    return str(status.get("status") or "") in (
+        "disabled",
+        "parse_ok",
+        "ok",
+    ) and _codex_check_exit_ok(status.get("codex") or {})
+
+
+def _codex_check_exit_ok(status: Mapping[str, Any]) -> bool:
+    if not bool(status.get("enabled")):
+        return True
+    return str(status.get("status") or "") == "ok"
 
 
 def collect_runtime_config_check() -> Dict[str, Any]:
@@ -198,6 +218,19 @@ def _print_ai_check(status: Mapping[str, Any]) -> None:
             _print_line(f"AI source: {', '.join(rendered)}")
     if status.get("config_error"):
         _print_line(f"Config error: {status.get('config_error')}")
+    codex = status.get("codex")
+    if isinstance(codex, Mapping):
+        _print_line(
+            "Codex CLI: "
+            f"{codex.get('status')} enabled={codex.get('enabled')} "
+            f"executable={codex.get('resolved_executable') or codex.get('executable')}"
+        )
+        if codex.get("codex_home"):
+            _print_line(f"Codex home: {codex.get('codex_home')}")
+        if codex.get("version"):
+            _print_line(f"Codex version: {codex.get('version')}")
+        if codex.get("error"):
+            _print_line(f"Codex error: {codex.get('error')}")
     configs = status.get("configs") or []
     if configs:
         _print_line("Configs:")
@@ -583,6 +616,15 @@ def _print_doctor(status: Mapping[str, Any]) -> None:
     _print_line(f"AI status: {ai_status.get('status')} provider={ai_status.get('provider')}")
     if ai_status.get("config_error"):
         _print_line(f"AI config error: {ai_status.get('config_error')}")
+    codex_status = ai_status.get("codex")
+    if isinstance(codex_status, Mapping):
+        _print_line(
+            "Codex CLI: "
+            f"{codex_status.get('status')} enabled={codex_status.get('enabled')} "
+            f"executable={codex_status.get('resolved_executable') or codex_status.get('executable')}"
+        )
+        if codex_status.get("error"):
+            _print_line(f"Codex error: {codex_status.get('error')}")
 
     disk = status.get("disk") or {}
     _print_line(f"Disk: {disk.get('status')} free={disk.get('free_gb')}GB path={disk.get('path')}")

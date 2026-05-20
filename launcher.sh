@@ -87,6 +87,7 @@ CONSTRAINTS_FILE="${CONSTRAINTS_FILE:-${SERVER_DIR}/constraints.txt}"
 LAUNCHER_PATH="${LAUNCHER_PATH:-${SCRIPT_DIR}/launcher.sh}"
 APP_USER="${APP_USER:-hnreader}"
 APP_GROUP="${APP_GROUP:-${APP_USER}}"
+APP_HOME="${APP_HOME:-/var/lib/hnreader}"
 SERVICE_PREFIX="${SERVICE_PREFIX:-hnreader}"
 ENV_DIR="${ENV_DIR:-/etc/hnreader}"
 ENV_FILE="${ENV_FILE:-${ENV_DIR}/server.env}"
@@ -249,6 +250,18 @@ HNREADER_AI_CONFIG_STATUS_CACHE_PATH="${HNREADER_AI_CONFIG_STATUS_CACHE_PATH:-}"
 HNREADER_AI_ENRICH_BODY_MAX_CHARS="${HNREADER_AI_ENRICH_BODY_MAX_CHARS:-1200}"
 HNREADER_AI_ENRICH_COMMENT_LIMIT="${HNREADER_AI_ENRICH_COMMENT_LIMIT:-18}"
 HNREADER_AI_ENRICH_COMMENT_MAX_CHARS="${HNREADER_AI_ENRICH_COMMENT_MAX_CHARS:-240}"
+
+# ---------- Codex CLI primary AI path ----------
+#
+# Keep machine-specific Codex/Node paths in .env.local. The defaults below are
+# generic service-user paths that work when Codex is installed for APP_USER.
+HNREADER_CODEX_ENABLED="${HNREADER_CODEX_ENABLED:-true}"
+HNREADER_CODEX_CLI_PATH="${HNREADER_CODEX_CLI_PATH:-codex}"
+HNREADER_CODEX_HOME="${HNREADER_CODEX_HOME:-${APP_HOME}/.codex}"
+HNREADER_CODEX_EXTRA_PATH="${HNREADER_CODEX_EXTRA_PATH:-${APP_HOME}/.local/bin:${APP_HOME}/.npm-global/bin:${APP_HOME}/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+HNREADER_CODEX_MODEL="${HNREADER_CODEX_MODEL:-}"
+HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS="${HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS:-300}"
+HNREADER_CODEX_IGNORE_USER_CONFIG="${HNREADER_CODEX_IGNORE_USER_CONFIG:-false}"
 
 # ---------- Admin alert email ----------
 
@@ -413,6 +426,8 @@ python_env_args() {
   fi
   _out_array=(
     "PYTHONPATH=$PYTHONPATH_ROOT"
+    "HOME=$APP_HOME"
+    "PATH=$HNREADER_CODEX_EXTRA_PATH"
     "HNREADER_DB_PATH=$HNREADER_DB_PATH"
     "HNREADER_LOG_DIR=$HNREADER_LOG_DIR"
     "HNREADER_APP_VERSION=$HNREADER_APP_VERSION"
@@ -471,6 +486,13 @@ python_env_args() {
     "HNREADER_AI_ENRICH_COMMENT_LIMIT=$HNREADER_AI_ENRICH_COMMENT_LIMIT"
     "HNREADER_AI_ENRICH_COMMENT_MAX_CHARS=$HNREADER_AI_ENRICH_COMMENT_MAX_CHARS"
     "HNREADER_AI_CONFIG_FILE=$ai_config_file_for_python"
+    "HNREADER_CODEX_ENABLED=$HNREADER_CODEX_ENABLED"
+    "HNREADER_CODEX_CLI_PATH=$HNREADER_CODEX_CLI_PATH"
+    "HNREADER_CODEX_HOME=$HNREADER_CODEX_HOME"
+    "HNREADER_CODEX_EXTRA_PATH=$HNREADER_CODEX_EXTRA_PATH"
+    "HNREADER_CODEX_MODEL=$HNREADER_CODEX_MODEL"
+    "HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS=$HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS"
+    "HNREADER_CODEX_IGNORE_USER_CONFIG=$HNREADER_CODEX_IGNORE_USER_CONFIG"
   )
 }
 
@@ -489,6 +511,17 @@ run_python_module_current_config() {
   # override the values about to be written.
   python_env_args env_args current
   env "${env_args[@]}" "$PYTHON_BIN" -m "$@"
+}
+
+run_python_module_current_config_as_app() {
+  resolve_python
+  local env_args=()
+  python_env_args env_args current
+  if [[ "$APP_USER" == "root" || "$(id -un)" == "$APP_USER" ]]; then
+    env "${env_args[@]}" "$PYTHON_BIN" -m "$@"
+  else
+    run_root runuser -u "$APP_USER" -- env "${env_args[@]}" "$PYTHON_BIN" -m "$@"
+  fi
 }
 
 _DANGEROUS_CHOWN_DIRS=(
@@ -563,7 +596,7 @@ ensure_user() {
   fi
   echo "Creating system user: ${APP_USER}"
   run_root useradd --system --gid "$APP_GROUP" \
-    --home-dir /var/lib/hnreader --no-create-home \
+    --home-dir "$APP_HOME" --create-home \
     --shell /usr/sbin/nologin "$APP_USER"
 }
 
@@ -572,10 +605,13 @@ prepare_runtime_dirs() {
   db_dir="$(dirname "$HNREADER_DB_PATH")"
   assert_safe_chown_dir "$db_dir" "HNREADER_DB_PATH directory"
   assert_safe_chown_dir "$HNREADER_LOG_DIR" "HNREADER_LOG_DIR"
-  run_root mkdir -p "$db_dir" "$HNREADER_LOG_DIR" "$ENV_DIR"
+  assert_safe_chown_dir "$APP_HOME" "APP_HOME"
+  assert_safe_chown_dir "$HNREADER_CODEX_HOME" "HNREADER_CODEX_HOME"
+  run_root mkdir -p "$db_dir" "$HNREADER_LOG_DIR" "$ENV_DIR" "$APP_HOME" "$HNREADER_CODEX_HOME"
   run_root chmod 0755 "$ENV_DIR"
   if id "$APP_USER" >/dev/null 2>&1; then
-    run_root chown -R -- "${APP_USER}:${APP_GROUP}" "$db_dir" "$HNREADER_LOG_DIR"
+    run_root chown -R -- "${APP_USER}:${APP_GROUP}" \
+      "$db_dir" "$HNREADER_LOG_DIR" "$APP_HOME" "$HNREADER_CODEX_HOME"
   fi
 }
 
@@ -641,32 +677,37 @@ validate_runtime_config() {
 validate_ai_config() {
   local provider
   provider="$(printf '%s' "$HNREADER_AI_PROVIDER" | tr '[:upper:]' '[:lower:]')"
+  local provider_enabled=1
   case "$provider" in
     ""|none|fallback|off|disabled)
-      return
+      provider_enabled=0
       ;;
   esac
 
-  local external_ai_config_file=0
-  if [[ "$HNREADER_AI_CONFIG_FILE" != "$ENV_FILE" ]]; then
-    external_ai_config_file=1
+  if (( provider_enabled == 1 )); then
+    local external_ai_config_file=0
+    if [[ "$HNREADER_AI_CONFIG_FILE" != "$ENV_FILE" ]]; then
+      external_ai_config_file=1
+    fi
+
+    if (( external_ai_config_file == 0 )) \
+        && [[ -z "$HNREADER_AI_CONFIGS" && ( -z "$HNREADER_AI_API_KEY" || -z "$HNREADER_AI_MODEL" ) ]]; then
+      echo "ERROR: AI provider is enabled but no usable AI config is set." >&2
+      echo "       Fill HNREADER_AI_CONFIGS, or set HNREADER_AI_PROVIDER=none to use fallback output." >&2
+      exit 1
+    fi
+    if (( external_ai_config_file == 0 )) \
+        && [[ "$HNREADER_AI_CONFIGS" == *REPLACE_WITH* || "$HNREADER_AI_API_KEY" == *REPLACE_WITH* ]]; then
+      echo "ERROR: AI config still contains a placeholder key." >&2
+      echo "       Replace sk-REPLACE_WITH_YOUR_DEEPSEEK_API_KEY or disable RealAiAgent." >&2
+      exit 1
+    fi
   fi
 
-  if (( external_ai_config_file == 0 )) \
-      && [[ -z "$HNREADER_AI_CONFIGS" && ( -z "$HNREADER_AI_API_KEY" || -z "$HNREADER_AI_MODEL" ) ]]; then
-    echo "ERROR: AI provider is enabled but no usable AI config is set." >&2
-    echo "       Fill HNREADER_AI_CONFIGS, or set HNREADER_AI_PROVIDER=none to use fallback output." >&2
-    exit 1
-  fi
-  if (( external_ai_config_file == 0 )) \
-      && [[ "$HNREADER_AI_CONFIGS" == *REPLACE_WITH* || "$HNREADER_AI_API_KEY" == *REPLACE_WITH* ]]; then
-    echo "ERROR: AI config still contains a placeholder key." >&2
-    echo "       Replace sk-REPLACE_WITH_YOUR_DEEPSEEK_API_KEY or disable RealAiAgent." >&2
-    exit 1
-  fi
-  if ! run_python_module_current_config "${SERVER_MODULE}.ops" ai-check --no-probe --quiet; then
+  if ! run_python_module_current_config_as_app "${SERVER_MODULE}.ops" ai-check --no-probe --quiet; then
     echo "ERROR: AI config failed Python validation." >&2
     echo "       Run 'bash ${LAUNCHER_PATH} ai-check --no-probe' for details." >&2
+    echo "       If only Codex is unavailable, set HNREADER_CODEX_ENABLED=false or fix Codex for ${APP_USER}." >&2
     exit 1
   fi
 }
@@ -777,6 +818,13 @@ $(env_line HNREADER_AI_ENRICH_BODY_MAX_CHARS "$HNREADER_AI_ENRICH_BODY_MAX_CHARS
 $(env_line HNREADER_AI_ENRICH_COMMENT_LIMIT "$HNREADER_AI_ENRICH_COMMENT_LIMIT")
 $(env_line HNREADER_AI_ENRICH_COMMENT_MAX_CHARS "$HNREADER_AI_ENRICH_COMMENT_MAX_CHARS")
 $(env_line HNREADER_AI_CONFIG_FILE "$HNREADER_AI_CONFIG_FILE")
+$(env_line HNREADER_CODEX_ENABLED "$HNREADER_CODEX_ENABLED")
+$(env_line HNREADER_CODEX_CLI_PATH "$HNREADER_CODEX_CLI_PATH")
+$(env_line HNREADER_CODEX_HOME "$HNREADER_CODEX_HOME")
+$(env_line HNREADER_CODEX_EXTRA_PATH "$HNREADER_CODEX_EXTRA_PATH")
+$(env_line HNREADER_CODEX_MODEL "$HNREADER_CODEX_MODEL")
+$(env_line HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS "$HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS")
+$(env_line HNREADER_CODEX_IGNORE_USER_CONFIG "$HNREADER_CODEX_IGNORE_USER_CONFIG")
 $(env_line HNREADER_INSIGHTS_AI_PROVIDER "$HNREADER_INSIGHTS_AI_PROVIDER")
 $(env_line HNREADER_INSIGHTS_AI_CONFIGS "$HNREADER_INSIGHTS_AI_CONFIGS")
 $(env_line HNREADER_INSIGHTS_AI_API_KEY "$HNREADER_INSIGHTS_AI_API_KEY")
@@ -828,6 +876,9 @@ Group=${APP_GROUP}
 WorkingDirectory=${PROJECT_DIR}
 EnvironmentFile=-${ENV_FILE}
 Environment=PYTHONPATH=${PYTHONPATH_ROOT}
+Environment=HOME=${APP_HOME}
+Environment=CODEX_HOME=${HNREADER_CODEX_HOME}
+Environment=PATH=${HNREADER_CODEX_EXTRA_PATH}
 ExecStart=${PYTHON_BIN} -c "from ${SERVER_MODULE} import db; db.init_db()"
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -836,7 +887,7 @@ ProtectHome=read-only
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-ReadWritePaths=${db_dir} ${HNREADER_LOG_DIR}
+ReadWritePaths=${db_dir} ${HNREADER_LOG_DIR} ${APP_HOME} ${HNREADER_CODEX_HOME}
 
 [Install]
 WantedBy=multi-user.target
@@ -861,6 +912,9 @@ Group=${APP_GROUP}
 WorkingDirectory=${PROJECT_DIR}
 EnvironmentFile=-${ENV_FILE}
 Environment=PYTHONPATH=${PYTHONPATH_ROOT}
+Environment=HOME=${APP_HOME}
+Environment=CODEX_HOME=${HNREADER_CODEX_HOME}
+Environment=PATH=${HNREADER_CODEX_EXTRA_PATH}
 ExecStart=${PYTHON_BIN} -m ${SERVER_MODULE}.ingest --loop
 Restart=always
 RestartSec=10
@@ -872,7 +926,7 @@ ProtectHome=read-only
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-ReadWritePaths=${db_dir} ${HNREADER_LOG_DIR}
+ReadWritePaths=${db_dir} ${HNREADER_LOG_DIR} ${APP_HOME} ${HNREADER_CODEX_HOME}
 
 [Install]
 WantedBy=multi-user.target
@@ -904,11 +958,11 @@ install_files() {
   resolve_python
   validate_cloud_sync_config
   validate_runtime_config
-  validate_ai_config
-  validate_admin_alert_config
   ensure_user
   ensure_project_read_access
   prepare_runtime_dirs
+  validate_ai_config
+  validate_admin_alert_config
   write_env_file
   write_db_init_service
   write_ingest_service

@@ -38,6 +38,21 @@ def _env_first(*names: str) -> Optional[str]:
     return None
 
 
+def _env_if_present(*names: str) -> Optional[str]:
+    """Return the first explicitly-set env value, including an empty string."""
+    for n in names:
+        if n in os.environ:
+            return os.environ.get(n) or ""
+    return None
+
+
+def _path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
 def get_db_path() -> Path:
     if _db_path_override is not None:
         return _db_path_override
@@ -48,7 +63,7 @@ def get_db_path() -> Path:
     # ``hackermini.db``. Pointing fresh at the new default would silently
     # start with an empty DB. Prefer the legacy file when the new default
     # has not been created yet, so existing data keeps serving.
-    if LEGACY_DB_PATH.exists() and not DEFAULT_DB_PATH.exists():
+    if _path_exists(LEGACY_DB_PATH) and not _path_exists(DEFAULT_DB_PATH):
         return LEGACY_DB_PATH
     return DEFAULT_DB_PATH
 
@@ -650,6 +665,12 @@ CODEX_ENABLED = _env_bool(
 CODEX_CLI_PATH = _env_str(
     "HNREADER_CODEX_CLI_PATH", "codex", fallback="HACKERMINI_CODEX_CLI_PATH"
 )
+CODEX_HOME = _env_str(
+    "HNREADER_CODEX_HOME", "", fallback="HACKERMINI_CODEX_HOME"
+).strip()
+CODEX_EXTRA_PATH = _env_str(
+    "HNREADER_CODEX_EXTRA_PATH", "", fallback="HACKERMINI_CODEX_EXTRA_PATH"
+).strip()
 CODEX_MODEL = _env_str(
     "HNREADER_CODEX_MODEL", "", fallback="HACKERMINI_CODEX_MODEL"
 ).strip()
@@ -750,6 +771,8 @@ INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS = _require_int_range(
 _AI_ENV_NAMES = {
     "HNREADER_CODEX_ENABLED",
     "HNREADER_CODEX_CLI_PATH",
+    "HNREADER_CODEX_HOME",
+    "HNREADER_CODEX_EXTRA_PATH",
     "HNREADER_CODEX_MODEL",
     "HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS",
     "HNREADER_CODEX_IGNORE_USER_CONFIG",
@@ -781,6 +804,8 @@ _AI_ENV_NAMES = {
     "HACKERMINI_AI_ENRICH_COMMENT_MAX_CHARS",
     "HACKERMINI_CODEX_ENABLED",
     "HACKERMINI_CODEX_CLI_PATH",
+    "HACKERMINI_CODEX_HOME",
+    "HACKERMINI_CODEX_EXTRA_PATH",
     "HACKERMINI_CODEX_MODEL",
     "HACKERMINI_CODEX_REQUEST_TIMEOUT_SECONDS",
     "HACKERMINI_CODEX_IGNORE_USER_CONFIG",
@@ -860,8 +885,8 @@ def _split_config_files(value: str) -> Tuple[Path, ...]:
 
 
 def _ai_env_file_candidates() -> Tuple[Path, ...]:
-    explicit = _env_first("HNREADER_AI_CONFIG_FILE", "HACKERMINI_AI_CONFIG_FILE")
-    if explicit:
+    explicit = _env_if_present("HNREADER_AI_CONFIG_FILE", "HACKERMINI_AI_CONFIG_FILE")
+    if explicit is not None:
         return _split_config_files(explicit)
 
     candidates = []
@@ -1180,7 +1205,7 @@ def _read_insights_ai_config_file(
 
 
 def _reload_codex_settings_from_process_env() -> None:
-    global CODEX_ENABLED, CODEX_CLI_PATH, CODEX_MODEL
+    global CODEX_ENABLED, CODEX_CLI_PATH, CODEX_HOME, CODEX_EXTRA_PATH, CODEX_MODEL
     global CODEX_REQUEST_TIMEOUT_SECONDS, CODEX_IGNORE_USER_CONFIG
 
     CODEX_ENABLED = _env_bool(
@@ -1189,6 +1214,12 @@ def _reload_codex_settings_from_process_env() -> None:
     CODEX_CLI_PATH = _env_str(
         "HNREADER_CODEX_CLI_PATH", "codex", fallback="HACKERMINI_CODEX_CLI_PATH"
     )
+    CODEX_HOME = _env_str(
+        "HNREADER_CODEX_HOME", "", fallback="HACKERMINI_CODEX_HOME"
+    ).strip()
+    CODEX_EXTRA_PATH = _env_str(
+        "HNREADER_CODEX_EXTRA_PATH", "", fallback="HACKERMINI_CODEX_EXTRA_PATH"
+    ).strip()
     CODEX_MODEL = _env_str(
         "HNREADER_CODEX_MODEL", "", fallback="HACKERMINI_CODEX_MODEL"
     ).strip()

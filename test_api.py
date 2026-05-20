@@ -8190,13 +8190,17 @@ class CodexFirstAiAgentTests(unittest.TestCase):
         old_enabled = settings.CODEX_ENABLED
         old_ignore = settings.CODEX_IGNORE_USER_CONFIG
         old_path = settings.CODEX_CLI_PATH
+        old_home = settings.CODEX_HOME
+        old_extra_path = settings.CODEX_EXTRA_PATH
         try:
             settings.CODEX_ENABLED = True  # type: ignore[assignment]
             settings.CODEX_IGNORE_USER_CONFIG = False  # type: ignore[assignment]
             settings.CODEX_CLI_PATH = "codex"  # type: ignore[assignment]
+            settings.CODEX_HOME = "codex-home"  # type: ignore[assignment]
+            settings.CODEX_EXTRA_PATH = "node-bin"  # type: ignore[assignment]
             with patch(
                 "server.codex_cli.resolve_codex_executable",
-                return_value="/usr/bin/codex",
+                return_value="resolved-codex",
             ):
                 with patch("server.codex_cli.subprocess.run", side_effect=fake_run):
                     out = CodexCliJsonClient().complete_json(
@@ -8209,10 +8213,12 @@ class CodexFirstAiAgentTests(unittest.TestCase):
             settings.CODEX_ENABLED = old_enabled  # type: ignore[assignment]
             settings.CODEX_IGNORE_USER_CONFIG = old_ignore  # type: ignore[assignment]
             settings.CODEX_CLI_PATH = old_path  # type: ignore[assignment]
+            settings.CODEX_HOME = old_home  # type: ignore[assignment]
+            settings.CODEX_EXTRA_PATH = old_extra_path  # type: ignore[assignment]
 
         self.assertEqual(out, {"ok": True})
         args, kwargs = calls[0]
-        self.assertEqual(args[0], "/usr/bin/codex")
+        self.assertEqual(args[0], "resolved-codex")
         self.assertIn("exec", args)
         self.assertIn("--sandbox", args)
         self.assertEqual(args[args.index("--sandbox") + 1], "read-only")
@@ -8222,6 +8228,10 @@ class CodexFirstAiAgentTests(unittest.TestCase):
         self.assertIn("--output-schema", args)
         self.assertNotIn("--ignore-user-config", args)
         self.assertEqual(kwargs["input"], "user")
+        self.assertEqual(kwargs["env"]["CODEX_HOME"], "codex-home")
+        self.assertTrue(
+            kwargs["env"]["PATH"].startswith("node-bin" + os.pathsep)
+        )
 
     def test_codex_cli_discovery_checks_common_current_user_locations(self):
         from .codex_cli import resolve_codex_executable
@@ -8231,6 +8241,94 @@ class CodexFirstAiAgentTests(unittest.TestCase):
             with patch("server.codex_cli._is_executable_file") as is_executable:
                 is_executable.side_effect = lambda path: str(path) == candidate
                 self.assertEqual(resolve_codex_executable("codex"), candidate)
+
+    def test_codex_cli_discovery_prefers_packaged_native_binary(self):
+        from .codex_cli import resolve_codex_executable
+
+        with tempfile.TemporaryDirectory(prefix="hnreader_codex_pkg_") as tmpdir:
+            root = Path(tmpdir)
+            wrapper = root / "bin" / "codex"
+            native = (
+                root
+                / "node_modules"
+                / "@openai"
+                / "codex-linux-x64"
+                / "vendor"
+                / "x86_64-unknown-linux-musl"
+                / "codex"
+                / "codex"
+            )
+            wrapper.parent.mkdir(parents=True)
+            native.parent.mkdir(parents=True)
+            wrapper.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+            native.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(0o755)
+            native.chmod(0o755)
+
+            with patch("server.codex_cli.shutil.which", return_value=str(wrapper)):
+                self.assertEqual(resolve_codex_executable("codex"), str(native))
+
+    def test_codex_runtime_check_reports_version_failure(self):
+        from .codex_cli import inspect_codex_runtime
+
+        old_enabled = settings.CODEX_ENABLED
+        old_path = settings.CODEX_CLI_PATH
+        old_home = settings.CODEX_HOME
+        old_extra_path = settings.CODEX_EXTRA_PATH
+        try:
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            settings.CODEX_CLI_PATH = "codex"  # type: ignore[assignment]
+            settings.CODEX_HOME = ""  # type: ignore[assignment]
+            settings.CODEX_EXTRA_PATH = ""  # type: ignore[assignment]
+            with patch(
+                "server.codex_cli.resolve_codex_executable",
+                return_value="resolved-codex",
+            ), patch(
+                "server.codex_cli.subprocess.run",
+                return_value=SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="node syntax error",
+                ),
+            ):
+                status = inspect_codex_runtime()
+        finally:
+            settings.CODEX_ENABLED = old_enabled  # type: ignore[assignment]
+            settings.CODEX_CLI_PATH = old_path  # type: ignore[assignment]
+            settings.CODEX_HOME = old_home  # type: ignore[assignment]
+            settings.CODEX_EXTRA_PATH = old_extra_path  # type: ignore[assignment]
+
+        self.assertEqual(status["status"], "err")
+        self.assertEqual(status["resolved_executable"], "resolved-codex")
+        self.assertIn("node syntax error", status["error"])
+
+    def test_ai_check_reports_enabled_codex_runtime_failure(self):
+        from . import ops
+
+        old_provider = settings.AI_PROVIDER
+        try:
+            settings.AI_PROVIDER = "none"  # type: ignore[assignment]
+            with patch.object(
+                ops.settings,
+                "refresh_ai_settings_from_env_files",
+                return_value=False,
+            ), patch.object(
+                ops,
+                "inspect_codex_runtime",
+                return_value={
+                    "enabled": True,
+                    "status": "err",
+                    "executable": "codex",
+                    "error": "node syntax error",
+                },
+            ):
+                status = ops.collect_ai_check(probe=False)
+        finally:
+            settings.AI_PROVIDER = old_provider  # type: ignore[assignment]
+
+        self.assertEqual(status["status"], "err")
+        self.assertIn("Codex CLI unavailable", status["config_error"])
+        self.assertFalse(ops._ai_check_exit_ok(status))
 
     def test_codex_cli_missing_for_current_user_is_fallback_class_error(self):
         from .codex_cli import CodexCliError, CodexCliJsonClient

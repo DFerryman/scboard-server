@@ -18,13 +18,20 @@ configuration, writes systemd units, and starts the sync-only service.
 Ingest and Insights try the local `codex` CLI first. That path uses the
 systemd service user's existing Codex login/subscription and runs with
 `codex --ask-for-approval never exec --sandbox read-only`, so it must not edit
-local files. If Codex fails, the server falls back to the existing
+local files. The launcher gives Codex a writable service-user home via
+`HNREADER_CODEX_HOME` and checks `codex --version` as that user before writing
+the units. If Codex fails at request time, the server falls back to the existing
 OpenAI-compatible AI config path unchanged.
 
 During the guided setup you will be asked for:
 
-- One or more fallback AI configs, or `none` to use fallback output when Codex
-  is unavailable.
+- One or more OpenAI-compatible fallback AI configs, or `none` to use offline
+  fallback output. If Codex is enabled, setup still verifies that the service
+  user can start the local CLI.
+- Optional Codex overrides in `.env.local`: `HNREADER_CODEX_CLI_PATH`,
+  `HNREADER_CODEX_HOME`, `HNREADER_CODEX_EXTRA_PATH`, `HNREADER_CODEX_MODEL`,
+  and `HNREADER_CODEX_ENABLED=false` when you intentionally want fallback-only
+  AI.
 - WeChat `pushSync` HTTP trigger URL and `PUSH_SECRET`.
 - Optional admin alert email settings.
 - Optional UFW setup. It allows only OpenSSH; this server exposes no HTTP port.

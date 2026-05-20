@@ -25,21 +25,88 @@ def _is_executable_file(path: Path) -> bool:
         return False
 
 
-def resolve_codex_executable(executable: str = "codex") -> str:
+def _path_with_extra(extra_path: str = "") -> str:
+    base = os.environ.get("PATH", "")
+    extra = str(extra_path or "").strip()
+    if not extra:
+        return base
+    if not base:
+        return extra
+    return extra + os.pathsep + base
+
+
+def _native_codex_candidates(wrapper: Path) -> Sequence[Path]:
+    try:
+        real = wrapper.resolve()
+    except OSError:
+        real = wrapper
+    package_root = real.parent.parent if real.parent.name == "bin" else real.parent
+    native_root = package_root / "node_modules" / "@openai"
+    if not native_root.is_dir():
+        return ()
+    return tuple(sorted(native_root.glob("codex-*/vendor/*/codex/codex")))
+
+
+def _looks_like_node_wrapper(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(256)
+    except OSError:
+        return False
+    return b"/usr/bin/env node" in head or b"node" in head.splitlines()[:1]
+
+
+def _prefer_native_codex_binary(path: str) -> str:
+    candidate = Path(path)
+    if not _looks_like_node_wrapper(candidate):
+        return path
+    for native in _native_codex_candidates(candidate):
+        if _is_executable_file(native):
+            return str(native)
+    return path
+
+
+def _which_all(executable: str, *, path: str) -> Sequence[str]:
+    matches = []
+    seen = set()
+    for directory in path.split(os.pathsep):
+        if not directory:
+            continue
+        candidate = Path(directory) / executable
+        raw = str(candidate)
+        if raw in seen:
+            continue
+        seen.add(raw)
+        if _is_executable_file(candidate):
+            matches.append(raw)
+    return tuple(matches)
+
+
+def resolve_codex_executable(executable: str = "codex", *, extra_path: str = "") -> str:
     configured = str(executable or "codex").strip() or "codex"
-    resolved = shutil.which(configured)
-    if resolved:
-        return resolved
     if configured != "codex":
-        return configured
+        resolved = shutil.which(configured, path=_path_with_extra(extra_path))
+        if resolved:
+            return _prefer_native_codex_binary(resolved)
+        return _prefer_native_codex_binary(configured)
+
+    search_path = _path_with_extra(extra_path)
+    resolved_candidates = list(_which_all(configured, path=search_path))
+    resolved = shutil.which(configured, path=search_path)
+    if resolved and resolved not in resolved_candidates:
+        resolved_candidates.insert(0, resolved)
+    for candidate in resolved_candidates:
+        preferred = _prefer_native_codex_binary(candidate)
+        if preferred != candidate:
+            return preferred
+    if resolved_candidates:
+        return resolved_candidates[0]
 
     home = Path.home()
     candidates = [
         home / ".local" / "bin" / "codex",
         home / ".npm-global" / "bin" / "codex",
         home / ".bun" / "bin" / "codex",
-        Path("/usr/local/bin/codex"),
-        Path("/usr/bin/codex"),
     ]
     if os.name == "nt":
         local_appdata = os.environ.get("LOCALAPPDATA")
@@ -58,8 +125,113 @@ def resolve_codex_executable(executable: str = "codex") -> str:
 
     for path in candidates:
         if _is_executable_file(path):
-            return str(path)
+            return _prefer_native_codex_binary(str(path))
     raise CodexCliError("Codex CLI executable not found for the current user")
+
+
+def _codex_env(*, codex_home: str = "", extra_path: str = "") -> Dict[str, str]:
+    env = os.environ.copy()
+    if codex_home:
+        env["CODEX_HOME"] = codex_home
+    if extra_path:
+        env["PATH"] = _path_with_extra(extra_path)
+    return env
+
+
+def _check_writable_dir(path: Path) -> Optional[str]:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            prefix=".hnreader-codex-check-",
+            dir=path,
+            delete=True,
+        ):
+            pass
+    except OSError as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def inspect_codex_runtime(
+    *,
+    executable: Optional[str] = None,
+    codex_home: Optional[str] = None,
+    extra_path: Optional[str] = None,
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Return a local Codex CLI readiness report without making an AI request."""
+
+    enabled = bool(settings.CODEX_ENABLED)
+    configured = executable if executable is not None else settings.CODEX_CLI_PATH
+    home = (codex_home if codex_home is not None else settings.CODEX_HOME).strip()
+    extra = (
+        extra_path if extra_path is not None else settings.CODEX_EXTRA_PATH
+    ).strip()
+    out: Dict[str, Any] = {
+        "enabled": enabled,
+        "status": "disabled" if not enabled else "unknown",
+        "executable": configured or "codex",
+        "codex_home": home,
+        "extra_path": extra,
+    }
+    if not enabled:
+        return out
+
+    if home:
+        home_path = Path(home).expanduser()
+        out["codex_home"] = str(home_path)
+        home_error = _check_writable_dir(home_path)
+        if home_error:
+            out.update(
+                {
+                    "status": "err",
+                    "error": f"CODEX_HOME is not writable: {home_error}",
+                }
+            )
+            return out
+
+    try:
+        resolved = resolve_codex_executable(configured or "codex", extra_path=extra)
+    except CodexCliError as exc:
+        out.update({"status": "missing", "error": str(exc)})
+        return out
+    out["resolved_executable"] = resolved
+
+    try:
+        completed = subprocess.run(
+            [resolved, "--version"],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=float(timeout),
+            check=False,
+            env=_codex_env(codex_home=home, extra_path=extra),
+        )
+    except subprocess.TimeoutExpired:
+        out.update(
+            {
+                "status": "err",
+                "error": f"Codex CLI version timed out after {timeout:.1f}s",
+            }
+        )
+        return out
+    except OSError as exc:
+        out.update({"status": "err", "error": f"{type(exc).__name__}: {exc}"})
+        return out
+
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    if stdout:
+        out["version"] = stdout.splitlines()[-1]
+    if stderr:
+        out["stderr"] = stderr[-1000:]
+    if completed.returncode != 0:
+        detail = (stderr or stdout or f"exit {completed.returncode}").strip()
+        out.update({"status": "err", "error": detail[-1000:]})
+        return out
+    out["status"] = "ok"
+    return out
 
 
 def _loads_json_from_text(content: str) -> Any:
@@ -303,6 +475,8 @@ class CodexCliJsonClient:
     ) -> None:
         self.executable = executable or settings.CODEX_CLI_PATH or "codex"
         self.model = (model if model is not None else settings.CODEX_MODEL).strip()
+        self.codex_home = settings.CODEX_HOME
+        self.extra_path = settings.CODEX_EXTRA_PATH
         self.timeout = (
             float(timeout)
             if timeout is not None
@@ -350,7 +524,10 @@ class CodexCliJsonClient:
     ) -> Dict[str, Any]:
         if not settings.CODEX_ENABLED:
             raise CodexCliError("Codex CLI is disabled")
-        executable = resolve_codex_executable(self.executable)
+        executable = resolve_codex_executable(
+            self.executable,
+            extra_path=self.extra_path,
+        )
         with tempfile.TemporaryDirectory(prefix="hmini-codex-") as tmp:
             tmp_path = Path(tmp)
             system_path = tmp_path / "system-prompt.md"
@@ -399,6 +576,10 @@ class CodexCliJsonClient:
                     capture_output=True,
                     timeout=self.timeout,
                     check=False,
+                    env=_codex_env(
+                        codex_home=self.codex_home,
+                        extra_path=self.extra_path,
+                    ),
                 )
             except FileNotFoundError as exc:
                 raise CodexCliError(
@@ -430,6 +611,7 @@ class CodexCliJsonClient:
 __all__ = [
     "CodexCliError",
     "CodexCliJsonClient",
+    "inspect_codex_runtime",
     "merge_usage_summaries",
     "resolve_codex_executable",
     "summarize_usage_records",
