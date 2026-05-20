@@ -678,7 +678,7 @@ CODEX_REQUEST_TIMEOUT_SECONDS = _require_float_range(
     "HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS",
     _env_float(
         "HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS",
-        300.0,
+        900.0,
         fallback="HACKERMINI_CODEX_REQUEST_TIMEOUT_SECONDS",
     ),
     min_value=1.0,
@@ -1227,7 +1227,7 @@ def _reload_codex_settings_from_process_env() -> None:
         "HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS",
         _env_float(
             "HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS",
-            300.0,
+            900.0,
             fallback="HACKERMINI_CODEX_REQUEST_TIMEOUT_SECONDS",
         ),
         min_value=1.0,
