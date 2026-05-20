@@ -24,6 +24,7 @@ import logging
 import random
 import re
 import socket
+import subprocess
 import ssl
 import time
 import urllib.error
@@ -46,6 +47,7 @@ from .topics import (
     DEFAULT_TOPIC_NAME,
     normalize_topic,
 )
+from .codex_cli import CodexCliError, CodexCliJsonClient, merge_usage_summaries
 
 
 log = logging.getLogger(__name__)
@@ -65,6 +67,93 @@ _MAX_AI_USAGE_TOKENS = 10_000_000
 # size is capped from provider max_output_tokens so an 8000-token provider
 # automatically runs two stories per batch instead of three.
 _ENRICH_OUTPUT_TOKENS_PER_STORY = 3200
+
+
+_STORY_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "titleZh": {"type": "string"},
+        "topicId": {"type": ["string", "null"]},
+        "topic": {"type": ["string", "null"]},
+        "topicName": {"type": "string"},
+        "aiSummary": {"type": "string"},
+        "discussionThemes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["title", "summary"],
+                "additionalProperties": False,
+            },
+        },
+        "insights": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "author": {"type": "string"},
+                    "score": {"type": "integer"},
+                    "text": {"type": "string"},
+                },
+                "required": ["author", "score", "text"],
+                "additionalProperties": False,
+            },
+        },
+        "terms": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "term": {"type": "string"},
+                    "def": {"type": "string"},
+                },
+                "required": ["term", "def"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": [
+        "titleZh",
+        "topicName",
+        "aiSummary",
+        "discussionThemes",
+        "insights",
+        "terms",
+    ],
+    "additionalProperties": False,
+}
+
+
+_BATCH_ENRICH_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    **_STORY_OUTPUT_SCHEMA["properties"],
+                },
+                "required": [
+                    "id",
+                    "titleZh",
+                    "topicName",
+                    "aiSummary",
+                    "discussionThemes",
+                    "insights",
+                    "terms",
+                ],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["results"],
+    "additionalProperties": False,
+}
 
 
 def _clamp_int(value: int, lower: int, upper: int) -> int:
@@ -1701,6 +1790,192 @@ class FallbackAiAgent(AiAgent):
         return f"{date} 共精选 {n} 条 Hacker News 内容。"
 
 
+class CodexFirstAiAgent(AiAgent):
+    """Try local read-only Codex CLI first, then delegate to existing fallback."""
+
+    supports_batch_enrich = True
+
+    def __init__(
+        self,
+        *,
+        codex_client: Optional[CodexCliJsonClient] = None,
+        fallback_agent: Optional[AiAgent] = None,
+    ) -> None:
+        self.codex_client = codex_client or CodexCliJsonClient()
+        self.fallback_agent = fallback_agent or RealAiAgent()
+        self.model = getattr(self.codex_client, "model", "") or "codex-cli"
+        self.base_url = "codex-cli://local"
+        self.timeout = getattr(self.codex_client, "timeout", None)
+
+    @property
+    def config_count(self) -> int:
+        return int(getattr(self.fallback_agent, "config_count", 0) or 0)
+
+    def recommended_enrich_batch_size(self, requested: int) -> int:
+        fn = getattr(self.fallback_agent, "recommended_enrich_batch_size", None)
+        if callable(fn):
+            return int(fn(requested))
+        return max(1, int(requested))
+
+    def _topic_catalog_json(
+        self,
+        topic_catalog: Sequence[TopicEntry] | None,
+    ) -> str:
+        return RealAiAgent._topic_catalog_json(self, topic_catalog)
+
+    def _topic_section(
+        self,
+        topic_catalog: Sequence[TopicEntry] | None,
+    ) -> str:
+        return RealAiAgent._topic_section(self, topic_catalog)
+
+    def usage_checkpoint(self) -> Dict[str, Any]:
+        fallback_checkpoint = None
+        fn = getattr(self.fallback_agent, "usage_checkpoint", None)
+        if callable(fn):
+            fallback_checkpoint = fn()
+        return {
+            "codex": self.codex_client.usage_checkpoint(),
+            "fallback": fallback_checkpoint,
+        }
+
+    def usage_summary_since(self, checkpoint: Any):
+        if isinstance(checkpoint, Mapping):
+            codex_checkpoint = int(checkpoint.get("codex") or 0)
+            fallback_checkpoint = checkpoint.get("fallback")
+        else:
+            codex_checkpoint = int(checkpoint or 0)
+            fallback_checkpoint = checkpoint
+
+        next_codex, codex_usage = self.codex_client.usage_summary_since(
+            codex_checkpoint
+        )
+        next_fallback = fallback_checkpoint
+        fallback_usage: Dict[str, Any] = {}
+        fn = getattr(self.fallback_agent, "usage_summary_since", None)
+        if callable(fn) and fallback_checkpoint is not None:
+            next_fallback, fallback_usage = fn(fallback_checkpoint)
+        return (
+            {"codex": next_codex, "fallback": next_fallback},
+            merge_usage_summaries(codex_usage, fallback_usage),
+        )
+
+    def _fallback(self, method_name: str, *args, error: Exception, **kwargs):
+        log.warning(
+            "Codex CLI %s failed; falling back to existing AI agent: %s: %s",
+            method_name,
+            type(error).__name__,
+            str(error),
+        )
+        method = getattr(self.fallback_agent, method_name)
+        return method(*args, **kwargs)
+
+    def _single_system_prompt(
+        self,
+        *,
+        max_tokens: int,
+        topic_catalog: Sequence[TopicEntry] | None,
+    ) -> str:
+        return RealAiAgent._story_system_prompt(
+            self,
+            max_tokens=max_tokens,
+            topic_catalog=topic_catalog,
+        )
+
+    def _batch_payload_and_system_prompt(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        topic_catalog: Sequence[TopicEntry] | None,
+    ) -> Tuple[str, str]:
+        _, user_content, system_suffix, max_tokens = (
+            RealAiAgent._build_batch_enrich_inputs(
+                self,
+                items,
+                topic_catalog,
+            )
+        )
+        return user_content, RealAiAgent._batch_system_prompt(
+            self,
+            max_tokens=max_tokens,
+            story_count=len(items),
+            system_suffix=system_suffix,
+        )
+
+    def process_story(
+        self,
+        story_row,
+        comments: Sequence[dict],
+        topic_catalog: Sequence[TopicEntry] | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            prompt_builder = RealAiAgent._build_user_prompt
+            user_prompt = prompt_builder(self, story_row, comments)
+            raw = self.codex_client.complete_json(
+                purpose="story",
+                system_prompt=self._single_system_prompt(
+                    max_tokens=_ENRICH_OUTPUT_TOKENS_PER_STORY,
+                    topic_catalog=topic_catalog,
+                ),
+                user_content=user_prompt,
+                output_schema=_STORY_OUTPUT_SCHEMA,
+            )
+            return validate_ai_output(
+                raw,
+                fallback_title=story_row["title_en"] or "",
+                existing_topics=topic_catalog,
+            )
+        except (CodexCliError, subprocess.SubprocessError, OSError, ValueError) as exc:
+            return self._fallback(
+                "process_story",
+                story_row,
+                comments,
+                topic_catalog,
+                error=exc,
+            )
+
+    def process_stories_batch(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        topic_catalog: Sequence[TopicEntry] | None = None,
+    ) -> Dict[int, Optional[Dict[str, Any]]]:
+        if not items:
+            return {}
+        try:
+            user_content, system_prompt = self._batch_payload_and_system_prompt(
+                items,
+                topic_catalog,
+            )
+            raw = self.codex_client.complete_json(
+                purpose="story-batch",
+                system_prompt=system_prompt,
+                user_content=user_content,
+                output_schema=_BATCH_ENRICH_OUTPUT_SCHEMA,
+            )
+            return validate_batch_ai_output(
+                raw,
+                story_rows=[item["story"] for item in items],
+                existing_topics=topic_catalog,
+            )
+        except (CodexCliError, subprocess.SubprocessError, OSError, ValueError) as exc:
+            return self._fallback(
+                "process_stories_batch",
+                items,
+                topic_catalog,
+                error=exc,
+            )
+
+    def select_digest_story_ids(
+        self,
+        date: str,
+        candidates: Sequence[Any],
+        max_count: int,
+    ) -> List[int]:
+        return self.fallback_agent.select_digest_story_ids(date, candidates, max_count)
+
+    def write_digest_intro(self, date: str, story_rows: Sequence[Any]) -> str:
+        return self.fallback_agent.write_digest_intro(date, story_rows)
+
+
 # ---------- Real agent ----------
 
 class RealAiAgent(AiAgent):
@@ -2111,6 +2386,94 @@ class RealAiAgent(AiAgent):
             "below the max."
         )
 
+    def _story_system_prompt(
+        self,
+        *,
+        max_tokens: int,
+        topic_catalog: Sequence[TopicEntry] | None,
+    ) -> str:
+        return (
+            _SYSTEM_PROMPT
+            + "\n\n"
+            + _enrich_output_budget_guidance(max_tokens, story_count=1)
+            + "\n\n"
+            + self._topic_section(topic_catalog)
+        )
+
+    def _batch_system_prompt(
+        self,
+        *,
+        max_tokens: int,
+        story_count: int,
+        system_suffix: str,
+    ) -> str:
+        return (
+            _SYSTEM_PROMPT
+            + "\n\n"
+            + _enrich_output_budget_guidance(
+                max_tokens,
+                story_count=story_count,
+            )
+            + "\n\n"
+            + system_suffix
+        )
+
+    def _build_batch_enrich_inputs(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        topic_catalog: Sequence[TopicEntry] | None,
+    ) -> Tuple[List[Any], str, str, int]:
+        stories = [item["story"] for item in items]
+        comment_limit = max(0, int(settings.AI_ENRICH_COMMENT_LIMIT))
+        comment_max_chars = max(1, int(settings.AI_ENRICH_COMMENT_MAX_CHARS))
+        body_max_chars = max(0, int(settings.AI_ENRICH_BODY_MAX_CHARS))
+        payload_items = []
+        for item in items:
+            story = item["story"]
+            comments = item.get("comments") or []
+            comment_lines: List[str] = []
+            for c in comments[:comment_limit]:
+                text = _clean_comment_text(
+                    c.get("text") or "", max_chars=comment_max_chars
+                )
+                if text:
+                    comment_lines.append(f"@{c.get('by') or 'anon'}: {text}")
+            payload_items.append(
+                {
+                    "id": int(story["id"]),
+                    "kind": story["kind"] or "story",
+                    "title": story["title_en"] or "",
+                    "url": story["url"] or "",
+                    "body": (story["raw_text"] or "")[:body_max_chars],
+                    "comments": comment_lines,
+                }
+            )
+
+        # B.#4: stable system prefix (instructions + topic catalog) lives in
+        # the system message so provider prefix caches hit across batches in
+        # the same wave. The user message holds only the variable JSON
+        # payload, which is the cache miss tail.
+        system_suffix = (
+            "Enrich each Hacker News story below. Return one strict JSON object "
+            "with a results array. Each result object must include id plus the "
+            "same fields required for a single story: titleZh, topicId, topicName, aiSummary, "
+            "discussionThemes, insights, terms. Do not omit any input id. "
+            "If comments are present, discussionThemes/insights must summarize the comments. "
+            "Only output JSON.\n\n"
+            f"Existing dynamic topics, max {settings.TOPIC_MAX_ACTIVE_TOPICS}, prefer reuse: "
+            f"{self._topic_catalog_json(topic_catalog)}\n"
+            "Topic policy: reuse an existing broad topic when it can cover the story; "
+            "create a new broad topic only when the current taxonomy cannot cover it "
+            "and the topic count is still below the max."
+        )
+        desired_max_tokens = _ENRICH_OUTPUT_TOKENS_PER_STORY * len(items)
+        return (
+            stories,
+            json.dumps(payload_items, ensure_ascii=False),
+            system_suffix,
+            desired_max_tokens,
+        )
+
     def _build_user_prompt(
         self,
         story_row,
@@ -2342,12 +2705,9 @@ class RealAiAgent(AiAgent):
             max_tokens = _resolve_max_tokens(
                 config, _ENRICH_OUTPUT_TOKENS_PER_STORY
             )
-            system_content = (
-                _SYSTEM_PROMPT
-                + "\n\n"
-                + _enrich_output_budget_guidance(max_tokens, story_count=1)
-                + "\n\n"
-                + self._topic_section(topic_catalog)
+            system_content = self._story_system_prompt(
+                max_tokens=max_tokens,
+                topic_catalog=topic_catalog,
             )
             response = self._post_chat_for_purpose(
                 "story",
@@ -2379,67 +2739,20 @@ class RealAiAgent(AiAgent):
         if not items:
             return {}
 
-        stories = [item["story"] for item in items]
-        comment_limit = max(0, int(settings.AI_ENRICH_COMMENT_LIMIT))
-        comment_max_chars = max(1, int(settings.AI_ENRICH_COMMENT_MAX_CHARS))
-        body_max_chars = max(0, int(settings.AI_ENRICH_BODY_MAX_CHARS))
-        payload_items = []
-        for item in items:
-            story = item["story"]
-            comments = item.get("comments") or []
-            comment_lines: List[str] = []
-            for c in comments[:comment_limit]:
-                text = _clean_comment_text(
-                    c.get("text") or "", max_chars=comment_max_chars
-                )
-                if text:
-                    comment_lines.append(f"@{c.get('by') or 'anon'}: {text}")
-            payload_items.append(
-                {
-                    "id": int(story["id"]),
-                    "kind": story["kind"] or "story",
-                    "title": story["title_en"] or "",
-                    "url": story["url"] or "",
-                    "body": (story["raw_text"] or "")[:body_max_chars],
-                    "comments": comment_lines,
-                }
-            )
-
-        # B.#4: stable system prefix (instructions + topic catalog) lives in
-        # the system message so provider prefix caches hit across batches in
-        # the same wave. The user message holds only the variable JSON
-        # payload, which is the cache miss tail.
-        system_suffix = (
-            "Enrich each Hacker News story below. Return one strict JSON object "
-            "with a results array. Each result object must include id plus the "
-            "same fields required for a single story: titleZh, topicId, topicName, aiSummary, "
-            "discussionThemes, insights, terms. Do not omit any input id. "
-            "If comments are present, discussionThemes/insights must summarize the comments. "
-            "Only output JSON.\n\n"
-            f"Existing dynamic topics, max {settings.TOPIC_MAX_ACTIVE_TOPICS}, prefer reuse: "
-            f"{self._topic_catalog_json(topic_catalog)}\n"
-            "Topic policy: reuse an existing broad topic when it can cover the story; "
-            "create a new broad topic only when the current taxonomy cannot cover it "
-            "and the topic count is still below the max."
+        stories, user_content, system_suffix, desired_max_tokens = (
+            self._build_batch_enrich_inputs(items, topic_catalog)
         )
-        user_content = json.dumps(payload_items, ensure_ascii=False)
         base_payload = {
             "temperature": 0.3,
             "response_format": {"type": "json_object"},
         }
-        desired_max_tokens = _ENRICH_OUTPUT_TOKENS_PER_STORY * len(items)
 
         def _process_with_config(config: AiProviderConfig) -> Dict[int, Dict[str, Any]]:
             max_tokens = _resolve_max_tokens(config, desired_max_tokens)
-            system_content = (
-                _SYSTEM_PROMPT
-                + "\n\n"
-                + _enrich_output_budget_guidance(
-                    max_tokens,
-                    story_count=len(items),
-                )
-                + "\n\n"
-                + system_suffix
+            system_content = self._batch_system_prompt(
+                max_tokens=max_tokens,
+                story_count=len(items),
+                system_suffix=system_suffix,
             )
             response = self._post_chat_for_purpose(
                 "story-batch",
@@ -2588,35 +2901,38 @@ class RealAiAgent(AiAgent):
 # ---------- factory ----------
 
 def build_ai_agent() -> AiAgent:
-    """Choose Fallback or Real based on ``settings.AI_PROVIDER``.
+    """Choose Codex-first, Real, or Fallback based on runtime settings.
 
-    Provider explicitly disabled (``none`` / ``""`` / ``fallback`` / ``off``
-    / ``disabled``) returns the offline :class:`FallbackAiAgent`. Anything
-    else MUST resolve to a working :class:`RealAiAgent` — A.#3: silently
-    swapping in Fallback on broken/missing config previously masked
-    production misconfiguration. Now we raise so the caller fails the
-    round and the admin gets paged.
+    Codex CLI is the default primary path and uses the server process user's
+    existing Codex login/subscription. The OpenAI-compatible provider config is
+    preserved as the fallback path when configured; otherwise the offline
+    fallback remains available for no-provider deployments.
     """
     settings.refresh_ai_settings_from_env_files()
     provider = (settings.AI_PROVIDER or "none").strip().lower()
     if provider in ("", "none", "fallback", "off", "disabled"):
-        return FallbackAiAgent()
-    try:
-        configs = build_ai_provider_configs()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"AI provider {provider!r} configured but config is invalid: {exc}"
-        ) from exc
-    if not configs:
-        raise RuntimeError(
-            f"AI provider {provider!r} configured but no usable api_key/model "
-            "entries were found in AI_CONFIGS_JSON / AI_API_KEY / AI_MODEL"
-        )
-    return RealAiAgent(configs=configs)
+        fallback: AiAgent = FallbackAiAgent()
+    else:
+        try:
+            configs = build_ai_provider_configs()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"AI provider {provider!r} configured but config is invalid: {exc}"
+            ) from exc
+        if not configs:
+            raise RuntimeError(
+                f"AI provider {provider!r} configured but no usable api_key/model "
+                "entries were found in AI_CONFIGS_JSON / AI_API_KEY / AI_MODEL"
+            )
+        fallback = RealAiAgent(configs=configs)
+    if settings.CODEX_ENABLED:
+        return CodexFirstAiAgent(fallback_agent=fallback)
+    return fallback
 
 
 __all__ = [
     "AiAgent",
+    "CodexFirstAiAgent",
     "FallbackAiAgent",
     "AiCapacityDeferred",
     "AiProviderConfig",

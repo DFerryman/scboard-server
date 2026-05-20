@@ -3241,6 +3241,89 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(cheap.purposes, ["insights-evidence", "insights-topic-scout"])
         self.assertEqual(complex_client.purposes, ["insights-signals"])
 
+    def test_codex_first_insights_client_reuses_prompt_and_payload_then_falls_back(self):
+        from . import insights_agents
+
+        class FakeCodex:
+            model = "codex-test"
+            timeout = 1.0
+
+            def __init__(self):
+                self.calls = []
+
+            def complete_json(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"headline": "h", "summary": "s", "signals": []}
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint, *, purposes=None):
+                return checkpoint, {}
+
+        class ExistingClient:
+            def __init__(self):
+                self.calls = []
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint, *, purposes=None):
+                return checkpoint, {}
+
+            def complete_json(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"fallback": True}
+
+        codex = FakeCodex()
+        fallback = ExistingClient()
+        client = insights_agents.CodexFirstInsightsAiClient(
+            codex_client=codex,  # type: ignore[arg-type]
+            fallback_client=fallback,
+        )
+        payload = {"stories": [{"id": 1, "title": "A"}]}
+
+        out = client.complete_json(
+            purpose="insights-signals",
+            system_prompt=insights_agents.TODAY_SIGNALS_SYSTEM_PROMPT,
+            user_payload=payload,
+            max_tokens=123,
+        )
+
+        self.assertEqual(out["headline"], "h")
+        self.assertEqual(len(fallback.calls), 0)
+        self.assertEqual(codex.calls[0]["purpose"], "insights-signals")
+        self.assertEqual(
+            codex.calls[0]["system_prompt"],
+            insights_agents.TODAY_SIGNALS_SYSTEM_PROMPT,
+        )
+        self.assertEqual(
+            json.loads(codex.calls[0]["user_content"]),
+            payload,
+        )
+
+        class FailingCodex(FakeCodex):
+            def complete_json(self, **kwargs):
+                raise insights_agents.CodexCliError("codex failed")
+
+        fallback = ExistingClient()
+        client = insights_agents.CodexFirstInsightsAiClient(
+            codex_client=FailingCodex(),  # type: ignore[arg-type]
+            fallback_client=fallback,
+        )
+        out = client.complete_json(
+            purpose="insights-signals",
+            system_prompt="system",
+            user_payload=payload,
+            max_tokens=456,
+        )
+
+        self.assertEqual(out, {"fallback": True})
+        self.assertEqual(fallback.calls[0]["purpose"], "insights-signals")
+        self.assertEqual(fallback.calls[0]["system_prompt"], "system")
+        self.assertEqual(fallback.calls[0]["user_payload"], payload)
+        self.assertEqual(fallback.calls[0]["max_tokens"], 456)
+
     def test_today_signals_agent_normalizes_english_labels(self):
         from .insights_agents import TodaySignalsAgent
 
@@ -7017,8 +7100,10 @@ class RealAiAgentFailover(unittest.TestCase):
         old_key = settings.AI_API_KEY
         old_model = settings.AI_MODEL
         old_base_url = settings.AI_BASE_URL
+        old_codex_enabled = settings.CODEX_ENABLED
         try:
             settings.AI_PROVIDER = "openai"  # type: ignore[assignment]
+            settings.CODEX_ENABLED = False  # type: ignore[assignment]
             settings.AI_CONFIGS_JSON = json.dumps(
                 [
                     {
@@ -7047,6 +7132,7 @@ class RealAiAgentFailover(unittest.TestCase):
             settings.AI_API_KEY = old_key  # type: ignore[assignment]
             settings.AI_MODEL = old_model  # type: ignore[assignment]
             settings.AI_BASE_URL = old_base_url  # type: ignore[assignment]
+            settings.CODEX_ENABLED = old_codex_enabled  # type: ignore[assignment]
 
         self.assertEqual([c.model for c in configs], ["model-one", "model-two"])
         self.assertEqual(configs[1].timeout, 12.0)
@@ -7057,6 +7143,7 @@ class RealAiAgentFailover(unittest.TestCase):
 
     def test_ai_config_file_hot_reload_updates_next_agent_build(self):
         ai_env_names = [
+            "HNREADER_CODEX_ENABLED",
             "HNREADER_AI_CONFIG_FILE",
             "HNREADER_AI_PROVIDER",
             "HNREADER_AI_CONFIGS",
@@ -7074,6 +7161,7 @@ class RealAiAgentFailover(unittest.TestCase):
             "AI_MODEL": settings.AI_MODEL,
             "AI_BASE_URL": settings.AI_BASE_URL,
             "AI_REQUEST_TIMEOUT_SECONDS": settings.AI_REQUEST_TIMEOUT_SECONDS,
+            "CODEX_ENABLED": settings.CODEX_ENABLED,
         }
 
         def launcher_style_env(model: str, timeout: int) -> str:
@@ -7089,6 +7177,7 @@ class RealAiAgentFailover(unittest.TestCase):
             )
             quoted_payload = payload.replace("\\", "\\\\").replace('"', '\\"')
             return (
+                'HNREADER_CODEX_ENABLED="false"\n'
                 'HNREADER_AI_PROVIDER="enabled"\n'
                 f'HNREADER_AI_CONFIGS="{quoted_payload}"\n'
                 f'HNREADER_AI_REQUEST_TIMEOUT_SECONDS="{timeout}"\n'
@@ -7104,6 +7193,7 @@ class RealAiAgentFailover(unittest.TestCase):
                 os.environ["HNREADER_AI_CONFIG_FILE"] = str(env_path)
 
                 settings.AI_PROVIDER = "none"  # type: ignore[assignment]
+                settings.CODEX_ENABLED = False  # type: ignore[assignment]
                 agent = build_ai_agent()
                 self.assertIsInstance(agent, RealAiAgent)
                 self.assertEqual(agent.config_count, 1)
@@ -7127,6 +7217,7 @@ class RealAiAgentFailover(unittest.TestCase):
 
     def test_ai_json_config_file_hot_reload_updates_next_agent_build(self):
         ai_env_names = [
+            "HNREADER_CODEX_ENABLED",
             "HNREADER_AI_CONFIG_FILE",
             "HNREADER_AI_PROVIDER",
             "HNREADER_AI_CONFIGS",
@@ -7144,6 +7235,7 @@ class RealAiAgentFailover(unittest.TestCase):
             "AI_MODEL": settings.AI_MODEL,
             "AI_BASE_URL": settings.AI_BASE_URL,
             "AI_REQUEST_TIMEOUT_SECONDS": settings.AI_REQUEST_TIMEOUT_SECONDS,
+            "CODEX_ENABLED": settings.CODEX_ENABLED,
         }
         old_applied = set(settings._last_applied_ai_env_keys)  # type: ignore[attr-defined]
         old_sources = settings._last_ai_config_sources  # type: ignore[attr-defined]
@@ -7152,6 +7244,7 @@ class RealAiAgentFailover(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
+                        "HNREADER_CODEX_ENABLED": False,
                         "configs": [
                             {
                                 "api_key": "secret-one",
@@ -7175,6 +7268,7 @@ class RealAiAgentFailover(unittest.TestCase):
 
                 settings.AI_PROVIDER = "none"  # type: ignore[assignment]
                 settings.AI_CONFIGS_JSON = ""  # type: ignore[assignment]
+                settings.CODEX_ENABLED = False  # type: ignore[assignment]
                 agent = build_ai_agent()
                 self.assertIsInstance(agent, RealAiAgent)
                 self.assertEqual(agent.model, "json-model-one")
@@ -7915,6 +8009,253 @@ class RealAiAgentFailover(unittest.TestCase):
             agent.process_story(self._story_row(), [])
 
 
+class CodexFirstAiAgentTests(unittest.TestCase):
+    def _story_row(self):
+        return {
+            "id": 101,
+            "title_en": "Hello",
+            "raw_text": "Body",
+            "url": "https://example.com",
+            "kind": "story",
+        }
+
+    def test_codex_story_reuses_existing_system_and_user_prompts(self):
+        class FakeCodex:
+            model = "codex-test"
+            timeout = 1.0
+
+            def __init__(self):
+                self.calls = []
+
+            def complete_json(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "titleZh": "中文标题",
+                    "topicName": "综合技术",
+                    "aiSummary": "摘要",
+                    "discussionThemes": [],
+                    "insights": [],
+                    "terms": [],
+                }
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint, *, purposes=None):
+                return checkpoint, {}
+
+        fallback = FallbackAiAgent()
+        codex = FakeCodex()
+        agent = ai_agent_module.CodexFirstAiAgent(
+            codex_client=codex,  # type: ignore[arg-type]
+            fallback_agent=fallback,
+        )
+        topics = [TopicEntry(id="web", name="综合技术", count=3)]
+        comments = [{"by": "alice", "text": "<p>Great detail</p>"}]
+
+        out = agent.process_story(self._story_row(), comments, topics)
+
+        self.assertEqual(out["titleZh"], "中文标题")
+        self.assertEqual(len(codex.calls), 1)
+        call = codex.calls[0]
+        expected_user = ai_agent_module.RealAiAgent._build_user_prompt(
+            agent, self._story_row(), comments
+        )
+        expected_system = (
+            ai_agent_module._SYSTEM_PROMPT
+            + "\n\n"
+            + ai_agent_module._enrich_output_budget_guidance(
+                ai_agent_module._ENRICH_OUTPUT_TOKENS_PER_STORY,
+                story_count=1,
+            )
+            + "\n\n"
+            + ai_agent_module.RealAiAgent._topic_section(agent, topics)
+        )
+        self.assertEqual(call["purpose"], "story")
+        self.assertEqual(call["user_content"], expected_user)
+        self.assertEqual(call["system_prompt"], expected_system)
+        self.assertEqual(call["output_schema"], ai_agent_module._STORY_OUTPUT_SCHEMA)
+
+    def test_codex_failure_falls_back_to_existing_agent(self):
+        class FailingCodex:
+            model = "codex-test"
+            timeout = 1.0
+
+            def complete_json(self, **kwargs):
+                raise ai_agent_module.CodexCliError("codex down")
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint, *, purposes=None):
+                return checkpoint, {}
+
+        class ExistingAgent(FallbackAiAgent):
+            def __init__(self):
+                self.calls = 0
+
+            def process_story(self, story_row, comments, topic_catalog=None):
+                self.calls += 1
+                return {
+                    "titleZh": "fallback title",
+                    "topic": "web",
+                    "topicName": "综合技术",
+                    "aiSummary": "fallback summary",
+                    "discussionThemes": [],
+                    "insights": [],
+                    "terms": [],
+                }
+
+        fallback = ExistingAgent()
+        agent = ai_agent_module.CodexFirstAiAgent(
+            codex_client=FailingCodex(),  # type: ignore[arg-type]
+            fallback_agent=fallback,
+        )
+
+        out = agent.process_story(self._story_row(), [], [])
+
+        self.assertEqual(out["titleZh"], "fallback title")
+        self.assertEqual(fallback.calls, 1)
+
+    def test_codex_batch_reuses_existing_batch_prompt_contract(self):
+        class FakeCodex:
+            model = "codex-test"
+            timeout = 1.0
+
+            def __init__(self):
+                self.calls = []
+
+            def complete_json(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "results": [
+                        {
+                            "id": 101,
+                            "titleZh": "标题 A",
+                            "topicName": "综合技术",
+                            "aiSummary": "摘要 A",
+                            "discussionThemes": [],
+                            "insights": [],
+                            "terms": [],
+                        }
+                    ]
+                }
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint, *, purposes=None):
+                return checkpoint, {}
+
+        codex = FakeCodex()
+        agent = ai_agent_module.CodexFirstAiAgent(
+            codex_client=codex,  # type: ignore[arg-type]
+            fallback_agent=FallbackAiAgent(),
+        )
+        items = [{"story": self._story_row(), "comments": []}]
+
+        out = agent.process_stories_batch(items, [])
+
+        self.assertEqual(out[101]["titleZh"], "标题 A")
+        self.assertEqual(len(codex.calls), 1)
+        self.assertEqual(codex.calls[0]["purpose"], "story-batch")
+        self.assertEqual(
+            codex.calls[0]["output_schema"],
+            ai_agent_module._BATCH_ENRICH_OUTPUT_SCHEMA,
+        )
+        self.assertIn('"id": 101', codex.calls[0]["user_content"])
+        self.assertIn(
+            "Return one strict JSON object with a results array",
+            codex.calls[0]["system_prompt"],
+        )
+
+    def test_codex_cli_invocation_is_read_only_and_uses_system_user_config(self):
+        from .codex_cli import CodexCliJsonClient
+
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    '{"type":"item.completed","item":{"type":"agent_message",'
+                    '"text":"{\\"ok\\":true}"}}\n'
+                    '{"type":"turn.completed","usage":{"input_tokens":1,'
+                    '"output_tokens":2,"total_tokens":3}}\n'
+                ),
+                stderr="",
+            )
+
+        old_enabled = settings.CODEX_ENABLED
+        old_ignore = settings.CODEX_IGNORE_USER_CONFIG
+        old_path = settings.CODEX_CLI_PATH
+        try:
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            settings.CODEX_IGNORE_USER_CONFIG = False  # type: ignore[assignment]
+            settings.CODEX_CLI_PATH = "codex"  # type: ignore[assignment]
+            with patch(
+                "server.codex_cli.resolve_codex_executable",
+                return_value="/usr/bin/codex",
+            ):
+                with patch("server.codex_cli.subprocess.run", side_effect=fake_run):
+                    out = CodexCliJsonClient().complete_json(
+                        purpose="test",
+                        system_prompt="system",
+                        user_content="user",
+                        output_schema={"type": "object"},
+                    )
+        finally:
+            settings.CODEX_ENABLED = old_enabled  # type: ignore[assignment]
+            settings.CODEX_IGNORE_USER_CONFIG = old_ignore  # type: ignore[assignment]
+            settings.CODEX_CLI_PATH = old_path  # type: ignore[assignment]
+
+        self.assertEqual(out, {"ok": True})
+        args, kwargs = calls[0]
+        self.assertEqual(args[0], "/usr/bin/codex")
+        self.assertIn("exec", args)
+        self.assertIn("--sandbox", args)
+        self.assertEqual(args[args.index("--sandbox") + 1], "read-only")
+        self.assertIn("--ask-for-approval", args)
+        self.assertEqual(args[args.index("--ask-for-approval") + 1], "never")
+        self.assertLess(args.index("--ask-for-approval"), args.index("exec"))
+        self.assertIn("--output-schema", args)
+        self.assertNotIn("--ignore-user-config", args)
+        self.assertEqual(kwargs["input"], "user")
+
+    def test_codex_cli_discovery_checks_common_current_user_locations(self):
+        from .codex_cli import resolve_codex_executable
+
+        candidate = str(Path.home() / ".local" / "bin" / "codex")
+        with patch("server.codex_cli.shutil.which", return_value=None):
+            with patch("server.codex_cli._is_executable_file") as is_executable:
+                is_executable.side_effect = lambda path: str(path) == candidate
+                self.assertEqual(resolve_codex_executable("codex"), candidate)
+
+    def test_codex_cli_missing_for_current_user_is_fallback_class_error(self):
+        from .codex_cli import CodexCliError, CodexCliJsonClient
+
+        old_enabled = settings.CODEX_ENABLED
+        old_path = settings.CODEX_CLI_PATH
+        try:
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            settings.CODEX_CLI_PATH = "codex"  # type: ignore[assignment]
+            with patch(
+                "server.codex_cli.resolve_codex_executable",
+                side_effect=CodexCliError("missing"),
+            ):
+                with self.assertRaises(CodexCliError):
+                    CodexCliJsonClient().complete_json(
+                        purpose="test",
+                        system_prompt="system",
+                        user_content="user",
+                        output_schema={"type": "object"},
+                    )
+        finally:
+            settings.CODEX_ENABLED = old_enabled  # type: ignore[assignment]
+            settings.CODEX_CLI_PATH = old_path  # type: ignore[assignment]
+
+
 # ---------- Digester (P4) ----------
 
 class AiAgentStrictBuilder(unittest.TestCase):
@@ -7929,6 +8270,7 @@ class AiAgentStrictBuilder(unittest.TestCase):
             settings.AI_CONFIGS_JSON,
             settings.AI_API_KEY,
             settings.AI_MODEL,
+            settings.CODEX_ENABLED,
         )
 
     def _restore(self, saved):
@@ -7937,15 +8279,31 @@ class AiAgentStrictBuilder(unittest.TestCase):
             settings.AI_CONFIGS_JSON,
             settings.AI_API_KEY,
             settings.AI_MODEL,
+            settings.CODEX_ENABLED,
         ) = saved
 
-    def test_provider_none_still_returns_fallback(self):
+    def test_provider_none_uses_codex_first_by_default(self):
         saved = self._save()
         try:
             settings.AI_PROVIDER = "none"  # type: ignore[assignment]
             settings.AI_CONFIGS_JSON = ""  # type: ignore[assignment]
             settings.AI_API_KEY = ""  # type: ignore[assignment]
             settings.AI_MODEL = ""  # type: ignore[assignment]
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            agent = build_ai_agent()
+            self.assertIsInstance(agent, ai_agent_module.CodexFirstAiAgent)
+            self.assertIsInstance(agent.fallback_agent, FallbackAiAgent)
+        finally:
+            self._restore(saved)
+
+    def test_provider_none_with_codex_disabled_returns_fallback(self):
+        saved = self._save()
+        try:
+            settings.AI_PROVIDER = "none"  # type: ignore[assignment]
+            settings.AI_CONFIGS_JSON = ""  # type: ignore[assignment]
+            settings.AI_API_KEY = ""  # type: ignore[assignment]
+            settings.AI_MODEL = ""  # type: ignore[assignment]
+            settings.CODEX_ENABLED = False  # type: ignore[assignment]
             agent = build_ai_agent()
             self.assertIsInstance(agent, FallbackAiAgent)
         finally:

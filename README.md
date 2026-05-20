@@ -15,9 +15,16 @@ With no command, `launcher.sh` runs `bootstrap`. It installs Ubuntu packages,
 creates `.venv`, installs Python dependencies, guides you through `.env.local`
 configuration, writes systemd units, and starts the sync-only service.
 
+Ingest and Insights try the local `codex` CLI first. That path uses the
+systemd service user's existing Codex login/subscription and runs with
+`codex --ask-for-approval never exec --sandbox read-only`, so it must not edit
+local files. If Codex fails, the server falls back to the existing
+OpenAI-compatible AI config path unchanged.
+
 During the guided setup you will be asked for:
 
-- One or more AI configs, or `none` to use fallback output.
+- One or more fallback AI configs, or `none` to use fallback output when Codex
+  is unavailable.
 - WeChat `pushSync` HTTP trigger URL and `PUSH_SECRET`.
 - Optional admin alert email settings.
 - Optional UFW setup. It allows only OpenSSH; this server exposes no HTTP port.

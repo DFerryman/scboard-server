@@ -642,6 +642,33 @@ AI_ENRICH_COMMENT_MAX_CHARS = _require_int_range(
     max_value=2000,
 )
 
+# ---------- Codex CLI primary AI path ----------
+
+CODEX_ENABLED = _env_bool(
+    "HNREADER_CODEX_ENABLED", True, fallback="HACKERMINI_CODEX_ENABLED"
+)
+CODEX_CLI_PATH = _env_str(
+    "HNREADER_CODEX_CLI_PATH", "codex", fallback="HACKERMINI_CODEX_CLI_PATH"
+)
+CODEX_MODEL = _env_str(
+    "HNREADER_CODEX_MODEL", "", fallback="HACKERMINI_CODEX_MODEL"
+).strip()
+CODEX_REQUEST_TIMEOUT_SECONDS = _require_float_range(
+    "HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS",
+    _env_float(
+        "HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS",
+        300.0,
+        fallback="HACKERMINI_CODEX_REQUEST_TIMEOUT_SECONDS",
+    ),
+    min_value=1.0,
+    max_value=1800.0,
+)
+CODEX_IGNORE_USER_CONFIG = _env_bool(
+    "HNREADER_CODEX_IGNORE_USER_CONFIG",
+    False,
+    fallback="HACKERMINI_CODEX_IGNORE_USER_CONFIG",
+)
+
 # ---------- Insights AI provider ----------
 
 INSIGHTS_AI_CONFIG_FILE = _env_str("HNREADER_INSIGHTS_AI_CONFIG_FILE", "")
@@ -721,6 +748,11 @@ INSIGHTS_COMPRESSION_AI_MAX_OUTPUT_TOKENS = _require_int_range(
 
 
 _AI_ENV_NAMES = {
+    "HNREADER_CODEX_ENABLED",
+    "HNREADER_CODEX_CLI_PATH",
+    "HNREADER_CODEX_MODEL",
+    "HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS",
+    "HNREADER_CODEX_IGNORE_USER_CONFIG",
     "HNREADER_AI_CONFIG_FILE",
     "HNREADER_AI_PROVIDER",
     "HNREADER_AI_CONFIGS",
@@ -747,6 +779,11 @@ _AI_ENV_NAMES = {
     "HACKERMINI_AI_ENRICH_BODY_MAX_CHARS",
     "HACKERMINI_AI_ENRICH_COMMENT_LIMIT",
     "HACKERMINI_AI_ENRICH_COMMENT_MAX_CHARS",
+    "HACKERMINI_CODEX_ENABLED",
+    "HACKERMINI_CODEX_CLI_PATH",
+    "HACKERMINI_CODEX_MODEL",
+    "HACKERMINI_CODEX_REQUEST_TIMEOUT_SECONDS",
+    "HACKERMINI_CODEX_IGNORE_USER_CONFIG",
 }
 
 _AI_JSON_FIELD_ENV_NAMES = {
@@ -1142,6 +1179,36 @@ def _read_insights_ai_config_file(
     return _read_insights_ai_env_file(path), "env"
 
 
+def _reload_codex_settings_from_process_env() -> None:
+    global CODEX_ENABLED, CODEX_CLI_PATH, CODEX_MODEL
+    global CODEX_REQUEST_TIMEOUT_SECONDS, CODEX_IGNORE_USER_CONFIG
+
+    CODEX_ENABLED = _env_bool(
+        "HNREADER_CODEX_ENABLED", True, fallback="HACKERMINI_CODEX_ENABLED"
+    )
+    CODEX_CLI_PATH = _env_str(
+        "HNREADER_CODEX_CLI_PATH", "codex", fallback="HACKERMINI_CODEX_CLI_PATH"
+    )
+    CODEX_MODEL = _env_str(
+        "HNREADER_CODEX_MODEL", "", fallback="HACKERMINI_CODEX_MODEL"
+    ).strip()
+    CODEX_REQUEST_TIMEOUT_SECONDS = _require_float_range(
+        "HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS",
+        _env_float(
+            "HNREADER_CODEX_REQUEST_TIMEOUT_SECONDS",
+            300.0,
+            fallback="HACKERMINI_CODEX_REQUEST_TIMEOUT_SECONDS",
+        ),
+        min_value=1.0,
+        max_value=1800.0,
+    )
+    CODEX_IGNORE_USER_CONFIG = _env_bool(
+        "HNREADER_CODEX_IGNORE_USER_CONFIG",
+        False,
+        fallback="HACKERMINI_CODEX_IGNORE_USER_CONFIG",
+    )
+
+
 def _reload_ai_settings_from_process_env() -> None:
     global AI_BASE_URL, AI_CONFIG_FILE, AI_CONFIGS_JSON, AI_PROVIDER
     global AI_API_KEY, AI_MODEL, AI_INTERNAL_HOST_ALLOWLIST
@@ -1219,6 +1286,7 @@ def _reload_ai_settings_from_process_env() -> None:
         min_value=50,
         max_value=2000,
     )
+    _reload_codex_settings_from_process_env()
 
 
 def _reload_insights_ai_settings_from_process_env() -> None:
@@ -1306,6 +1374,7 @@ def _reload_insights_ai_settings_from_process_env() -> None:
         min_value=0,
         max_value=1_000_000,
     ) or None
+    _reload_codex_settings_from_process_env()
 
 
 _last_applied_ai_env_keys: set = set()

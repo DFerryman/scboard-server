@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -14,6 +15,9 @@ from .ai_agent import (
     build_insights_compression_ai_provider_configs,
     build_insights_ai_provider_configs,
 )
+from .codex_cli import CodexCliError, CodexCliJsonClient, merge_usage_summaries
+
+log = logging.getLogger(__name__)
 
 
 FORBIDDEN_WORD_RE = re.compile(
@@ -236,6 +240,12 @@ INSIGHTS_EVIDENCE_MAX_TOKENS = 12288
 INSIGHTS_TOPIC_SCOUT_MAX_TOKENS = 6144
 
 
+_JSON_OBJECT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": True,
+}
+
+
 def _normalize_signal_label(value: Any) -> str:
     label = _clean_text(value, max_chars=16)
     mapped = {
@@ -382,6 +392,88 @@ class InsightsAiClient(RealAiAgent):
         return self._with_failover(purpose, _run)
 
 
+class CodexFirstInsightsAiClient:
+    """Insights JSON client that falls back to the existing provider client."""
+
+    def __init__(
+        self,
+        *,
+        codex_client: Optional[CodexCliJsonClient] = None,
+        fallback_client,
+    ) -> None:
+        self.codex_client = codex_client or CodexCliJsonClient()
+        self.fallback_client = fallback_client
+        self.model = getattr(self.codex_client, "model", "") or "codex-cli"
+        self.base_url = "codex-cli://local"
+        self.timeout = getattr(self.codex_client, "timeout", None)
+
+    def usage_checkpoint(self) -> Dict[str, Any]:
+        return {
+            "codex": self.codex_client.usage_checkpoint(),
+            "fallback": self.fallback_client.usage_checkpoint(),
+        }
+
+    def usage_summary_since(
+        self,
+        checkpoint: Any,
+        *,
+        purposes: Optional[Sequence[str]] = None,
+    ):
+        if isinstance(checkpoint, Mapping):
+            codex_checkpoint = int(checkpoint.get("codex") or 0)
+            fallback_checkpoint = int(checkpoint.get("fallback") or 0)
+        else:
+            codex_checkpoint = int(checkpoint or 0)
+            fallback_checkpoint = int(checkpoint or 0)
+        next_codex, codex_usage = self.codex_client.usage_summary_since(
+            codex_checkpoint,
+            purposes=purposes,
+        )
+        next_fallback, fallback_usage = self.fallback_client.usage_summary_since(
+            fallback_checkpoint,
+            purposes=purposes,
+        )
+        return (
+            {"codex": next_codex, "fallback": next_fallback},
+            merge_usage_summaries(codex_usage, fallback_usage),
+        )
+
+    def complete_json(
+        self,
+        *,
+        purpose: str,
+        system_prompt: str,
+        user_payload: Mapping[str, Any],
+        max_tokens: int = 2400,
+    ) -> Dict[str, Any]:
+        user_content = json.dumps(
+            user_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        try:
+            return self.codex_client.complete_json(
+                purpose=purpose,
+                system_prompt=system_prompt,
+                user_content=user_content,
+                output_schema=_JSON_OBJECT_SCHEMA,
+            )
+        except (CodexCliError, OSError, ValueError) as exc:
+            # Keep the existing OpenAI-compatible flow intact; Codex failure
+            # only changes which client gets first attempt.
+            log.warning(
+                "Codex CLI %s failed; falling back to existing insights AI client: %s",
+                purpose,
+                f"{type(exc).__name__}: {exc}",
+            )
+            return self.fallback_client.complete_json(
+                purpose=purpose,
+                system_prompt=system_prompt,
+                user_payload=user_payload,
+                max_tokens=max_tokens,
+            )
+
+
 def _build_insights_ai_client(
     *,
     provider: str,
@@ -401,7 +493,10 @@ def _build_insights_ai_client(
             f"{label} AI is enabled but no usable {env_hint} "
             "api_key/model config was found"
         )
-    return InsightsAiClient(configs=configs)
+    client = InsightsAiClient(configs=configs)
+    if settings.CODEX_ENABLED:
+        return CodexFirstInsightsAiClient(fallback_client=client)  # type: ignore[return-value]
+    return client
 
 
 def build_insights_ai_client() -> InsightsAiClient:
@@ -988,6 +1083,7 @@ __all__ = [
     "InsightsAgentRunner",
     "InsightsAiClient",
     "InsightsValidationError",
+    "CodexFirstInsightsAiClient",
     "DEBATE_SYSTEM_PROMPT",
     "EVIDENCE_SYSTEM_PROMPT",
     "INSIGHTS_DEBATES_MAX_TOKENS",
