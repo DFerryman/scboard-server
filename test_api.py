@@ -5706,6 +5706,26 @@ class EnricherBehavior(_SqliteCase):
         self.assertEqual(usage["by_step"]["story"]["requests"], 1)
         self.assertEqual(usage["by_step"]["story"]["cost"], 0.0005)
 
+    def test_enrich_usage_checkpoint_preserves_structured_checkpoint(self):
+        class StructuredUsageAgent:
+            def __init__(self):
+                self.seen_checkpoint = None
+
+            def usage_checkpoint(self):
+                return {"codex": 1, "fallback": 3}
+
+            def usage_summary_since(self, checkpoint, *, purposes=None):
+                self.seen_checkpoint = checkpoint
+                return {"codex": 2, "fallback": 4}, {"requests": 2}
+
+        agent = StructuredUsageAgent()
+        checkpoint = ingest_module._ai_usage_checkpoint(agent)
+        summary = ingest_module._finalize_enrich_summary({}, agent, checkpoint)
+
+        self.assertEqual(checkpoint, {"codex": 1, "fallback": 3})
+        self.assertEqual(agent.seen_checkpoint, checkpoint)
+        self.assertEqual(summary["ai_usage"], {"requests": 2})
+
     def test_stale_enriching_recovered(self):
         self._seed()
         conn = db.connect()

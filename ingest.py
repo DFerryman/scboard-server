@@ -1408,12 +1408,13 @@ def _merge_enrich_summary(target: Dict[str, Any], part: Dict[str, Any]) -> None:
         target["timed_out"] = True
 
 
-def _ai_usage_checkpoint(ai_agent) -> Optional[int]:
+def _ai_usage_checkpoint(ai_agent) -> Optional[Any]:
     fn = getattr(ai_agent, "usage_checkpoint", None)
     if not callable(fn):
         return None
     try:
-        return int(fn())
+        checkpoint = fn()
+        return checkpoint if checkpoint is not None else None
     except Exception as exc:  # noqa: BLE001
         log.warning("ai usage checkpoint failed: %s", exc)
         return None
@@ -1422,7 +1423,7 @@ def _ai_usage_checkpoint(ai_agent) -> Optional[int]:
 def _finalize_enrich_summary(
     summary: Dict[str, Any],
     ai_agent,
-    usage_checkpoint: Optional[int],
+    usage_checkpoint: Optional[Any],
 ) -> Dict[str, Any]:
     if usage_checkpoint is None:
         return summary
@@ -2180,7 +2181,7 @@ def _update_run_enrich_progress(run_id: str, enrich_summary: Dict[str, Any]) -> 
 def _record_run_ai_usage_snapshot(
     run_id: str,
     ai_agent,
-    checkpoint: Optional[int],
+    checkpoint: Optional[Any],
 ) -> None:
     """Refresh ingest_runs.ai_usage with cumulative usage since ``checkpoint``.
 
