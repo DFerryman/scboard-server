@@ -46,7 +46,7 @@ from .digest import run_digester_once
 from .ingest import run_enricher_once, run_fetcher_once, run_ingest_round
 from .normalizer import derive_kind, extract_domain, normalize_item
 from .schemas import StoryType, TopicEntry
-from .topics import topic_id_set, topic_name_from_id
+from .topics import resolve_fixed_topic, topic_aliases, topic_id_set, topic_name_from_id
 
 
 VALID_CLOUD_PUSH_SECRET = "a" * 64
@@ -1252,6 +1252,8 @@ class EmptyDbContract(_SqliteCase):
                     (301, "Legacy unmapped", "topic-unmapped-legacy", 2, 1700000301),
                     (302, "Legacy alias", "ai-tools", 1, 1700000302),
                     (303, "Legacy named alias", "legacy-ai-bucket", 3, 1700000303),
+                    (304, "Opaque legacy AI", "topic-63fe855a00", 4, 1700000304),
+                    (305, "Opaque legacy devtools", "topic-a72ef18d9a", 5, 1700000305),
                 ]
                 for story_id, title, topic, rank, hn_time in rows:
                     conn.execute(
@@ -1304,9 +1306,16 @@ class EmptyDbContract(_SqliteCase):
         self.assertEqual(ai_devtools.total, 2)
         self.assertEqual({story.id for story in ai_devtools.list}, {302, 303})
 
+        self.assertEqual(_h_topic_stories("ai", 1, 10).total, 0)
+        self.assertEqual(_h_topic_stories("devtools", 1, 10).total, 0)
+
         top = _h_stories(StoryType.TOP, 1, 10)
         legacy = next(story for story in top.list if story.id == 301)
         self.assertEqual(legacy.topic, "topic-unmapped-legacy")
+        opaque_ai = next(story for story in top.list if story.id == 304)
+        opaque_devtools = next(story for story in top.list if story.id == 305)
+        self.assertEqual(opaque_ai.topic, "topic-63fe855a00")
+        self.assertEqual(opaque_devtools.topic, "topic-a72ef18d9a")
 
     def test_topic_stories_counts_story_once_across_multiple_feeds(self):
         now = repository.now_seconds()
@@ -4642,7 +4651,23 @@ class CloudSyncReadModel(_SqliteCase):
                     score=90,
                     descendants=4,
                 )
-                repository.replace_feed_ranking(conn, "top", [202, 201])
+                self._insert_done_story(
+                    conn,
+                    203,
+                    hn_time + 2,
+                    topic="topic-63fe855a00",
+                    score=85,
+                    descendants=5,
+                )
+                self._insert_done_story(
+                    conn,
+                    204,
+                    hn_time + 3,
+                    topic="topic-a72ef18d9a",
+                    score=82,
+                    descendants=6,
+                )
+                repository.replace_feed_ranking(conn, "top", [202, 203, 204, 201])
         finally:
             conn.close()
 
@@ -4663,7 +4688,7 @@ class CloudSyncReadModel(_SqliteCase):
             if line.strip()
         ]
 
-        self.assertEqual(stats["stories"], 2)
+        self.assertEqual(stats["stories"], 4)
         self.assertEqual(stats["topics"], 1)
         self.assertEqual(
             [(doc["id"], doc["count"]) for doc in topic_docs],
@@ -4672,6 +4697,8 @@ class CloudSyncReadModel(_SqliteCase):
         stories_by_id = {doc["id"]: doc for doc in story_docs}
         self.assertEqual(stories_by_id[201]["topic"], "topic-unmapped-legacy")
         self.assertEqual(stories_by_id[202]["topic"], "ai-devtools")
+        self.assertEqual(stories_by_id[203]["topic"], "topic-63fe855a00")
+        self.assertEqual(stories_by_id[204]["topic"], "topic-a72ef18d9a")
 
     def test_cloud_sync_diff_uses_ai_ready_read_model_contract(self):
         from . import cloud_sync, cloud_sync_diff
@@ -6316,6 +6343,13 @@ class AiValidation(unittest.TestCase):
             ["items"]["properties"]["topicId"]
         )
         self.assertEqual(batch_topic_id_schema, topic_id_schema)
+
+    def test_opaque_legacy_topic_hashes_are_not_fixed_aliases(self):
+        self.assertIsNone(resolve_fixed_topic(topic="topic-63fe855a00"))
+        self.assertIsNone(resolve_fixed_topic(topic="topic-a72ef18d9a"))
+        self.assertNotIn("topic-63fe855a00", topic_aliases("ai"))
+        self.assertNotIn("topic-a72ef18d9a", topic_aliases("devtools"))
+        self.assertEqual(resolve_fixed_topic(topic="ai-tools")[0], "ai-devtools")
 
     def test_strict_ai_output_rejects_generated_topic_id(self):
         with self.assertRaisesRegex(ValueError, "fixed topic"):

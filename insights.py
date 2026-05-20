@@ -29,7 +29,7 @@ from .topics import (
     DEFAULT_TOPIC_NAME,
     clean_topic_name,
     legacy_topic_id,
-    resolve_fixed_topic,
+    resolve_fixed_source_topic,
 )
 
 
@@ -123,7 +123,7 @@ def _row_value(row: Any, key: str, default: Any = "") -> Any:
 
 
 def _topic_label(topic: str, topic_name: Any = "") -> str:
-    fixed = resolve_fixed_topic(topic=topic, topic_name=topic_name)
+    fixed = resolve_fixed_source_topic(topic=topic, topic_name=topic_name)
     if fixed:
         return fixed[1]
     name = clean_topic_name(topic_name)
@@ -141,7 +141,7 @@ def _row_topic_label(row: Any) -> str:
 
 
 def _row_topic_id(row: Any) -> str:
-    fixed = resolve_fixed_topic(
+    fixed = resolve_fixed_source_topic(
         topic=str(row["topic"] or ""),
         topic_name=_row_value(row, "topic_name", ""),
     )

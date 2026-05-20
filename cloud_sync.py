@@ -33,7 +33,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from . import ai_config_status, db, dashboard_projection, repository, settings
 from .schemas import Story, TopicEntry
-from .topics import resolve_fixed_topic, topic_name_from_id
+from .topics import resolve_fixed_source_topic, topic_name_from_id
 
 
 log = logging.getLogger(__name__)
@@ -256,7 +256,7 @@ def _list_ai_ready_topics(conn, visible_ids: Iterable[int]) -> List[TopicEntry]:
             params,
         ).fetchall()
     for row in rows:
-        fixed_topic = resolve_fixed_topic(
+        fixed_topic = resolve_fixed_source_topic(
             topic=row["id"],
             topic_name=row["name"],
         )

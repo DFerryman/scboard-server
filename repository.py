@@ -36,6 +36,7 @@ from .topics import (
     legacy_topic_id,
     normalize_topic,
     resolve_fixed_topic,
+    resolve_fixed_source_topic,
     topic_name_from_id,
 )
 
@@ -303,7 +304,7 @@ def _row_optional(row: sqlite3.Row, key: str, default: Any = None) -> Any:
 
 
 def _story_topic_id(topic: object, topic_name: object = "") -> str:
-    fixed = resolve_fixed_topic(topic=topic, topic_name=topic_name)
+    fixed = resolve_fixed_source_topic(topic=topic, topic_name=topic_name)
     if fixed:
         return fixed[0]
     return legacy_topic_id(topic) or DEFAULT_TOPIC_ID
@@ -418,7 +419,7 @@ def list_topics(conn: sqlite3.Connection, *, limit: Optional[int] = None) -> Lis
     ).fetchall()
     buckets: Dict[str, Dict[str, int]] = {}
     for row in rows:
-        fixed_topic = resolve_fixed_topic(
+        fixed_topic = resolve_fixed_source_topic(
             topic=row["id"],
             topic_name=row["name"],
         )
@@ -526,7 +527,7 @@ def source_topic_ids_for_canonical(
     ).fetchall()
     source_ids: set[str] = set()
     for row in rows:
-        fixed = resolve_fixed_topic(topic=row["id"], topic_name=row["name"])
+        fixed = resolve_fixed_source_topic(topic=row["id"], topic_name=row["name"])
         if fixed and fixed[0] == canonical_id:
             source_id = str(row["id"] or "").strip()
             if source_id:

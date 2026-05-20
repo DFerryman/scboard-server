@@ -21,6 +21,7 @@ MAX_TOPIC_ID_CHARS = 64
 
 _TOPIC_ID_RE = re.compile(r"[^a-z0-9-]+")
 _DASH_RE = re.compile(r"-+")
+_OPAQUE_LEGACY_TOPIC_RE = re.compile(r"^topic-[0-9a-f]{10}$")
 
 
 FIXED_TOPIC_CATALOG: Tuple[Mapping[str, object], ...] = (
@@ -147,6 +148,8 @@ for item in FIXED_TOPIC_CATALOG:
     _ALIAS_TO_ID[topic_id.casefold()] = topic_id
     _ALIAS_TO_ID[str(item["name"]).casefold()] = topic_id
     for alias in item.get("aliases", ()):
+        if _OPAQUE_LEGACY_TOPIC_RE.fullmatch(str(alias).strip().lower()):
+            continue
         _ALIAS_TO_ID[str(alias).casefold()] = topic_id
 
 
@@ -157,6 +160,10 @@ def clean_topic_id(value: object) -> str:
     text = _TOPIC_ID_RE.sub("-", text)
     text = _DASH_RE.sub("-", text).strip("-")
     return text[:MAX_TOPIC_ID_CHARS]
+
+
+def is_opaque_legacy_topic_id(value: object) -> bool:
+    return bool(_OPAQUE_LEGACY_TOPIC_RE.fullmatch(clean_topic_id(value)))
 
 
 def clean_topic_name(value: object) -> str:
@@ -224,6 +231,8 @@ def topic_aliases(topic_id: str) -> set[str]:
     aliases = {resolved}
     for alias in item.get("aliases", ()):
         text = str(alias)
+        if is_opaque_legacy_topic_id(text):
+            continue
         if all(ord(ch) < 128 for ch in text):
             clean = clean_topic_id(text)
             if clean:
@@ -254,6 +263,16 @@ def resolve_fixed_topic(
         return None
     entry = _topic_entry(resolved)
     return entry.id, entry.name
+
+
+def resolve_fixed_source_topic(
+    *,
+    topic: object = None,
+    topic_name: object = None,
+) -> Optional[Tuple[str, str]]:
+    if is_opaque_legacy_topic_id(topic):
+        return None
+    return resolve_fixed_topic(topic=topic, topic_name=topic_name)
 
 
 def normalize_topic(
