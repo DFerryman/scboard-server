@@ -67,6 +67,7 @@ _MAX_AI_USAGE_TOKENS = 10_000_000
 # size is capped from provider max_output_tokens so an 8000-token provider
 # automatically runs two stories per batch instead of three.
 _ENRICH_OUTPUT_TOKENS_PER_STORY = 3200
+_CODEX_INGEST_REASONING_EFFORT = "medium"
 
 
 _STORY_OUTPUT_SCHEMA: Dict[str, Any] = {
@@ -1924,6 +1925,7 @@ class CodexFirstAiAgent(AiAgent):
                 ),
                 user_content=user_prompt,
                 output_schema=_STORY_OUTPUT_SCHEMA,
+                reasoning_effort=_CODEX_INGEST_REASONING_EFFORT,
             )
             return validate_ai_output(
                 raw,
@@ -1956,6 +1958,7 @@ class CodexFirstAiAgent(AiAgent):
                 system_prompt=system_prompt,
                 user_content=user_content,
                 output_schema=_BATCH_ENRICH_OUTPUT_SCHEMA,
+                reasoning_effort=_CODEX_INGEST_REASONING_EFFORT,
             )
             return validate_batch_ai_output(
                 raw,

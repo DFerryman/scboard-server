@@ -18,6 +18,21 @@ class CodexCliError(RuntimeError):
     """Raised when the local Codex CLI path cannot produce valid JSON."""
 
 
+_CODEX_REASONING_EFFORTS = frozenset(("minimal", "low", "medium", "high", "xhigh"))
+
+
+def _normalize_reasoning_effort(value: Optional[str]) -> Optional[str]:
+    effort = str(value or "").strip().lower()
+    if not effort:
+        return None
+    if effort not in _CODEX_REASONING_EFFORTS:
+        allowed = ", ".join(sorted(_CODEX_REASONING_EFFORTS))
+        raise CodexCliError(
+            f"invalid Codex reasoning effort {value!r}; expected one of: {allowed}"
+        )
+    return effort
+
+
 def _is_executable_file(path: Path) -> bool:
     try:
         return path.is_file() and os.access(path, os.X_OK)
@@ -521,9 +536,11 @@ class CodexCliJsonClient:
         system_prompt: str,
         user_content: str,
         output_schema: Mapping[str, Any],
+        reasoning_effort: Optional[str] = None,
     ) -> Dict[str, Any]:
         if not settings.CODEX_ENABLED:
             raise CodexCliError("Codex CLI is disabled")
+        effort = _normalize_reasoning_effort(reasoning_effort)
         executable = resolve_codex_executable(
             self.executable,
             extra_path=self.extra_path,
@@ -560,6 +577,8 @@ class CodexCliJsonClient:
                 "-c",
                 "features.hooks=false",
             ]
+            if effort:
+                args.extend(["-c", f"model_reasoning_effort={json.dumps(effort)}"])
             if settings.CODEX_IGNORE_USER_CONFIG:
                 args.append("--ignore-user-config")
             if self.model:

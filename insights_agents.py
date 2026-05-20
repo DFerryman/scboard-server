@@ -20,6 +20,24 @@ from .codex_cli import CodexCliError, CodexCliJsonClient, merge_usage_summaries
 log = logging.getLogger(__name__)
 
 
+_CODEX_INSIGHTS_COMPRESSION_REASONING_EFFORT = "medium"
+_CODEX_INSIGHTS_ANALYSIS_REASONING_EFFORT = "xhigh"
+_CODEX_INSIGHTS_ANALYSIS_PURPOSES = frozenset(
+    (
+        "insights-signals",
+        "insights-trends",
+        "insights-opportunities",
+        "insights-debates",
+    )
+)
+
+
+def _codex_reasoning_effort_for_insights_purpose(purpose: str) -> str:
+    if purpose in _CODEX_INSIGHTS_ANALYSIS_PURPOSES:
+        return _CODEX_INSIGHTS_ANALYSIS_REASONING_EFFORT
+    return _CODEX_INSIGHTS_COMPRESSION_REASONING_EFFORT
+
+
 FORBIDDEN_WORD_RE = re.compile(
     r"\bShow\s+HN\b|\bHacker\s*News\b|\bHackerNews\b|\bHN\b",
     re.IGNORECASE,
@@ -616,6 +634,9 @@ class CodexFirstInsightsAiClient:
                 system_prompt=system_prompt,
                 user_content=user_content,
                 output_schema=output_schema,
+                reasoning_effort=_codex_reasoning_effort_for_insights_purpose(
+                    purpose
+                ),
             )
         except (CodexCliError, OSError, ValueError) as exc:
             # Keep the existing OpenAI-compatible flow intact; Codex failure

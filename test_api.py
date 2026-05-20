@@ -3337,6 +3337,21 @@ class CloudSyncReadModel(_SqliteCase):
             codex.calls[0]["output_schema"],
             insights_agents._INSIGHTS_OUTPUT_SCHEMAS["insights-signals"],
         )
+        self.assertEqual(codex.calls[0]["reasoning_effort"], "xhigh")
+
+        client.complete_json(
+            purpose="insights-evidence",
+            system_prompt=insights_agents.EVIDENCE_SYSTEM_PROMPT,
+            user_payload=payload,
+            max_tokens=123,
+        )
+
+        self.assertEqual(len(fallback.calls), 0)
+        self.assertEqual(
+            codex.calls[1]["output_schema"],
+            insights_agents._INSIGHTS_OUTPUT_SCHEMAS["insights-evidence"],
+        )
+        self.assertEqual(codex.calls[1]["reasoning_effort"], "medium")
 
         class FailingCodex(FakeCodex):
             def complete_json(self, **kwargs):
@@ -8218,6 +8233,7 @@ class CodexFirstAiAgentTests(unittest.TestCase):
         self.assertEqual(call["user_content"], expected_user)
         self.assertEqual(call["system_prompt"], expected_system)
         self.assertEqual(call["output_schema"], ai_agent_module._STORY_OUTPUT_SCHEMA)
+        self.assertEqual(call["reasoning_effort"], "medium")
 
     def test_codex_failure_falls_back_to_existing_agent(self):
         class FailingCodex:
@@ -8302,6 +8318,7 @@ class CodexFirstAiAgentTests(unittest.TestCase):
         self.assertEqual(out[101]["titleZh"], "标题 A")
         self.assertEqual(len(codex.calls), 1)
         self.assertEqual(codex.calls[0]["purpose"], "story-batch")
+        self.assertEqual(codex.calls[0]["reasoning_effort"], "medium")
         self.assertEqual(
             codex.calls[0]["output_schema"],
             ai_agent_module._BATCH_ENRICH_OUTPUT_SCHEMA,
@@ -8351,6 +8368,7 @@ class CodexFirstAiAgentTests(unittest.TestCase):
                         system_prompt="system",
                         user_content="user",
                         output_schema={"type": "object"},
+                        reasoning_effort="medium",
                     )
         finally:
             settings.CODEX_ENABLED = old_enabled  # type: ignore[assignment]
@@ -8369,12 +8387,30 @@ class CodexFirstAiAgentTests(unittest.TestCase):
         self.assertEqual(args[args.index("--ask-for-approval") + 1], "never")
         self.assertLess(args.index("--ask-for-approval"), args.index("exec"))
         self.assertIn("--output-schema", args)
+        self.assertIn('model_reasoning_effort="medium"', args)
         self.assertNotIn("--ignore-user-config", args)
         self.assertEqual(kwargs["input"], "user")
         self.assertEqual(kwargs["env"]["CODEX_HOME"], "codex-home")
         self.assertTrue(
             kwargs["env"]["PATH"].startswith("node-bin" + os.pathsep)
         )
+
+    def test_codex_cli_rejects_invalid_reasoning_effort(self):
+        from .codex_cli import CodexCliError, CodexCliJsonClient
+
+        old_enabled = settings.CODEX_ENABLED
+        try:
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            with self.assertRaisesRegex(CodexCliError, "invalid Codex reasoning effort"):
+                CodexCliJsonClient().complete_json(
+                    purpose="test",
+                    system_prompt="system",
+                    user_content="user",
+                    output_schema={"type": "object"},
+                    reasoning_effort="invalid-effort",
+                )
+        finally:
+            settings.CODEX_ENABLED = old_enabled  # type: ignore[assignment]
 
     def test_codex_cli_discovery_checks_common_current_user_locations(self):
         from .codex_cli import resolve_codex_executable
