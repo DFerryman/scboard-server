@@ -8058,6 +8058,40 @@ class CodexFirstAiAgentTests(unittest.TestCase):
         assert_strict_objects(ai_agent_module._STORY_OUTPUT_SCHEMA)
         assert_strict_objects(ai_agent_module._BATCH_ENRICH_OUTPUT_SCHEMA)
 
+    def test_codex_first_usage_summary_accepts_purpose_filter(self):
+        class UsageClient:
+            def __init__(self, label):
+                self.label = label
+                self.seen = None
+
+            def usage_checkpoint(self):
+                return 1
+
+            def usage_summary_since(self, checkpoint, *, purposes=None):
+                self.seen = (checkpoint, purposes)
+                return checkpoint + 1, {
+                    "requests": 1,
+                    "by_step": {self.label: {"requests": 1}},
+                }
+
+        codex = UsageClient("codex")
+        fallback = UsageClient("fallback")
+        agent = ai_agent_module.CodexFirstAiAgent(
+            codex_client=codex,  # type: ignore[arg-type]
+            fallback_agent=fallback,  # type: ignore[arg-type]
+        )
+
+        next_checkpoint, usage = agent.usage_summary_since(
+            {"codex": 2, "fallback": 5},
+            purposes=("story", "story-batch"),
+        )
+
+        self.assertEqual(codex.seen, (2, ("story", "story-batch")))
+        self.assertEqual(fallback.seen, (5, ("story", "story-batch")))
+        self.assertEqual(next_checkpoint, {"codex": 3, "fallback": 6})
+        self.assertIn("codex", usage["by_step"])
+        self.assertIn("fallback", usage["by_step"])
+
     def test_codex_story_reuses_existing_system_and_user_prompts(self):
         class FakeCodex:
             model = "codex-test"

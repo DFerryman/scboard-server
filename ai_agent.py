@@ -1836,7 +1836,12 @@ class CodexFirstAiAgent(AiAgent):
             "fallback": fallback_checkpoint,
         }
 
-    def usage_summary_since(self, checkpoint: Any):
+    def usage_summary_since(
+        self,
+        checkpoint: Any,
+        *,
+        purposes: Optional[Sequence[str]] = None,
+    ):
         if isinstance(checkpoint, Mapping):
             codex_checkpoint = int(checkpoint.get("codex") or 0)
             fallback_checkpoint = checkpoint.get("fallback")
@@ -1845,13 +1850,17 @@ class CodexFirstAiAgent(AiAgent):
             fallback_checkpoint = checkpoint
 
         next_codex, codex_usage = self.codex_client.usage_summary_since(
-            codex_checkpoint
+            codex_checkpoint,
+            purposes=purposes,
         )
         next_fallback = fallback_checkpoint
         fallback_usage: Dict[str, Any] = {}
         fn = getattr(self.fallback_agent, "usage_summary_since", None)
         if callable(fn) and fallback_checkpoint is not None:
-            next_fallback, fallback_usage = fn(fallback_checkpoint)
+            next_fallback, fallback_usage = fn(
+                fallback_checkpoint,
+                purposes=purposes,
+            )
         return (
             {"codex": next_codex, "fallback": next_fallback},
             merge_usage_summaries(codex_usage, fallback_usage),
