@@ -210,7 +210,8 @@ EVIDENCE_SYSTEM_PROMPT = (
     "\"topic\":\"\",\"storyIds\":[123],\"synthesis\":\"\","
     "\"painPoints\":[\"\"],\"opportunityAngles\":[\"\"],"
     "\"debatePoints\":[\"\"],\"commentSignals\":[\"\"]}],"
-    "\"excludedStoryIds\":[123],\"exclusionReasons\":{\"123\":\"\"}}."
+    "\"excludedStoryIds\":[123],"
+    "\"exclusionReasons\":[{\"storyId\":123,\"reason\":\"\"}]}."
 )
 
 
@@ -240,9 +241,143 @@ INSIGHTS_EVIDENCE_MAX_TOKENS = 12288
 INSIGHTS_TOPIC_SCOUT_MAX_TOKENS = 6144
 
 
-_JSON_OBJECT_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": True,
+def _strict_object(properties: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": dict(properties),
+        "required": list(properties.keys()),
+        "additionalProperties": False,
+    }
+
+
+def _array_of(items: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "type": "array",
+        "items": dict(items),
+    }
+
+
+_STRING_SCHEMA: Dict[str, Any] = {"type": "string"}
+_INTEGER_SCHEMA: Dict[str, Any] = {"type": "integer"}
+
+_EVIDENCE_CARD_SCHEMA = _strict_object(
+    {
+        "topicKey": _STRING_SCHEMA,
+        "topic": _STRING_SCHEMA,
+        "storyIds": _array_of(_INTEGER_SCHEMA),
+        "synthesis": _STRING_SCHEMA,
+        "painPoints": _array_of(_STRING_SCHEMA),
+        "opportunityAngles": _array_of(_STRING_SCHEMA),
+        "debatePoints": _array_of(_STRING_SCHEMA),
+        "commentSignals": _array_of(_STRING_SCHEMA),
+    }
+)
+_EVIDENCE_EXCLUSION_REASON_SCHEMA = _strict_object(
+    {
+        "storyId": _INTEGER_SCHEMA,
+        "reason": _STRING_SCHEMA,
+    }
+)
+_TOPIC_SCOUT_SELECTED_SCHEMA = _strict_object(
+    {
+        "topicKey": _STRING_SCHEMA,
+        "reason": _STRING_SCHEMA,
+        "routes": _array_of(_STRING_SCHEMA),
+    }
+)
+_TOPIC_SCOUT_EXCLUDED_SCHEMA = _strict_object(
+    {
+        "topicKey": _STRING_SCHEMA,
+        "reason": _STRING_SCHEMA,
+    }
+)
+_SIGNAL_SCHEMA = _strict_object(
+    {
+        "id": _STRING_SCHEMA,
+        "label": _STRING_SCHEMA,
+        "title": _STRING_SCHEMA,
+        "brief": _STRING_SCHEMA,
+        "trend": _STRING_SCHEMA,
+        "tone": _STRING_SCHEMA,
+    }
+)
+_TREND_ITEM_SCHEMA = _strict_object(
+    {
+        "topic": _STRING_SCHEMA,
+        "heat": _INTEGER_SCHEMA,
+        "deltaText": _STRING_SCHEMA,
+        "trendKey": _STRING_SCHEMA,
+    }
+)
+_OPPORTUNITY_SCHEMA = _strict_object(
+    {
+        "rank": _INTEGER_SCHEMA,
+        "rankText": _STRING_SCHEMA,
+        "title": _STRING_SCHEMA,
+        "score": _INTEGER_SCHEMA,
+        "category": _STRING_SCHEMA,
+        "audience": _array_of(_STRING_SCHEMA),
+        "thesis": _STRING_SCHEMA,
+        "whyNow": _STRING_SCHEMA,
+        "risk": _STRING_SCHEMA,
+        "linkedStoryIds": _array_of(_INTEGER_SCHEMA),
+    }
+)
+_DEBATE_SCHEMA = _strict_object(
+    {
+        "topic": _STRING_SCHEMA,
+        "verdict": _STRING_SCHEMA,
+        "intensity": _INTEGER_SCHEMA,
+        "supportWidth": _INTEGER_SCHEMA,
+        "opposeWidth": _INTEGER_SCHEMA,
+        "support": _STRING_SCHEMA,
+        "oppose": _STRING_SCHEMA,
+        "watch": _STRING_SCHEMA,
+    }
+)
+
+_INSIGHTS_OUTPUT_SCHEMAS: Dict[str, Dict[str, Any]] = {
+    "insights-evidence": _strict_object(
+        {
+            "evidenceCards": _array_of(_EVIDENCE_CARD_SCHEMA),
+            "excludedStoryIds": _array_of(_INTEGER_SCHEMA),
+            "exclusionReasons": _array_of(_EVIDENCE_EXCLUSION_REASON_SCHEMA),
+        }
+    ),
+    "insights-topic-scout": _strict_object(
+        {
+            "selectedTopics": _array_of(_TOPIC_SCOUT_SELECTED_SCHEMA),
+            "excludedTopics": _array_of(_TOPIC_SCOUT_EXCLUDED_SCHEMA),
+        }
+    ),
+    "insights-signals": _strict_object(
+        {
+            "headline": _STRING_SCHEMA,
+            "summary": _STRING_SCHEMA,
+            "signals": _array_of(_SIGNAL_SCHEMA),
+        }
+    ),
+    "insights-trends": _strict_object(
+        {
+            "trendHeatmap": _strict_object(
+                {
+                    "title": _STRING_SCHEMA,
+                    "note": _STRING_SCHEMA,
+                    "items": _array_of(_TREND_ITEM_SCHEMA),
+                }
+            )
+        }
+    ),
+    "insights-opportunities": _strict_object(
+        {
+            "opportunities": _array_of(_OPPORTUNITY_SCHEMA),
+        }
+    ),
+    "insights-debates": _strict_object(
+        {
+            "debates": _array_of(_DEBATE_SCHEMA),
+        }
+    ),
 }
 
 
@@ -294,6 +429,27 @@ def _allowed_story_ids_from_payload(payload: Mapping[str, Any]) -> set[int]:
             if isinstance(item, dict):
                 allowed.update(_candidate_story_ids(item))
     return allowed
+
+
+def _normalize_exclusion_reasons(value: Any) -> Dict[str, str]:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _clean_text(reason)
+            for key, reason in value.items()
+            if _clean_text(reason)
+        }
+    out: Dict[str, str] = {}
+    for item in _as_list(value):
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            sid = int(item.get("storyId"))
+        except (TypeError, ValueError):
+            continue
+        reason = _clean_text(item.get("reason"))
+        if reason:
+            out[str(sid)] = reason
+    return out
 
 
 def _fallback_topic_key(index: int) -> str:
@@ -452,11 +608,14 @@ class CodexFirstInsightsAiClient:
             separators=(",", ":"),
         )
         try:
+            output_schema = _INSIGHTS_OUTPUT_SCHEMAS.get(purpose)
+            if output_schema is None:
+                raise CodexCliError(f"no Codex output schema for insights purpose {purpose!r}")
             return self.codex_client.complete_json(
                 purpose=purpose,
                 system_prompt=system_prompt,
                 user_content=user_content,
-                output_schema=_JSON_OBJECT_SCHEMA,
+                output_schema=output_schema,
             )
         except (CodexCliError, OSError, ValueError) as exc:
             # Keep the existing OpenAI-compatible flow intact; Codex failure
@@ -589,10 +748,7 @@ class EvidenceAgent:
             for sid in _unique_ints(_as_list(data.get("excludedStoryIds")))
             if sid in input_ids and sid not in assigned
         ]
-        exclusion_reasons_raw = data.get("exclusionReasons")
-        exclusion_reasons = (
-            exclusion_reasons_raw if isinstance(exclusion_reasons_raw, dict) else {}
-        )
+        exclusion_reasons = _normalize_exclusion_reasons(data.get("exclusionReasons"))
         missing_ids = sorted(input_ids - assigned - set(excluded_ids))
         if missing_ids:
             out_cards.append(
@@ -608,8 +764,7 @@ class EvidenceAgent:
             "evidenceCards": out_cards,
             "excludedStoryIds": excluded_ids,
             "exclusionReasons": {
-                str(sid): _clean_text(exclusion_reasons.get(str(sid)) or exclusion_reasons.get(sid))
-                or "素材信号不足"
+                str(sid): exclusion_reasons.get(str(sid)) or "素材信号不足"
                 for sid in excluded_ids
             },
             "coverage": {

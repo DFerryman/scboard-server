@@ -3172,6 +3172,38 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertGreaterEqual(insights_agents.INSIGHTS_OPPORTUNITIES_MAX_TOKENS, 8192)
         self.assertGreaterEqual(insights_agents.INSIGHTS_DEBATES_MAX_TOKENS, 6144)
 
+    def test_insights_codex_output_schemas_are_strict_response_format_compatible(self):
+        from . import insights_agents
+
+        def assert_strict_objects(schema):
+            if not isinstance(schema, dict):
+                return
+            if schema.get("type") == "object":
+                properties = schema.get("properties") or {}
+                self.assertEqual(
+                    set(schema.get("required") or []),
+                    set(properties.keys()),
+                )
+                self.assertFalse(schema.get("additionalProperties", True))
+                for child in properties.values():
+                    assert_strict_objects(child)
+            if schema.get("type") == "array":
+                assert_strict_objects(schema.get("items"))
+
+        self.assertEqual(
+            set(insights_agents._INSIGHTS_OUTPUT_SCHEMAS.keys()),
+            {
+                "insights-evidence",
+                "insights-topic-scout",
+                "insights-signals",
+                "insights-trends",
+                "insights-opportunities",
+                "insights-debates",
+            },
+        )
+        for schema in insights_agents._INSIGHTS_OUTPUT_SCHEMAS.values():
+            assert_strict_objects(schema)
+
     def test_insights_runner_routes_compression_agents_to_cheaper_client(self):
         from .insights_agents import InsightsAgentRunner
 
@@ -3300,6 +3332,10 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(
             json.loads(codex.calls[0]["user_content"]),
             payload,
+        )
+        self.assertEqual(
+            codex.calls[0]["output_schema"],
+            insights_agents._INSIGHTS_OUTPUT_SCHEMAS["insights-signals"],
         )
 
         class FailingCodex(FakeCodex):
@@ -4096,6 +4132,40 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(card["opportunityAngles"], [long_angle])
         self.assertEqual(card["debatePoints"], [long_debate])
         self.assertEqual(card["commentSignals"], [long_signal])
+
+    def test_evidence_agent_accepts_strict_schema_exclusion_reason_array(self):
+        from .insights_agents import EvidenceAgent
+
+        agent = object.__new__(EvidenceAgent)
+        out = agent.validate(
+            {
+                "evidenceCards": [
+                    {
+                        "topicKey": "kept",
+                        "topic": "Kept",
+                        "storyIds": [101],
+                        "synthesis": "summary",
+                        "painPoints": [],
+                        "opportunityAngles": [],
+                        "debatePoints": [],
+                        "commentSignals": [],
+                    }
+                ],
+                "excludedStoryIds": [102],
+                "exclusionReasons": [
+                    {"storyId": 102, "reason": "off topic"},
+                ],
+            },
+            {
+                "stories": [
+                    {"id": 101, "topicName": "Kept"},
+                    {"id": 102, "topicName": "Other"},
+                ]
+            },
+        )
+
+        self.assertEqual(out["excludedStoryIds"], [102])
+        self.assertEqual(out["exclusionReasons"], {"102": "off topic"})
 
     def test_topic_scout_agent_accounts_for_unmentioned_cards(self):
         from .insights_agents import TopicScoutAgent
