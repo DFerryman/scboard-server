@@ -13,7 +13,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Any, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 try:
     from zoneinfo import ZoneInfo
@@ -32,7 +32,10 @@ from .schemas import (
 from .topics import (
     DEFAULT_TOPIC_ID,
     DEFAULT_TOPIC_NAME,
+    fixed_topic_entries,
+    legacy_topic_id,
     normalize_topic,
+    resolve_fixed_topic,
     topic_name_from_id,
 )
 
@@ -292,6 +295,20 @@ def _coerce_terms(data: Any) -> List[Term]:
     return out
 
 
+def _row_optional(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+    try:
+        return row[key]
+    except (IndexError, KeyError, TypeError):
+        return default
+
+
+def _story_topic_id(topic: object, topic_name: object = "") -> str:
+    fixed = resolve_fixed_topic(topic=topic, topic_name=topic_name)
+    if fixed:
+        return fixed[0]
+    return legacy_topic_id(topic) or DEFAULT_TOPIC_ID
+
+
 def row_to_story(row: sqlite3.Row, feed: Optional[str] = None) -> Story:
     enriched_at = row["enriched_at"]
     use_enriched_snapshot = (
@@ -314,7 +331,10 @@ def row_to_story(row: sqlite3.Row, feed: Optional[str] = None) -> Story:
         descendants = row["descendants"]
         hn_time = row["hn_time"]
     title_zh = row["title_zh"] or title_en
-    topic = row["topic"] or DEFAULT_TOPIC_ID
+    topic = _story_topic_id(
+        row["topic"] or DEFAULT_TOPIC_ID,
+        _row_optional(row, "topic_name", ""),
+    )
 
     return Story(
         id=row["id"],
@@ -343,25 +363,11 @@ def row_to_story(row: sqlite3.Row, feed: Optional[str] = None) -> Story:
 def list_known_topics(
     conn: sqlite3.Connection, *, limit: Optional[int] = None
 ) -> List[TopicEntry]:
-    """Return the current dynamic taxonomy, including temporarily empty topics."""
-    limit_clause = ""
-    params: Tuple[Any, ...] = ()
+    """Return the server-owned fixed taxonomy."""
+    entries = list(fixed_topic_entries())
     if limit is not None:
-        limit_clause = "LIMIT ?"
-        params = (max(0, int(limit)),)
-    rows = conn.execute(
-        f"""
-        SELECT id, name
-        FROM topics
-        ORDER BY last_seen_at DESC, updated_at DESC, id ASC
-        {limit_clause}
-        """,
-        params,
-    ).fetchall()
-    return [
-        TopicEntry(id=str(r["id"] or DEFAULT_TOPIC_ID), name=str(r["name"] or ""), count=0)
-        for r in rows
-    ]
+        entries = entries[: max(0, int(limit))]
+    return entries
 
 def ensure_topic(
     conn: sqlite3.Connection,
@@ -370,18 +376,12 @@ def ensure_topic(
     *,
     seen_at: Optional[int] = None,
 ) -> TopicEntry:
-    max_topics = max(1, int(settings.TOPIC_MAX_ACTIVE_TOPICS))
-    known_topics = list_known_topics(conn, limit=max_topics)
     normalized_id, normalized_name = normalize_topic(
         topic=topic_id,
         topic_id=topic_id,
         topic_name=name,
-        existing_topics=known_topics,
+        strict=True,
     )
-    known_by_id = {t.id: t for t in known_topics}
-    if normalized_id not in known_by_id and len(known_topics) >= max_topics:
-        fallback = known_topics[0]
-        normalized_id, normalized_name = fallback.id, fallback.name
     now = now_seconds()
     last_seen = int(seen_at if seen_at is not None else now)
     conn.execute(
@@ -399,13 +399,9 @@ def ensure_topic(
 
 
 def list_topics(conn: sqlite3.Connection, *, limit: Optional[int] = None) -> List[TopicEntry]:
-    effective_limit = (
-        settings.TOPIC_MAX_ACTIVE_TOPICS if limit is None else max(0, int(limit))
-    )
-    limit_clause = "LIMIT ?"
-    params: Tuple[Any, ...] = (max(0, int(effective_limit)),)
+    effective_limit = None if limit is None else max(0, int(limit))
     rows = conn.execute(
-        f"""
+        """
         SELECT
             s.topic AS id,
             COALESCE(t.name, '') AS name,
@@ -418,19 +414,45 @@ def list_topics(conn: sqlite3.Connection, *, limit: Optional[int] = None) -> Lis
           AND COALESCE(s.topic, '') != ''
         GROUP BY s.topic, t.name
         HAVING c > 0
-        ORDER BY c DESC, last_seen DESC, id ASC
-        {limit_clause}
         """,
-        params,
     ).fetchall()
-    out: List[TopicEntry] = []
+    buckets: Dict[str, Dict[str, int]] = {}
     for row in rows:
-        topic_id = str(row["id"] or DEFAULT_TOPIC_ID)
-        name = str(row["name"] or "")
-        if not name:
-            name = DEFAULT_TOPIC_NAME if topic_id == DEFAULT_TOPIC_ID else topic_name_from_id(topic_id)
-        out.append(TopicEntry(id=topic_id, name=name, count=int(row["c"] or 0)))
-    return out
+        fixed_topic = resolve_fixed_topic(
+            topic=row["id"],
+            topic_name=row["name"],
+        )
+        if not fixed_topic:
+            continue
+        topic_id, _topic_name = fixed_topic
+        bucket = buckets.setdefault(
+            topic_id,
+            {"count": 0, "last_seen": 0},
+        )
+        bucket["count"] += int(row["c"] or 0)
+        bucket["last_seen"] = max(
+            bucket["last_seen"],
+            int(row["last_seen"] or 0),
+        )
+    out = [
+        TopicEntry(
+            id=topic_id,
+            name=topic_name_from_id(topic_id),
+            count=int(bucket["count"]),
+        )
+        for topic_id, bucket in buckets.items()
+        if int(bucket["count"]) > 0
+    ]
+    out.sort(
+        key=lambda entry: (
+            -entry.count,
+            -int(buckets[entry.id]["last_seen"]),
+            entry.id,
+        )
+    )
+    if effective_limit is None:
+        return out
+    return out[: max(0, int(effective_limit))]
 
 
 def list_active_topics(
@@ -438,12 +460,20 @@ def list_active_topics(
     *,
     limit: int = 30,
 ) -> List[TopicEntry]:
-    return list_topics(conn, limit=min(max(1, int(limit)), settings.TOPIC_MAX_ACTIVE_TOPICS))
+    counts = {entry.id: entry.count for entry in list_topics(conn, limit=None)}
+    entries = [
+        TopicEntry(id=entry.id, name=entry.name, count=int(counts.get(entry.id, 0)))
+        for entry in fixed_topic_entries()
+    ]
+    return entries[: max(1, int(limit))]
 
 
 def get_story(conn: sqlite3.Connection, story_id: int) -> Optional[Story]:
     row = conn.execute(
-        "SELECT * FROM stories WHERE id=? AND enrich_status='done'",
+        "SELECT s.*, COALESCE(t.name, '') AS topic_name "
+        "FROM stories s "
+        "LEFT JOIN topics t ON t.id=s.topic "
+        "WHERE s.id=? AND s.enrich_status='done'",
         (story_id,),
     ).fetchone()
     if not row:
@@ -463,8 +493,9 @@ def list_feed_stories(
     ).fetchone()
     total = int(total_row["c"]) if total_row else 0
     rows = conn.execute(
-        "SELECT s.* FROM rankings r "
+        "SELECT s.*, COALESCE(t.name, '') AS topic_name FROM rankings r "
         "JOIN stories s ON s.id=r.story_id "
+        "LEFT JOIN topics t ON t.id=s.topic "
         "WHERE r.feed=? AND s.enrich_status='done' "
         "ORDER BY r.rank ASC "
         "LIMIT ? OFFSET ?",
@@ -475,26 +506,59 @@ def list_feed_stories(
     return stories, total, has_more
 
 
+def source_topic_ids_for_canonical(
+    conn: sqlite3.Connection,
+    topic_id: str,
+) -> List[str]:
+    fixed_topic = resolve_fixed_topic(topic=topic_id, topic_id=topic_id)
+    if not fixed_topic:
+        return []
+    canonical_id, _ = fixed_topic
+    rows = conn.execute(
+        """
+        SELECT DISTINCT s.topic AS id, COALESCE(t.name, '') AS name
+        FROM stories s
+        LEFT JOIN topics t ON t.id=s.topic
+        WHERE s.enrich_status='done'
+          AND COALESCE(s.topic, '') != ''
+          AND EXISTS (SELECT 1 FROM rankings r WHERE r.story_id=s.id)
+        """
+    ).fetchall()
+    source_ids: set[str] = set()
+    for row in rows:
+        fixed = resolve_fixed_topic(topic=row["id"], topic_name=row["name"])
+        if fixed and fixed[0] == canonical_id:
+            source_id = str(row["id"] or "").strip()
+            if source_id:
+                source_ids.add(source_id)
+    return sorted(source_ids)
+
+
 def list_topic_stories(
     conn: sqlite3.Connection, topic_id: str, page: int, page_size: int
 ) -> Tuple[List[Story], int, bool]:
     offset = (page - 1) * page_size
+    source_topic_ids = source_topic_ids_for_canonical(conn, topic_id)
+    if not source_topic_ids:
+        return [], 0, False
+    placeholders = ",".join("?" * len(source_topic_ids))
     total_row = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) AS c
         FROM stories s
-        WHERE s.topic=?
+        WHERE s.topic IN ({placeholders})
           AND s.enrich_status='done'
           AND EXISTS (SELECT 1 FROM rankings r WHERE r.story_id=s.id)
         """,
-        (topic_id,),
+        source_topic_ids,
     ).fetchone()
     total = int(total_row["c"]) if total_row else 0
     rows = conn.execute(
-        """
-        SELECT s.*
+        f"""
+        SELECT s.*, COALESCE(t.name, '') AS topic_name
         FROM stories s
-        WHERE s.topic=?
+        LEFT JOIN topics t ON t.id=s.topic
+        WHERE s.topic IN ({placeholders})
           AND s.enrich_status='done'
           AND EXISTS (SELECT 1 FROM rankings r WHERE r.story_id=s.id)
         ORDER BY
@@ -509,7 +573,7 @@ def list_topic_stories(
           s.id ASC
         LIMIT ? OFFSET ?
         """,
-        (topic_id, page_size, offset),
+        [*source_topic_ids, page_size, offset],
     ).fetchall()
     stories = [row_to_story(r) for r in rows]
     has_more = offset + len(rows) < total
@@ -517,15 +581,19 @@ def list_topic_stories(
 
 
 def topic_count(conn: sqlite3.Connection, topic_id: str) -> int:
+    source_topic_ids = source_topic_ids_for_canonical(conn, topic_id)
+    if not source_topic_ids:
+        return 0
+    placeholders = ",".join("?" * len(source_topic_ids))
     row = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) AS c
         FROM stories s
-        WHERE s.topic=?
+        WHERE s.topic IN ({placeholders})
           AND s.enrich_status='done'
           AND EXISTS (SELECT 1 FROM rankings r WHERE r.story_id=s.id)
         """,
-        (topic_id,),
+        source_topic_ids,
     ).fetchone()
     return int(row["c"]) if row else 0
 
@@ -574,8 +642,11 @@ def stories_by_ids(
         return []
     with id_in_clause(conn, story_ids) as (clause, params):
         return conn.execute(
-            f"SELECT * FROM stories WHERE id {clause} "
-            "AND enrich_status='done'",
+            f"SELECT s.*, COALESCE(t.name, '') AS topic_name "
+            f"FROM stories s "
+            f"LEFT JOIN topics t ON t.id=s.topic "
+            f"WHERE s.id {clause} "
+            "AND s.enrich_status='done'",
             tuple(params),
         ).fetchall()
 
@@ -2617,6 +2688,7 @@ __all__ = [
     "list_active_topics",
     "get_story",
     "list_feed_stories",
+    "source_topic_ids_for_canonical",
     "list_topic_stories",
     "topic_count",
     "latest_digest_row",

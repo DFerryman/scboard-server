@@ -46,6 +46,7 @@ from .digest import run_digester_once
 from .ingest import run_enricher_once, run_fetcher_once, run_ingest_round
 from .normalizer import derive_kind, extract_domain, normalize_item
 from .schemas import StoryType, TopicEntry
+from .topics import topic_id_set, topic_name_from_id
 
 
 VALID_CLOUD_PUSH_SECRET = "a" * 64
@@ -1173,12 +1174,27 @@ class EmptyDbContract(_SqliteCase):
         body = _h_topics()
         self.assertEqual(body.list, [])
 
-    def test_topics_list_only_dynamic_topics_with_visible_stories(self):
+    def test_active_topic_catalog_ignores_legacy_dynamic_cap(self):
+        old = settings.TOPIC_MAX_ACTIVE_TOPICS
+        try:
+            settings.TOPIC_MAX_ACTIVE_TOPICS = 2  # type: ignore[assignment]
+            conn = db.connect()
+            try:
+                entries = repository.list_active_topics(conn)
+            finally:
+                conn.close()
+        finally:
+            settings.TOPIC_MAX_ACTIVE_TOPICS = old  # type: ignore[assignment]
+
+        self.assertEqual({entry.id for entry in entries}, topic_id_set())
+        self.assertEqual(len(entries), len(topic_id_set()))
+
+    def test_topics_list_only_fixed_topics_with_visible_stories(self):
         now = repository.now_seconds()
         conn = db.connect()
         try:
             with db.transaction(conn):
-                repository.ensure_topic(conn, "empty-topic", "空主题")
+                repository.ensure_topic(conn, "security", "安全 / 隐私")
                 conn.execute(
                     """
                     INSERT INTO stories(
@@ -1217,8 +1233,80 @@ class EmptyDbContract(_SqliteCase):
         body = _h_topics()
         self.assertEqual(
             [(entry.id, entry.name, entry.count) for entry in body.list],
-            [("ai-tools", "AI 工具", 1)],
+            [("ai-devtools", "AI 编程工具", 1)],
         )
+
+    def test_unmapped_legacy_topic_is_not_counted_as_general(self):
+        now = repository.now_seconds()
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                conn.execute(
+                    """
+                    INSERT INTO topics(id, name, created_at, updated_at, last_seen_at)
+                    VALUES('legacy-ai-bucket', ?, ?, ?, ?)
+                    """,
+                    ("AI \u5de5\u5177", now, now, now),
+                )
+                rows = [
+                    (301, "Legacy unmapped", "topic-unmapped-legacy", 2, 1700000301),
+                    (302, "Legacy alias", "ai-tools", 1, 1700000302),
+                    (303, "Legacy named alias", "legacy-ai-bucket", 3, 1700000303),
+                ]
+                for story_id, title, topic, rank, hn_time in rows:
+                    conn.execute(
+                        """
+                        INSERT INTO stories(
+                            id, kind, title_en, title_zh, url, domain, by,
+                            score, descendants, hn_time,
+                            topic, ai_summary, discussion_themes, insights, terms,
+                            enrich_status, fetched_at, last_seen_at, enriched_at
+                        ) VALUES(
+                            ?, 'story', ?, ?, ?, 'x', 'x',
+                            42, 0, ?,
+                            ?, '', '[]', '[]', '[]',
+                            'done', ?, ?, ?
+                        )
+                        """,
+                        (
+                            story_id,
+                            title,
+                            title,
+                            f"https://x/{story_id}",
+                            hn_time,
+                            topic,
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO rankings(feed, rank, story_id, refreshed_at)
+                        VALUES('top', ?, ?, ?)
+                        """,
+                        (rank, story_id, now),
+                    )
+        finally:
+            conn.close()
+
+        topics = _h_topics().list
+        self.assertEqual(
+            {entry.id: entry.count for entry in topics},
+            {"ai-devtools": 2},
+        )
+
+        general = _h_topic_stories("general", 1, 10)
+        self.assertEqual(general.total, 0)
+        self.assertEqual(general.list, [])
+
+        ai_devtools = _h_topic_stories("ai-devtools", 1, 10)
+        self.assertEqual(ai_devtools.total, 2)
+        self.assertEqual({story.id for story in ai_devtools.list}, {302, 303})
+
+        top = _h_stories(StoryType.TOP, 1, 10)
+        legacy = next(story for story in top.list if story.id == 301)
+        self.assertEqual(legacy.topic, "topic-unmapped-legacy")
 
     def test_topic_stories_counts_story_once_across_multiple_feeds(self):
         now = repository.now_seconds()
@@ -1321,61 +1409,43 @@ class EmptyDbContract(_SqliteCase):
             [(301, 100), (302, 90)],
         )
 
-    def test_topics_are_capped_and_overflow_reuses_existing_topic(self):
-        old = settings.TOPIC_MAX_ACTIVE_TOPICS
-        settings.TOPIC_MAX_ACTIVE_TOPICS = 2  # type: ignore[assignment]
+    def test_persistence_rejects_unknown_generated_topic(self):
         now = repository.now_seconds()
+        conn = db.connect()
         try:
-            conn = db.connect()
-            try:
-                with db.transaction(conn):
-                    for offset, topic in enumerate(("topic-a", "topic-b", "topic-c"), start=1):
-                        story_id = 700 + offset
-                        repository.insert_story_pending(
-                            conn,
-                            {
-                                "id": story_id,
-                                "kind": "story",
-                                "title_en": f"T{offset}",
-                                "title_zh": f"T{offset}",
-                                "url": f"https://x/{story_id}",
-                                "domain": "x",
-                                "by": "x",
-                                "score": offset,
-                                "descendants": 0,
-                                "hn_time": 1700000000 + offset,
-                                "raw_text": "",
-                                "raw_json": "{}",
-                                "fetched_at": now,
-                                "last_seen_at": now,
-                            },
-                        )
-                        repository.write_enriched_story(
-                            conn,
-                            story_id,
-                            title_zh=f"T{offset}",
-                            topic=topic,
-                            topic_name=f"Topic {offset}",
-                            ai_summary="",
-                            insights=[],
-                            terms=[],
-                        )
-                        conn.execute(
-                            """
-                            INSERT INTO rankings(feed, rank, story_id, refreshed_at)
-                            VALUES('top', ?, ?, ?)
-                            """,
-                            (offset, story_id, now),
-                        )
-            finally:
-                conn.close()
-
-            body = _h_topics()
+            with db.transaction(conn):
+                repository.insert_story_pending(
+                    conn,
+                    {
+                        "id": 701,
+                        "kind": "story",
+                        "title_en": "Generated topic",
+                        "title_zh": "Generated topic",
+                        "url": "https://x/701",
+                        "domain": "x",
+                        "by": "x",
+                        "score": 1,
+                        "descendants": 0,
+                        "hn_time": 1700000001,
+                        "raw_text": "",
+                        "raw_json": "{}",
+                        "fetched_at": now,
+                        "last_seen_at": now,
+                    },
+                )
+                with self.assertRaisesRegex(ValueError, "fixed topic"):
+                    repository.write_enriched_story(
+                        conn,
+                        701,
+                        title_zh="Generated topic",
+                        topic="topic-a",
+                        topic_name="Topic A",
+                        ai_summary="",
+                        insights=[],
+                        terms=[],
+                    )
         finally:
-            settings.TOPIC_MAX_ACTIVE_TOPICS = old  # type: ignore[assignment]
-
-        self.assertLessEqual(len(body.list), 2)
-        self.assertEqual(sum(entry.count for entry in body.list), 3)
+            conn.close()
 
     def test_digest_empty_db_returns_today(self):
         body = _h_digest(None)
@@ -2333,6 +2403,26 @@ class IngestRoundBehavior(_SqliteCase):
 
 
 class CloudSyncReadModel(_SqliteCase):
+    INSIGHTS_TEST_TOPICS = (
+        "ai",
+        "ai-devtools",
+        "devtools",
+        "programming",
+        "infra",
+        "database",
+        "security",
+        "web",
+        "opensource",
+        "hardware",
+        "policy",
+        "business",
+        "science-culture",
+        "general",
+    )
+
+    def _fixed_topic(self, offset: int) -> str:
+        return self.INSIGHTS_TEST_TOPICS[offset % len(self.INSIGHTS_TEST_TOPICS)]
+
     def _insert_done_story(
         self,
         conn,
@@ -2482,7 +2572,7 @@ class CloudSyncReadModel(_SqliteCase):
                         conn,
                         200 + offset,
                         start + offset * 60,
-                        topic=f"topic-{offset}",
+                        topic=self._fixed_topic(offset),
                         score=10 + offset,
                         descendants=1,
                     )
@@ -2638,7 +2728,7 @@ class CloudSyncReadModel(_SqliteCase):
                         conn,
                         400 + offset,
                         start + offset * 60,
-                        topic=f"topic-{offset}",
+                        topic=self._fixed_topic(offset),
                         score=10 + offset,
                         descendants=1,
                     )
@@ -2706,7 +2796,7 @@ class CloudSyncReadModel(_SqliteCase):
                         conn,
                         200 + offset,
                         start + offset * 60,
-                        topic=f"topic-{offset}",
+                        topic=self._fixed_topic(offset),
                         raw_text="RAW_TEXT_SHOULD_NOT_LEAK",
                     )
                     conn.execute(
@@ -2967,7 +3057,7 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertNotIn("Topic 2", trend_topics)
         self.assertGreaterEqual(len(trend_topics), insights.TREND_HEAT_MIN_TOPICS)
 
-    def test_trend_heat_uses_dynamic_topic_display_names(self):
+    def test_trend_heat_uses_fixed_topic_display_names(self):
         from . import insights
 
         target = "2026-05-19"
@@ -2978,7 +3068,7 @@ class CloudSyncReadModel(_SqliteCase):
                 conn.execute(
                     """
                     INSERT INTO topics(id, name, created_at, updated_at, last_seen_at)
-                    VALUES('topic-ai-coding', 'AI Coding', ?, ?, ?)
+                    VALUES('ai-devtools', 'AI Coding', ?, ?, ?)
                     """,
                     (start, start, start),
                 )
@@ -2986,7 +3076,7 @@ class CloudSyncReadModel(_SqliteCase):
                     conn,
                     101,
                     start,
-                    topic="topic-ai-coding",
+                    topic="ai-devtools",
                     score=120,
                     descendants=80,
                 )
@@ -3004,7 +3094,10 @@ class CloudSyncReadModel(_SqliteCase):
             conn.close()
 
         self.assertEqual(rows[0]["topic_name"], "AI Coding")
-        self.assertEqual(payload["topicDailyStats"][0]["topic"], "AI Coding")
+        self.assertEqual(
+            payload["topicDailyStats"][0]["topic"],
+            topic_name_from_id("ai-devtools"),
+        )
 
     def test_trend_heat_delta_tracks_activity_heat_not_story_count(self):
         from . import insights
@@ -3018,7 +3111,7 @@ class CloudSyncReadModel(_SqliteCase):
                 conn.execute(
                     """
                     INSERT INTO topics(id, name, created_at, updated_at, last_seen_at)
-                    VALUES('rising-topic', 'AI Coding', ?, ?, ?)
+                    VALUES('ai-devtools', 'AI Coding', ?, ?, ?)
                     """,
                     (start_ts, start_ts, start_ts),
                 )
@@ -3028,7 +3121,7 @@ class CloudSyncReadModel(_SqliteCase):
                         conn,
                         200 + offset,
                         day_start,
-                        topic="rising-topic",
+                        topic="ai-devtools",
                         score=18,
                         descendants=9,
                     )
@@ -3037,7 +3130,7 @@ class CloudSyncReadModel(_SqliteCase):
                     conn,
                     300,
                     today_start,
-                    topic="rising-topic",
+                    topic="ai-devtools",
                     score=180,
                     descendants=90,
                 )
@@ -3046,7 +3139,7 @@ class CloudSyncReadModel(_SqliteCase):
                         conn,
                         400 + offset,
                         today_start + offset + 1,
-                        topic=f"ordinary-topic-{offset}",
+                        topic=self._fixed_topic(offset + 2),
                         score=50,
                         descendants=9,
                     )
@@ -3064,7 +3157,8 @@ class CloudSyncReadModel(_SqliteCase):
             conn.close()
 
         item = next(
-            item for item in payload["topicDailyStats"] if item["topic"] == "AI Coding"
+            item for item in payload["topicDailyStats"]
+            if item["topic"] == topic_name_from_id("ai-devtools")
         )
         self.assertEqual(item["heat"], 100)
         self.assertEqual(item["previousHeat"], 78)
@@ -3572,7 +3666,7 @@ class CloudSyncReadModel(_SqliteCase):
                             conn,
                             300 + offset,
                             target_start + offset * 60,
-                            topic=f"topic-{offset}",
+                            topic=self._fixed_topic(3 if offset == 0 else offset),
                             score=1000 if offset == 0 else 120 + offset,
                             descendants=600 if offset == 0 else 60 + offset,
                             raw_text=long_raw_text if offset == 0 else "raw article text",
@@ -3785,7 +3879,7 @@ class CloudSyncReadModel(_SqliteCase):
                         conn,
                         700 + offset,
                         target_start + offset * 60,
-                        topic=f"topic-{offset}",
+                        topic=self._fixed_topic(offset),
                         score=120 + offset,
                         descendants=60 + offset,
                     )
@@ -3857,7 +3951,7 @@ class CloudSyncReadModel(_SqliteCase):
                         conn,
                         500 + offset,
                         target_start + offset * 60,
-                        topic=f"topic-{offset}",
+                        topic=self._fixed_topic(offset),
                         score=120 + offset,
                         descendants=60 + offset,
                     )
@@ -4015,7 +4109,7 @@ class CloudSyncReadModel(_SqliteCase):
                         conn,
                         400 + offset,
                         target_start + offset * 60,
-                        topic=f"topic-{offset}",
+                        topic=self._fixed_topic(offset),
                         score=120 + offset,
                         descendants=60 + offset,
                     )
@@ -4513,7 +4607,7 @@ class CloudSyncReadModel(_SqliteCase):
                     "_id": "1:database",
                     "id": "database",
                     "syncVersion": 1,
-                    "name": "数据库",
+                    "name": "数据库 / 存储",
                     "count": 1,
                 }
             ],
@@ -4522,6 +4616,62 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(digest_docs[0]["_id"], f"1:{digest_date}")
         self.assertEqual(digest_docs[0]["syncVersion"], 1)
         self.assertEqual([s["id"] for s in digest_docs[0]["stories"]], [101])
+
+    def test_build_read_model_does_not_publish_unmapped_legacy_topic_as_general(self):
+        from . import cloud_sync
+
+        now = repository.now_seconds()
+        hn_time = 1700000000
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "catalog_version", "3")
+                self._insert_done_story(
+                    conn,
+                    201,
+                    hn_time,
+                    topic="topic-unmapped-legacy",
+                    score=80,
+                    descendants=3,
+                )
+                self._insert_done_story(
+                    conn,
+                    202,
+                    hn_time + 1,
+                    topic="ai-tools",
+                    score=90,
+                    descendants=4,
+                )
+                repository.replace_feed_ranking(conn, "top", [202, 201])
+        finally:
+            conn.close()
+
+        out_dir = Path(self.tmpdir) / "legacy-topic-read-model"
+        stats = cloud_sync.build_read_model(out_dir, include_dashboard=False)
+        story_docs = [
+            json.loads(line)
+            for line in (out_dir / "stories.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+        topic_docs = [
+            json.loads(line)
+            for line in (out_dir / "topics.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+
+        self.assertEqual(stats["stories"], 2)
+        self.assertEqual(stats["topics"], 1)
+        self.assertEqual(
+            [(doc["id"], doc["count"]) for doc in topic_docs],
+            [("ai-devtools", 1)],
+        )
+        stories_by_id = {doc["id"]: doc for doc in story_docs}
+        self.assertEqual(stories_by_id[201]["topic"], "topic-unmapped-legacy")
+        self.assertEqual(stories_by_id[202]["topic"], "ai-devtools")
 
     def test_cloud_sync_diff_uses_ai_ready_read_model_contract(self):
         from . import cloud_sync, cloud_sync_diff
@@ -4714,7 +4864,7 @@ class EnricherBehavior(_SqliteCase):
         )
         self.assertEqual([i.author for i in body.story.insights], ["u1", "u2"])
 
-    def test_enricher_passes_active_topics_and_writes_dynamic_topic(self):
+    def test_enricher_passes_fixed_topics_and_writes_canonical_topic(self):
         self._seed()
         now = repository.now_seconds()
         conn = db.connect()
@@ -4730,7 +4880,7 @@ class EnricherBehavior(_SqliteCase):
         finally:
             conn.close()
 
-        class DynamicTopicAgent:
+        class FixedTopicAgent:
             def __init__(self):
                 self.seen_catalogs = []
 
@@ -4748,15 +4898,15 @@ class EnricherBehavior(_SqliteCase):
             def write_digest_intro(self, *_):
                 return ""
 
-        agent = DynamicTopicAgent()
+        agent = FixedTopicAgent()
         summary = run_enricher_once(client=_FakeHn({}, {}), ai_agent=agent)
 
         self.assertEqual(summary["done"], 1)
-        self.assertEqual(agent.seen_catalogs, [[]])
+        self.assertIn("ai-devtools", {t.id for t in agent.seen_catalogs[0]})
         body = _h_topics()
         self.assertEqual(
             [(entry.id, entry.name, entry.count) for entry in body.list],
-            [("ai-tools", "AI 工具", 1)],
+            [("ai-devtools", "AI 编程工具", 1)],
         )
 
     def test_failing_agent_retries_then_marks_failed(self):
@@ -5743,16 +5893,14 @@ class EnricherBehavior(_SqliteCase):
                             "message": {
                                 "content": json.dumps(
                                     {
-                                        "results": [
-                                            {
-                                                "id": 101,
-                                                "titleZh": "ZH101",
-                                                "topic": "web",
-                                                "aiSummary": "S101",
-                                                "insights": [],
-                                                "terms": [],
-                                            }
-                                        ]
+                                        "titleZh": "ZH101",
+                                        "topicId": "web",
+                                        "topic": "web",
+                                        "topicName": "Web / 互联网",
+                                        "aiSummary": "S101",
+                                        "discussionThemes": [],
+                                        "insights": [],
+                                        "terms": [],
                                     }
                                 )
                             }
@@ -6150,15 +6298,68 @@ class AiUsageSummary(unittest.TestCase):
 # ---------- AI output validation (P3) ----------
 
 class AiValidation(unittest.TestCase):
+    def test_fixed_topic_catalog_is_the_only_valid_topic_source(self):
+        topic_ids = topic_id_set()
+        self.assertIn("ai", topic_ids)
+        self.assertIn("ai-devtools", topic_ids)
+        self.assertIn("security", topic_ids)
+        self.assertIn("general", topic_ids)
+        self.assertNotIn("topic-ab238e3409", topic_ids)
+        self.assertEqual(topic_name_from_id("security"), "安全 / 隐私")
+
+    def test_story_output_schema_constrains_topic_id_to_fixed_catalog(self):
+        topic_id_schema = ai_agent_module._STORY_OUTPUT_SCHEMA["properties"]["topicId"]
+        self.assertEqual(topic_id_schema["type"], "string")
+        self.assertEqual(set(topic_id_schema["enum"]), topic_id_set())
+        batch_topic_id_schema = (
+            ai_agent_module._BATCH_ENRICH_OUTPUT_SCHEMA["properties"]["results"]
+            ["items"]["properties"]["topicId"]
+        )
+        self.assertEqual(batch_topic_id_schema, topic_id_schema)
+
+    def test_strict_ai_output_rejects_generated_topic_id(self):
+        with self.assertRaisesRegex(ValueError, "fixed topic"):
+            validate_ai_output(
+                {"topicId": "network-security", "topicName": "网络安全"},
+                fallback_title="t",
+                strict_topic=True,
+            )
+
+    def test_strict_ai_output_reuses_fixed_topic_id_without_dynamic_catalog(self):
+        out = validate_ai_output(
+            {"topicId": "security", "topicName": "网络安全"},
+            fallback_title="t",
+            strict_topic=True,
+        )
+        self.assertEqual(out["topic"], "security")
+        self.assertEqual(out["topicName"], "安全 / 隐私")
+
+    def test_full_topic_cap_does_not_reassign_generated_topic_to_first_entry(self):
+        old = settings.TOPIC_MAX_ACTIVE_TOPICS
+        try:
+            settings.TOPIC_MAX_ACTIVE_TOPICS = 2  # type: ignore[assignment]
+            with self.assertRaisesRegex(ValueError, "fixed topic"):
+                validate_ai_output(
+                    {"topicName": "编译器实现"},
+                    fallback_title="t",
+                    existing_topics=[
+                        TopicEntry(id="ai", name="AI / 大模型", count=4),
+                        TopicEntry(id="security", name="安全 / 隐私", count=2),
+                    ],
+                    strict_topic=True,
+                )
+        finally:
+            settings.TOPIC_MAX_ACTIVE_TOPICS = old  # type: ignore[assignment]
+
     def test_blank_topic_falls_back_to_general(self):
         out = validate_ai_output({"topicName": ""}, fallback_title="t")
         self.assertEqual(out["topic"], "general")
-        self.assertEqual(out["topicName"], "综合技术")
+        self.assertEqual(out["topicName"], "综合 / 其他")
 
-    def test_dynamic_topic_name_creates_topic_id(self):
+    def test_known_topic_name_maps_to_fixed_topic_id(self):
         out = validate_ai_output({"topicName": "AI 工具"}, fallback_title="t")
-        self.assertEqual(out["topicName"], "AI 工具")
-        self.assertTrue(out["topic"].startswith("topic-"))
+        self.assertEqual(out["topic"], "ai-devtools")
+        self.assertEqual(out["topicName"], "AI 编程工具")
 
     def test_existing_topic_id_is_reused(self):
         out = validate_ai_output(
@@ -6167,9 +6368,9 @@ class AiValidation(unittest.TestCase):
             existing_topics=[TopicEntry(id="security", name="安全", count=3)],
         )
         self.assertEqual(out["topic"], "security")
-        self.assertEqual(out["topicName"], "安全")
+        self.assertEqual(out["topicName"], "安全 / 隐私")
 
-    def test_new_topic_is_blocked_when_topic_cap_is_full(self):
+    def test_generated_topic_name_falls_back_to_general_when_not_strict(self):
         old = settings.TOPIC_MAX_ACTIVE_TOPICS
         try:
             settings.TOPIC_MAX_ACTIVE_TOPICS = 2  # type: ignore[assignment]
@@ -6183,11 +6384,12 @@ class AiValidation(unittest.TestCase):
             )
         finally:
             settings.TOPIC_MAX_ACTIVE_TOPICS = old  # type: ignore[assignment]
-        self.assertEqual(out["topic"], "ai-tools")
-        self.assertEqual(out["topicName"], "AI 工具")
+        self.assertEqual(out["topic"], "general")
+        self.assertEqual(out["topicName"], "综合 / 其他")
 
-    def test_prompt_describes_dynamic_topic_rules(self):
-        self.assertIn("dynamic and content-based", ai_agent_module._SYSTEM_PROMPT)
+    def test_prompt_describes_fixed_topic_rules(self):
+        self.assertIn("fixed topic catalog", ai_agent_module._SYSTEM_PROMPT)
+        self.assertIn("Do NOT create", ai_agent_module._SYSTEM_PROMPT)
         self.assertIn("Hacker News feed", ai_agent_module._SYSTEM_PROMPT)
 
     def test_term_def_alias_normalized(self):
@@ -6369,6 +6571,7 @@ class RealAiAgentFailover(unittest.TestCase):
                                 "content": json.dumps(
                                     {
                                         "titleZh": "title",
+                                        "topicId": "general",
                                         "topicName": "General",
                                         "aiSummary": "summary",
                                         "discussionThemes": [],
@@ -8191,6 +8394,7 @@ class CodexFirstAiAgentTests(unittest.TestCase):
                 self.calls.append(kwargs)
                 return {
                     "titleZh": "中文标题",
+                    "topicId": "web",
                     "topicName": "综合技术",
                     "aiSummary": "摘要",
                     "discussionThemes": [],
@@ -8293,6 +8497,7 @@ class CodexFirstAiAgentTests(unittest.TestCase):
                         {
                             "id": 101,
                             "titleZh": "标题 A",
+                            "topicId": "web",
                             "topicName": "综合技术",
                             "aiSummary": "摘要 A",
                             "discussionThemes": [],
@@ -8928,6 +9133,7 @@ class RealAiAgentBatchAndSelection(unittest.TestCase):
                                             {
                                                 "id": 101,
                                                 "titleZh": "A",
+                                                "topicId": "general",
                                                 "topicName": "General",
                                                 "aiSummary": "summary A",
                                                 "discussionThemes": [],
@@ -8937,6 +9143,7 @@ class RealAiAgentBatchAndSelection(unittest.TestCase):
                                             {
                                                 "id": 102,
                                                 "titleZh": "B",
+                                                "topicId": "general",
                                                 "topicName": "General",
                                                 "aiSummary": "summary B",
                                                 "discussionThemes": [],

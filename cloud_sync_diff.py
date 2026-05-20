@@ -108,9 +108,10 @@ def _expected_feed_stories(
     """Source-side feed projection using the cloud_sync AI-ready gate."""
     rows = conn.execute(
         """
-        SELECT s.*
+        SELECT s.*, COALESCE(t.name, '') AS topic_name
         FROM rankings r
         JOIN stories s ON s.id=r.story_id
+        LEFT JOIN topics t ON t.id=s.topic
         WHERE r.feed=? AND s.enrich_status='done'
         ORDER BY r.rank ASC
         """,
@@ -127,15 +128,20 @@ def _expected_topic_stories(
     conn, topic_id: str, page: int, page_size: int
 ) -> Tuple[List[dict], int]:
     """Source-side topic projection using the cloud_sync AI-ready gate."""
+    source_topic_ids = repository.source_topic_ids_for_canonical(conn, topic_id)
+    if not source_topic_ids:
+        return [], 0
+    placeholders = ",".join("?" * len(source_topic_ids))
     rows = conn.execute(
-        """
-        SELECT s.*
+        f"""
+        SELECT s.*, COALESCE(t.name, '') AS topic_name
         FROM stories s
-        WHERE s.topic=?
+        LEFT JOIN topics t ON t.id=s.topic
+        WHERE s.topic IN ({placeholders})
           AND s.enrich_status='done'
           AND EXISTS (SELECT 1 FROM rankings r WHERE r.story_id=s.id)
         """,
-        (topic_id,),
+        source_topic_ids,
     ).fetchall()
     stories = [repository.row_to_story(r) for r in rows]
     ready = [s for s in stories if _story_is_ai_ready(s)]

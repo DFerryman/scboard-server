@@ -46,6 +46,8 @@ from .topics import (
     DEFAULT_TOPIC_ID,
     DEFAULT_TOPIC_NAME,
     normalize_topic,
+    topic_id_set,
+    topic_prompt_catalog,
 )
 from .codex_cli import CodexCliError, CodexCliJsonClient, merge_usage_summaries
 
@@ -74,7 +76,7 @@ _STORY_OUTPUT_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "titleZh": {"type": "string"},
-        "topicId": {"type": ["string", "null"]},
+        "topicId": {"type": "string", "enum": sorted(topic_id_set())},
         "topic": {"type": ["string", "null"]},
         "topicName": {"type": "string"},
         "aiSummary": {"type": "string"},
@@ -1419,15 +1421,14 @@ _SYSTEM_PROMPT = (
     "output a single strict JSON object (output JSON only, no surrounding "
     "prose) with these fields:\n"
     "- titleZh: string, Chinese title.\n"
-    "- topicId: string, optional. Set to an existing topic id when the "
-    "active topic catalog already covers this story.\n"
-    "- topicName: string, required. Topics are dynamic and content-based; "
-    "do NOT classify by Hacker News feed (top/new/best/ask/show/job). At "
-    "most 16 topics total, each broad enough to group multiple stories. "
-    "Reuse an existing topic when it can cover the new entry; only create a "
-    "new Chinese topic name when no existing one fits and the catalog has "
-    "fewer than 16 entries. Use a short Chinese noun phrase; avoid one-off "
-    "labels, company names, or product names. When uncertain, use \"综合技术\".\n"
+    "- topicId: string, required. Choose exactly one id from the fixed topic "
+    "catalog provided below. Do NOT create, rename, translate, merge, or "
+    "invent topics. Do NOT classify by Hacker News feed "
+    "(top/new/best/ask/show/job). Use general only when no fixed topic truly "
+    "fits.\n"
+    "- topicName: string, required for backward compatibility. Use the fixed "
+    "catalog name for the chosen topicId; the server ignores AI-created "
+    "topic names.\n"
     "- aiSummary: string. Use the request-specific output budget guidance "
     "for length. Lead with the facts, then any controversy.\n"
     "- discussionThemes: array. Use the request-specific output budget "
@@ -1598,6 +1599,7 @@ def validate_ai_output(
     *,
     fallback_title: str,
     existing_topics: Sequence[TopicEntry] | None = None,
+    strict_topic: bool = False,
 ) -> Dict[str, Any]:
     """Apply field-level downgrades per plan §B.
 
@@ -1625,12 +1627,8 @@ def validate_ai_output(
         topic_id=raw.get("topicId"),
         topic_name=raw.get("topicName"),
         existing_topics=existing_topics,
+        strict=strict_topic,
     )
-    if existing_topics and len(existing_topics) >= max(1, settings.TOPIC_MAX_ACTIVE_TOPICS):
-        existing_by_id = {t.id: t for t in existing_topics}
-        if topic_id not in existing_by_id:
-            fallback_topic = existing_by_id.get(DEFAULT_TOPIC_ID) or existing_topics[0]
-            topic_id, topic_name = fallback_topic.id, fallback_topic.name
     out["topic"] = topic_id
     out["topicName"] = topic_name
 
@@ -1690,6 +1688,7 @@ def validate_batch_ai_output(
     *,
     story_rows: Sequence[Any],
     existing_topics: Sequence[TopicEntry] | None = None,
+    strict_topic: bool = False,
 ) -> Dict[int, Dict[str, Any]]:
     """Validate batch enrich response into ``story_id -> AI output``."""
     stories_by_id = {int(r["id"]): r for r in story_rows}
@@ -1715,6 +1714,7 @@ def validate_batch_ai_output(
             item,
             fallback_title=stories_by_id[sid]["title_en"] or "",
             existing_topics=existing_topics,
+            strict_topic=strict_topic,
         )
     return out
 
@@ -1950,6 +1950,7 @@ class CodexFirstAiAgent(AiAgent):
                 raw,
                 fallback_title=story_row["title_en"] or "",
                 existing_topics=topic_catalog,
+                strict_topic=True,
             )
         except (CodexCliError, subprocess.SubprocessError, OSError, ValueError) as exc:
             return self._fallback(
@@ -1983,6 +1984,7 @@ class CodexFirstAiAgent(AiAgent):
                 raw,
                 story_rows=[item["story"] for item in items],
                 existing_topics=topic_catalog,
+                strict_topic=True,
             )
         except (CodexCliError, subprocess.SubprocessError, OSError, ValueError) as exc:
             return self._fallback(
@@ -2473,11 +2475,8 @@ class RealAiAgent(AiAgent):
         self,
         topic_catalog: Sequence[TopicEntry] | None,
     ) -> str:
-        topics = [
-            {"id": t.id, "name": t.name, "count": int(t.count)}
-            for t in (topic_catalog or [])
-        ]
-        return json.dumps(topics, ensure_ascii=False)
+        counts = {t.id: int(t.count) for t in (topic_catalog or [])}
+        return json.dumps(topic_prompt_catalog(counts), ensure_ascii=False)
 
     def _topic_section(
         self,
@@ -2488,13 +2487,12 @@ class RealAiAgent(AiAgent):
         # Variable content (story body, comments) is kept in the user
         # message so it does not invalidate the cache key.
         return (
-            f"Existing dynamic topics (max {settings.TOPIC_MAX_ACTIVE_TOPICS}, "
-            f"prefer reuse, may be empty): "
+            "Fixed topic catalog. Choose exactly one topicId from this list; "
+            "do not create new topics or use product/company names as topics: "
             f"{self._topic_catalog_json(topic_catalog)}\n"
-            "Topic policy: first check whether an existing topic covers this "
-            "story; if so, reuse it. Only create a new broad topic when none "
-            "of the existing ones can cover the story and the topic count is "
-            "below the max."
+            "Topic policy: classify by the story's primary subject, not HN "
+            "feed, comment tangents, or source domain. Use general only after "
+            "checking every specific topic."
         )
 
     def _story_system_prompt(
@@ -2571,11 +2569,12 @@ class RealAiAgent(AiAgent):
             "discussionThemes, insights, terms. Do not omit any input id. "
             "If comments are present, discussionThemes/insights must summarize the comments. "
             "Only output JSON.\n\n"
-            f"Existing dynamic topics, max {settings.TOPIC_MAX_ACTIVE_TOPICS}, prefer reuse: "
+            "Fixed topic catalog. Choose exactly one topicId from this list; "
+            "do not create new topics or use product/company names as topics: "
             f"{self._topic_catalog_json(topic_catalog)}\n"
-            "Topic policy: reuse an existing broad topic when it can cover the story; "
-            "create a new broad topic only when the current taxonomy cannot cover it "
-            "and the topic count is still below the max."
+            "Topic policy: classify by each story's primary subject, not HN "
+            "feed, comment tangents, or source domain. Use general only after "
+            "checking every specific topic."
         )
         desired_max_tokens = _ENRICH_OUTPUT_TOKENS_PER_STORY * len(items)
         return (
@@ -2838,6 +2837,7 @@ class RealAiAgent(AiAgent):
                 raw,
                 fallback_title=story_row["title_en"] or "",
                 existing_topics=topic_catalog,
+                strict_topic=True,
             )
 
         return self._with_failover("story", _process_with_config)
@@ -2884,6 +2884,7 @@ class RealAiAgent(AiAgent):
                     raw,
                     story_rows=stories,
                     existing_topics=topic_catalog,
+                    strict_topic=True,
                 )
             except AiProviderResponseError:
                 raise

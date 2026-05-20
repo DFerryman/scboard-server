@@ -33,7 +33,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from . import ai_config_status, db, dashboard_projection, repository, settings
 from .schemas import Story, TopicEntry
-from .topics import DEFAULT_TOPIC_ID, topic_name_from_id
+from .topics import resolve_fixed_topic, topic_name_from_id
 
 
 log = logging.getLogger(__name__)
@@ -236,6 +236,7 @@ def _list_ai_ready_topics(conn, visible_ids: Iterable[int]) -> List[TopicEntry]:
     ids = [int(sid) for sid in visible_ids]
     if not ids:
         return []
+    buckets: Dict[str, Dict[str, int]] = {}
     with repository.id_in_clause(conn, ids) as (clause, params):
         rows = conn.execute(
             f"""
@@ -251,18 +252,37 @@ def _list_ai_ready_topics(conn, visible_ids: Iterable[int]) -> List[TopicEntry]:
               AND COALESCE(s.topic, '') != ''
             GROUP BY s.topic, t.name
             HAVING c > 0
-            ORDER BY c DESC, last_seen DESC, id ASC
             """,
             params,
         ).fetchall()
-    return [
-        TopicEntry(
-            id=str(row["id"] or DEFAULT_TOPIC_ID),
-            name=str(row["name"] or topic_name_from_id(row["id"])),
-            count=int(row["c"] or 0),
+    for row in rows:
+        fixed_topic = resolve_fixed_topic(
+            topic=row["id"],
+            topic_name=row["name"],
         )
-        for row in rows
+        if not fixed_topic:
+            continue
+        topic_id, _ = fixed_topic
+        bucket = buckets.setdefault(topic_id, {"count": 0, "last_seen": 0})
+        bucket["count"] += int(row["c"] or 0)
+        bucket["last_seen"] = max(bucket["last_seen"], int(row["last_seen"] or 0))
+    out = [
+        TopicEntry(
+            id=topic_id,
+            name=topic_name_from_id(topic_id),
+            count=int(bucket["count"] or 0),
+        )
+        for topic_id, bucket in buckets.items()
+        if int(bucket["count"] or 0) > 0
     ]
+    out.sort(
+        key=lambda entry: (
+            -entry.count,
+            -int(buckets[entry.id]["last_seen"]),
+            entry.id,
+        )
+    )
+    return out
 
 
 def build_read_model(
@@ -307,7 +327,11 @@ def build_read_model(
         story_docs = []
         for sid in visible_ids:
             row = conn.execute(
-                "SELECT * FROM stories WHERE id=?", (sid,)
+                "SELECT s.*, COALESCE(t.name, '') AS topic_name "
+                "FROM stories s "
+                "LEFT JOIN topics t ON t.id=s.topic "
+                "WHERE s.id=?",
+                (sid,),
             ).fetchone()
             if row is None:
                 continue

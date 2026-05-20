@@ -24,7 +24,13 @@ from .insights_agents import (
     contains_forbidden_words,
     sanitize_forbidden_words,
 )
-from .topics import clean_topic_name, topic_name_from_id
+from .topics import (
+    DEFAULT_TOPIC_ID,
+    DEFAULT_TOPIC_NAME,
+    clean_topic_name,
+    legacy_topic_id,
+    resolve_fixed_topic,
+)
 
 
 log = logging.getLogger(__name__)
@@ -117,11 +123,14 @@ def _row_value(row: Any, key: str, default: Any = "") -> Any:
 
 
 def _topic_label(topic: str, topic_name: Any = "") -> str:
+    fixed = resolve_fixed_topic(topic=topic, topic_name=topic_name)
+    if fixed:
+        return fixed[1]
     name = clean_topic_name(topic_name)
     if name:
         return name
-    clean = str(topic or "").strip()
-    return topic_name_from_id(clean)
+    legacy_id = legacy_topic_id(topic)
+    return legacy_id or DEFAULT_TOPIC_NAME
 
 
 def _row_topic_label(row: Any) -> str:
@@ -129,6 +138,16 @@ def _row_topic_label(row: Any) -> str:
         str(row["topic"] or ""),
         _row_value(row, "topic_name", ""),
     )
+
+
+def _row_topic_id(row: Any) -> str:
+    fixed = resolve_fixed_topic(
+        topic=str(row["topic"] or ""),
+        topic_name=_row_value(row, "topic_name", ""),
+    )
+    if fixed:
+        return fixed[0]
+    return legacy_topic_id(str(row["topic"] or "")) or DEFAULT_TOPIC_ID
 
 
 def _story_payload(
@@ -146,7 +165,7 @@ def _story_payload(
     out: Dict[str, Any] = {
         "id": story_id,
         "kind": row["kind"] or "story",
-        "topic": row["topic"] or "",
+        "topic": _row_topic_id(row),
         "topicName": _row_topic_label(row),
         "titleZh": row["title_zh"] or row["title_en"] or "",
         "titleEn": row["title_en"] or "",
@@ -402,14 +421,14 @@ def build_opportunity_input(
 ) -> Dict[str, Any]:
     topic_counts: Dict[str, int] = {}
     for row in window_rows:
-        topic = row["topic"] or ""
+        topic = _row_topic_id(row)
         topic_counts[topic] = topic_counts.get(topic, 0) + 1
 
     candidates = []
     for row in window_rows:
         sid = int(row["id"])
         ranks = feed_ranks.get(sid, {})
-        repeated = topic_counts.get(row["topic"] or "", 0) >= 2
+        repeated = topic_counts.get(_row_topic_id(row), 0) >= 2
         high_rank = _feed_rank_score(ranks) <= 30
         if not (
             int(row["score"] or 0) >= 80
@@ -495,7 +514,7 @@ def _story_ref(row: Any, feed_ranks: Mapping[int, Mapping[str, int]]) -> Dict[st
     sid = int(row["id"])
     return {
         "id": sid,
-        "topic": row["topic"] or "",
+        "topic": _row_topic_id(row),
         "topicName": _row_topic_label(row),
         "titleZh": row["title_zh"] or row["title_en"] or "",
         "titleEn": row["title_en"] or "",
@@ -669,7 +688,7 @@ def _insights_evidence_cache_key(
             {
                 "id": sid,
                 "kind": row["kind"] or "story",
-                "topic": row["topic"] or "",
+                "topic": _row_topic_id(row),
                 "topicName": _row_topic_label(row),
                 "titleZh": row["title_zh"] or "",
                 "titleEn": row["title_en"] or "",
@@ -1215,7 +1234,7 @@ def _build_stats(
     source_story_ids: Sequence[int],
     debates: Sequence[Mapping[str, Any]],
 ) -> List[Dict[str, str]]:
-    topics = {str(row["topic"] or "") for row in window_rows if str(row["topic"] or "").strip()}
+    topics = {_row_topic_id(row) for row in window_rows if _row_topic_id(row)}
     strong_debates = sum(1 for item in debates if int(item.get("intensity") or 0) >= 80)
     return [
         {"label": "追踪主题", "value": str(len(topics))},
