@@ -8039,6 +8039,25 @@ class CodexFirstAiAgentTests(unittest.TestCase):
             "kind": "story",
         }
 
+    def test_codex_output_schemas_are_strict_response_format_compatible(self):
+        def assert_strict_objects(schema):
+            if not isinstance(schema, dict):
+                return
+            if schema.get("type") == "object":
+                properties = schema.get("properties") or {}
+                self.assertEqual(
+                    set(schema.get("required") or []),
+                    set(properties.keys()),
+                )
+                self.assertFalse(schema.get("additionalProperties", True))
+                for child in properties.values():
+                    assert_strict_objects(child)
+            if schema.get("type") == "array":
+                assert_strict_objects(schema.get("items"))
+
+        assert_strict_objects(ai_agent_module._STORY_OUTPUT_SCHEMA)
+        assert_strict_objects(ai_agent_module._BATCH_ENRICH_OUTPUT_SCHEMA)
+
     def test_codex_story_reuses_existing_system_and_user_prompts(self):
         class FakeCodex:
             model = "codex-test"

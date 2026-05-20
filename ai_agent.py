@@ -117,6 +117,8 @@ _STORY_OUTPUT_SCHEMA: Dict[str, Any] = {
     },
     "required": [
         "titleZh",
+        "topicId",
+        "topic",
         "topicName",
         "aiSummary",
         "discussionThemes",
@@ -140,12 +142,7 @@ _BATCH_ENRICH_OUTPUT_SCHEMA: Dict[str, Any] = {
                 },
                 "required": [
                     "id",
-                    "titleZh",
-                    "topicName",
-                    "aiSummary",
-                    "discussionThemes",
-                    "insights",
-                    "terms",
+                    *_STORY_OUTPUT_SCHEMA["required"],
                 ],
                 "additionalProperties": False,
             },
