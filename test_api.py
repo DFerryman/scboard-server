@@ -986,6 +986,39 @@ class SettingsValidation(unittest.TestCase):
             launcher,
         )
 
+    def test_launcher_cloud_usage_defaults_are_cost_controlled(self):
+        import inspect
+
+        from . import cloud_push
+
+        launcher = (Path(__file__).resolve().parent / "launcher.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(cloud_push.DEFAULT_PUSH_BATCH_SIZE, 50)
+        self.assertEqual(
+            inspect.signature(cloud_push.push_read_model)
+            .parameters["batch_size"]
+            .default,
+            50,
+        )
+        self.assertIn(
+            'HNREADER_INGEST_INTERVAL_SECONDS="${HNREADER_INGEST_INTERVAL_SECONDS:-3600}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_CLOUD_PUSH_BATCH_SIZE="${HNREADER_CLOUD_PUSH_BATCH_SIZE:-50}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_DASHBOARD_INGEST_RUN_LIMIT="${HNREADER_DASHBOARD_INGEST_RUN_LIMIT:-20}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_DASHBOARD_CLOUD_SYNC_RUN_LIMIT="${HNREADER_DASHBOARD_CLOUD_SYNC_RUN_LIMIT:-20}"',
+            launcher,
+        )
+
     def test_runtime_int_range_rejects_extreme_worker_count(self):
         with self.assertRaises(RuntimeError):
             settings._require_int_range(  # type: ignore[attr-defined]
@@ -11489,6 +11522,45 @@ class CloudSyncTwoPhaseOrchestration(_SqliteCase):
             row = conn.execute(
                 "SELECT status, sync_version, error FROM cloud_sync_runs WHERE run_id=?",
                 ("run-twophase-ok",),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["sync_version"], 12)
+        self.assertIsNone(row["error"])
+
+    def test_business_skipped_does_not_republish_dashboard(self):
+        from . import cloud_sync_runner, ingest
+
+        self._enable_cloud_sync()
+        try:
+            with patch.object(
+                cloud_sync_runner, "run_business_once",
+                return_value=cloud_sync_runner.CloudBusinessResult(
+                    ok=True, status="ok",
+                    sync_version=12, published_at=1700000000,
+                    elapsed_seconds=0.2,
+                    push_stats={"businessSkipped": True},
+                ),
+            ), patch.object(
+                cloud_sync_runner, "run_dashboard_once",
+                side_effect=AssertionError(
+                    "dashboard must not be republished when business did not change"
+                ),
+            ):
+                result = ingest._trigger_and_record_cloud_sync("run-business-skipped")
+        finally:
+            self._restore_cloud_sync()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["sync_version"], 12)
+        self.assertIsNone(result["error"])
+
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT status, sync_version, error FROM cloud_sync_runs WHERE run_id=?",
+                ("run-business-skipped",),
             ).fetchone()
         finally:
             conn.close()

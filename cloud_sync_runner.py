@@ -307,6 +307,8 @@ def run_dashboard_once(
             sync_version=int(sync_version),
             published_at=int(published_at),
             ai_status=ai_status,
+            ingest_run_limit=settings.DASHBOARD_INGEST_RUN_LIMIT,
+            cloud_sync_run_limit=settings.DASHBOARD_CLOUD_SYNC_RUN_LIMIT,
         )
         push_stats = cloud_push.push_dashboard(
             url=settings.CLOUD_PUSH_URL,

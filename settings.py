@@ -446,7 +446,7 @@ DIGEST_TIMEZONE = _require_timezone(
 def _default_insights_update_interval_seconds() -> int:
     return _env_int(
         "HNREADER_INGEST_INTERVAL_SECONDS",
-        30 * 60,
+        60 * 60,
         fallback="HACKERMINI_INGEST_INTERVAL_SECONDS",
     ) * 4
 
@@ -1484,7 +1484,7 @@ INGEST_INTERVAL_SECONDS = _require_int_range(
     "HNREADER_INGEST_INTERVAL_SECONDS",
     _env_int(
         "HNREADER_INGEST_INTERVAL_SECONDS",
-        30 * 60,
+        60 * 60,
         fallback="HACKERMINI_INGEST_INTERVAL_SECONDS",
     ),
     min_value=1,
@@ -1561,7 +1561,7 @@ CLOUD_PUSH_BATCH_SIZE = _require_int_range(
     "HNREADER_CLOUD_PUSH_BATCH_SIZE",
     _env_int(
         "HNREADER_CLOUD_PUSH_BATCH_SIZE",
-        20,
+        50,
         fallback="HACKERMINI_CLOUD_PUSH_BATCH_SIZE",
     ),
     min_value=1,
@@ -1586,6 +1586,26 @@ CLOUD_SYNC_TIMEOUT_SECONDS = _require_int_range(
     ),
     min_value=10,
     max_value=600,
+)
+DASHBOARD_INGEST_RUN_LIMIT = _require_int_range(
+    "HNREADER_DASHBOARD_INGEST_RUN_LIMIT",
+    _env_int(
+        "HNREADER_DASHBOARD_INGEST_RUN_LIMIT",
+        20,
+        fallback="HACKERMINI_DASHBOARD_INGEST_RUN_LIMIT",
+    ),
+    min_value=1,
+    max_value=100,
+)
+DASHBOARD_CLOUD_SYNC_RUN_LIMIT = _require_int_range(
+    "HNREADER_DASHBOARD_CLOUD_SYNC_RUN_LIMIT",
+    _env_int(
+        "HNREADER_DASHBOARD_CLOUD_SYNC_RUN_LIMIT",
+        20,
+        fallback="HACKERMINI_DASHBOARD_CLOUD_SYNC_RUN_LIMIT",
+    ),
+    min_value=1,
+    max_value=100,
 )
 
 # ---------- Admin alert email ----------

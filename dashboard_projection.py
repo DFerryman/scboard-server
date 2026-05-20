@@ -39,8 +39,8 @@ DASHBOARD_SUMMARY_FILE = "dashboard_summary.json"
 DASHBOARD_INGEST_RUNS_FILE = "dashboard_ingest_runs.jsonl"
 DASHBOARD_CLOUD_SYNC_RUNS_FILE = "dashboard_cloud_sync_runs.jsonl"
 
-DEFAULT_RECENT_INGEST_RUNS = 100
-DEFAULT_RECENT_CLOUD_SYNC_RUNS = 100
+DEFAULT_RECENT_INGEST_RUNS = settings.DASHBOARD_INGEST_RUN_LIMIT
+DEFAULT_RECENT_CLOUD_SYNC_RUNS = settings.DASHBOARD_CLOUD_SYNC_RUN_LIMIT
 
 
 def _decode_run_ai_usage(row: sqlite3.Row) -> Optional[Dict[str, Any]]:

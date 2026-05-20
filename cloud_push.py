@@ -28,7 +28,7 @@ decoupled so that:
 Module entry point::
 
     from server.cloud_push import push_read_model, push_dashboard, CloudPushError
-    business_stats = push_read_model(url=..., secret=..., batch_size=20)
+    business_stats = push_read_model(url=..., secret=..., batch_size=50)
     dashboard_stats = push_dashboard(url=..., secret=..., sync_version=v)
 
 CLI entry point (reads credentials from environment variables)::
@@ -42,7 +42,7 @@ Env vars (required, for CLI):
 
 Env vars (optional, for CLI):
     HNREADER_CLOUD_PUSH_BATCH_SIZE / HNREADER_CLOUD_BATCH_SIZE  stories per
-                                batch, default 20
+                                batch, default 50
     HNREADER_CLOUD_PUSH_MAX_BODY_BYTES  max writeBatch request body size,
                                 default 80000
 """
@@ -75,6 +75,7 @@ log = logging.getLogger(__name__)
 
 TS_TOLERANCE_MS = 60 * 1000
 DEFAULT_TIMEOUT_SECONDS = 120
+DEFAULT_PUSH_BATCH_SIZE = 50
 # CloudBase documents a 100KB limit for text cloud-function request bodies.
 # Keep headroom for JSON formatting and gateway accounting instead of riding
 # the exact edge.
@@ -909,7 +910,7 @@ def push_read_model(
     *,
     url: str,
     secret: str,
-    batch_size: int = 20,
+    batch_size: int = DEFAULT_PUSH_BATCH_SIZE,
     max_body_bytes: int = DEFAULT_WRITE_BATCH_MAX_BODY_BYTES,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     write_batch_max_attempts: int = DEFAULT_WRITE_BATCH_MAX_ATTEMPTS,
@@ -1238,7 +1239,7 @@ def main() -> None:
     # Prefer HNREADER_CLOUD_PUSH_BATCH_SIZE (new name), fall back to HNREADER_CLOUD_BATCH_SIZE (old name)
     batch_raw = os.environ.get("HNREADER_CLOUD_PUSH_BATCH_SIZE") \
         or os.environ.get("HNREADER_CLOUD_BATCH_SIZE") \
-        or "20"
+        or str(DEFAULT_PUSH_BATCH_SIZE)
     try:
         batch_size = int(batch_raw)
     except ValueError:

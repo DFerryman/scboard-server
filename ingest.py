@@ -1892,6 +1892,18 @@ def _trigger_and_record_cloud_sync(
         _alert_cloud_sync_result(run_id, result)
         return result
 
+    if business.push_stats.get("businessSkipped"):
+        log.info(
+            "[cloud_sync] dashboard skipped run_id=%s: business version unchanged",
+            run_id,
+        )
+        return {
+            "status": "ok",
+            "sync_version": business.sync_version,
+            "elapsed_seconds": business_elapsed,
+            "error": None,
+        }
+
     # ---------- Phase B: dashboard publish (only when business is ok) ----------
     # The business push has already succeeded and been recorded; publishing the
     # dashboard next is best-effort: a failure does not roll back the business
