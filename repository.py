@@ -1994,6 +1994,24 @@ def record_story_image_upload(
     checked_at: Optional[int] = None,
 ) -> None:
     now = int(checked_at or now_seconds())
+    clean_image_file_id = str(image_file_id or "").strip()
+    if clean_image_file_id:
+        delete_after = now + int(settings.STORY_IMAGE_DELETE_GRACE_SECONDS)
+        conn.execute(
+            """
+            UPDATE story_image_assets
+            SET status='pending_delete',
+                delete_after=CASE
+                    WHEN delete_after > 0 AND delete_after < ? THEN delete_after
+                    ELSE ?
+                END,
+                error=''
+            WHERE story_id=?
+              AND image_file_id != ?
+              AND status IN ('ready', 'delete_failed')
+            """,
+            (delete_after, delete_after, int(story_id), clean_image_file_id),
+        )
     conn.execute(
         """
         UPDATE stories
@@ -2007,21 +2025,23 @@ def record_story_image_upload(
         """,
         (
             image_url or "",
-            image_file_id or "",
+            clean_image_file_id,
             image_source_url or "",
             now,
             int(story_id),
         ),
     )
+    if not clean_image_file_id:
+        return
     conn.execute(
         """
         INSERT INTO story_image_assets(
-            story_id, image_file_id, image_url, image_source_url, cloud_path,
+            image_file_id, story_id, image_url, image_source_url, cloud_path,
             sha256, status, uploaded_at, last_referenced_at, delete_after,
             deleted_at, error
         ) VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, 0, 0, '')
-        ON CONFLICT(story_id) DO UPDATE SET
-            image_file_id=excluded.image_file_id,
+        ON CONFLICT(image_file_id) DO UPDATE SET
+            story_id=excluded.story_id,
             image_url=excluded.image_url,
             image_source_url=excluded.image_source_url,
             cloud_path=excluded.cloud_path,
@@ -2034,8 +2054,8 @@ def record_story_image_upload(
             error=''
         """,
         (
+            clean_image_file_id,
             int(story_id),
-            image_file_id or "",
             image_url or "",
             image_source_url or "",
             cloud_path or "",

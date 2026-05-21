@@ -15959,6 +15959,58 @@ class StoryImagePipelineTests(_SqliteCase):
         self.assertEqual(asset["status"], "ready")
         self.assertEqual(asset["sha256"], digest)
 
+    def test_reuploading_story_image_marks_previous_file_pending_delete(self):
+        now = int(time.time())
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                self._insert_story(conn, 151, last_seen_at=now)
+                repository.record_story_image_upload(
+                    conn,
+                    story_id=151,
+                    image_url="https://temp.example/151-old.png",
+                    image_file_id="cloud://env/151-old.png",
+                    image_source_url="https://cdn.example/151-old.png",
+                    cloud_path="hn/story-thumbs/v1/151-old.png",
+                    sha256="a" * 64,
+                    checked_at=now,
+                )
+                repository.record_story_image_upload(
+                    conn,
+                    story_id=151,
+                    image_url="https://temp.example/151-new.png",
+                    image_file_id="cloud://env/151-new.png",
+                    image_source_url="https://cdn.example/151-new.png",
+                    cloud_path="hn/story-thumbs/v1/151-new.png",
+                    sha256="b" * 64,
+                    checked_at=now + 1,
+                )
+        finally:
+            conn.close()
+
+        conn = db.connect()
+        try:
+            story = conn.execute("SELECT * FROM stories WHERE id=151").fetchone()
+            assets = {
+                r["image_file_id"]: r
+                for r in conn.execute(
+                    """
+                    SELECT image_file_id, status, delete_after, sha256
+                    FROM story_image_assets
+                    WHERE story_id=151
+                    """
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+
+        self.assertEqual(story["image_file_id"], "cloud://env/151-new.png")
+        self.assertEqual(story["image_url"], "https://temp.example/151-new.png")
+        self.assertEqual(assets["cloud://env/151-old.png"]["status"], "pending_delete")
+        self.assertGreaterEqual(assets["cloud://env/151-old.png"]["delete_after"], now)
+        self.assertEqual(assets["cloud://env/151-new.png"]["status"], "ready")
+        self.assertEqual(assets["cloud://env/151-new.png"]["sha256"], "b" * 64)
+
     def test_cloud_sync_exports_story_image_fields_and_manifest(self):
         from . import cloud_sync
 

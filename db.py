@@ -231,8 +231,8 @@ CREATE INDEX IF NOT EXISTS idx_cloud_sync_runs_started
 ON cloud_sync_runs(started_at DESC);
 
 CREATE TABLE IF NOT EXISTS story_image_assets (
-  story_id INTEGER PRIMARY KEY,
-  image_file_id TEXT NOT NULL DEFAULT '',
+  image_file_id TEXT NOT NULL PRIMARY KEY,
+  story_id INTEGER NOT NULL,
   image_url TEXT NOT NULL DEFAULT '',
   image_source_url TEXT NOT NULL DEFAULT '',
   cloud_path TEXT NOT NULL DEFAULT '',
@@ -248,6 +248,9 @@ CREATE TABLE IF NOT EXISTS story_image_assets (
 
 CREATE INDEX IF NOT EXISTS idx_story_image_assets_status_delete
 ON story_image_assets(status, delete_after);
+
+CREATE INDEX IF NOT EXISTS idx_story_image_assets_story_status
+ON story_image_assets(story_id, status);
 """
 
 
@@ -432,6 +435,7 @@ def init_db(path: Optional[Path] = None) -> None:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA_SQL)
         _migrate_story_columns(conn)
+        _migrate_story_image_assets_table(conn)
         _migrate_ingest_run_columns(conn)
         _migrate_insight_columns(conn)
         _migrate_insight_run_columns(conn)
@@ -489,6 +493,72 @@ def _migrate_story_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_stories_reenrich_work "
         "ON stories(needs_reenrich, last_seen_at DESC)"
     )
+
+
+def _create_story_image_assets_indexes(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_story_image_assets_status_delete "
+        "ON story_image_assets(status, delete_after)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_story_image_assets_story_status "
+        "ON story_image_assets(story_id, status)"
+    )
+
+
+def _migrate_story_image_assets_table(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("PRAGMA table_info(story_image_assets)").fetchall()
+    if not rows:
+        return
+    pk_columns = [
+        str(r["name"])
+        for r in sorted(rows, key=lambda r: int(r["pk"] or 0))
+        if int(r["pk"] or 0) > 0
+    ]
+    if pk_columns == ["image_file_id"]:
+        _create_story_image_assets_indexes(conn)
+        return
+    if pk_columns != ["story_id"]:
+        return
+
+    conn.execute("ALTER TABLE story_image_assets RENAME TO story_image_assets_old")
+    conn.execute(
+        """
+        CREATE TABLE story_image_assets (
+          image_file_id TEXT NOT NULL PRIMARY KEY,
+          story_id INTEGER NOT NULL,
+          image_url TEXT NOT NULL DEFAULT '',
+          image_source_url TEXT NOT NULL DEFAULT '',
+          cloud_path TEXT NOT NULL DEFAULT '',
+          sha256 TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT ''
+            CHECK (status IN ('ready', 'pending_delete', 'deleted', 'delete_failed', '')),
+          uploaded_at INTEGER NOT NULL DEFAULT 0,
+          last_referenced_at INTEGER NOT NULL DEFAULT 0,
+          delete_after INTEGER NOT NULL DEFAULT 0,
+          deleted_at INTEGER NOT NULL DEFAULT 0,
+          error TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO story_image_assets(
+            image_file_id, story_id, image_url, image_source_url, cloud_path,
+            sha256, status, uploaded_at, last_referenced_at, delete_after,
+            deleted_at, error
+        )
+        SELECT
+            image_file_id, story_id, image_url, image_source_url, cloud_path,
+            sha256, status, uploaded_at, last_referenced_at, delete_after,
+            deleted_at, error
+        FROM story_image_assets_old
+        WHERE COALESCE(image_file_id, '') != ''
+        ORDER BY uploaded_at ASC, story_id ASC
+        """
+    )
+    conn.execute("DROP TABLE story_image_assets_old")
+    _create_story_image_assets_indexes(conn)
 
 
 def _migrate_ingest_run_columns(conn: sqlite3.Connection) -> None:
