@@ -5521,7 +5521,7 @@ class EnricherBehavior(_SqliteCase):
         self.assertEqual(visible_after.descendants, settings.COMMENT_MIN_DESCENDANTS + 10)
         self.assertEqual(visible_after.aiSummary, f"{settings.COMMENT_MIN_DESCENDANTS + 10}:1")
 
-    def test_quality_gate_rejects_unapproved_hybrid_name_before_persistence(self):
+    def test_quality_gate_repairs_hybrid_name_before_persistence(self):
         rankings = {"top": [701], "new": [], "best": [], "ask": [], "show": [], "job": []}
         items = {
             701: {
@@ -5551,42 +5551,52 @@ class EnricherBehavior(_SqliteCase):
             def write_digest_intro(self, *_):
                 return ""
 
-        class RejectingReviewer:
+        class RepairingReviewer:
             def __init__(self):
                 self.calls = []
 
             def review_story_output(self, story_row, processed, issues):
                 self.calls.append((story_row, processed, issues))
                 return {
-                    "approved": False,
-                    "action": "reject",
-                    "reason": "malformed proper noun",
+                    "approved": True,
+                    "action": "repair",
+                    "reason": "fixed malformed proper noun",
+                    "repaired": {
+                        "titleZh": "唐纳德·克努斯《字母 S》（1980）",
+                        "aiSummary": "克努斯解释字母 S 的数学构造。",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    },
                 }
 
-        reviewer = RejectingReviewer()
+        reviewer = RepairingReviewer()
         summary = run_enricher_once(
             client=_FakeHn({}, {}),
             ai_agent=BadAgent(),
             quality_reviewer=reviewer,
         )
 
-        self.assertEqual(summary["done"], 0)
-        self.assertEqual(summary["retried"], 1)
+        self.assertEqual(summary["done"], 1)
+        self.assertEqual(summary["retried"], 0)
+        self.assertEqual(summary["failed"], 0)
         self.assertEqual(len(reviewer.calls), 1)
         self.assertTrue(any("Knuth" in issue for issue in reviewer.calls[0][2]))
 
         conn = db.connect()
         try:
             row = conn.execute(
-                "SELECT enrich_status, enrich_error, title_zh FROM stories WHERE id=701"
+                "SELECT enrich_status, enrich_error, title_zh, ai_summary "
+                "FROM stories WHERE id=701"
             ).fetchone()
         finally:
             conn.close()
-        self.assertEqual(row["enrich_status"], "pending")
-        self.assertIn("quality review rejected", row["enrich_error"])
-        self.assertEqual(row["title_zh"], "The Letter S, by Donald Knuth (1980) [pdf]")
+        self.assertEqual(row["enrich_status"], "done")
+        self.assertFalse(row["enrich_error"])
+        self.assertEqual(row["title_zh"], "唐纳德·克努斯《字母 S》（1980）")
+        self.assertEqual(row["ai_summary"], "克努斯解释字母 S 的数学构造。")
 
-    def test_quality_gate_reviews_reader_facing_meta_disclaimers(self):
+    def test_quality_gate_repairs_reader_facing_meta_disclaimers(self):
         rankings = {"top": [702], "new": [], "best": [], "ask": [], "show": [], "job": []}
         items = {
             702: {
@@ -5616,40 +5626,192 @@ class EnricherBehavior(_SqliteCase):
             def write_digest_intro(self, *_):
                 return ""
 
-        class RejectingReviewer:
+        class RepairingReviewer:
             def __init__(self):
                 self.issues = []
 
             def review_story_output(self, story_row, processed, issues):
                 self.issues.extend(issues)
                 return {
-                    "approved": False,
-                    "action": "reject",
-                    "reason": "reader-facing meta disclaimer",
+                    "approved": True,
+                    "action": "repair",
+                    "reason": "removed reader-facing meta disclaimer",
+                    "repaired": {
+                        "titleZh": "一篇数据库小笔记",
+                        "aiSummary": "这篇笔记围绕数据库主题展开，适合关注数据系统实现细节的读者。",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    },
                 }
 
-        reviewer = RejectingReviewer()
+        reviewer = RepairingReviewer()
         summary = run_enricher_once(
             client=_FakeHn({}, {}),
             ai_agent=MetaAgent(),
             quality_reviewer=reviewer,
         )
 
-        self.assertEqual(summary["done"], 0)
-        self.assertEqual(summary["retried"], 1)
+        self.assertEqual(summary["done"], 1)
+        self.assertEqual(summary["retried"], 0)
+        self.assertEqual(summary["failed"], 0)
         self.assertTrue(any("meta/disclaimer" in issue for issue in reviewer.issues))
 
         conn = db.connect()
         try:
             row = conn.execute(
-                "SELECT enrich_status, enrich_error FROM stories WHERE id=702"
+                "SELECT enrich_status, enrich_error, ai_summary FROM stories WHERE id=702"
             ).fetchone()
         finally:
             conn.close()
-        self.assertEqual(row["enrich_status"], "pending")
-        self.assertIn("quality review rejected", row["enrich_error"])
+        self.assertEqual(row["enrich_status"], "done")
+        self.assertFalse(row["enrich_error"])
+        self.assertNotIn("由于输入未提供", row["ai_summary"])
 
-    def test_batch_quality_rejection_retries_bad_item_as_single(self):
+    def test_quality_gate_fails_closed_when_reviewer_cannot_repair(self):
+        rankings = {"top": [703], "new": [], "best": [], "ask": [], "show": [], "job": []}
+        items = {
+            703: {
+                "id": 703,
+                "type": "story",
+                "title": "The Letter S, by Donald Knuth (1980) [pdf]",
+                "url": "https://example.com/knuth.pdf",
+                "by": "x",
+                "score": 1,
+                "descendants": 0,
+                "time": 1700000000,
+            }
+        }
+        run_fetcher_once(client=_FakeHn(rankings, items))
+
+        class BadAgent:
+            def process_story(self, *_):
+                return {
+                    "titleZh": "唐纳德·克努uth《字母 S》（1980）",
+                    "topic": "science-culture",
+                    "aiSummary": "克努uth解释字母 S 的数学构造。",
+                    "discussionThemes": [],
+                    "insights": [],
+                    "terms": [],
+                }
+
+            def write_digest_intro(self, *_):
+                return ""
+
+        class RejectingReviewer:
+            def review_story_output(self, *_):
+                return {
+                    "approved": False,
+                    "action": "reject",
+                    "reason": "cannot repair",
+                    "repaired": {
+                        "titleZh": "唐纳德·克努uth《字母 S》（1980）",
+                        "aiSummary": "克努uth解释字母 S 的数学构造。",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    },
+                }
+
+        summary = run_enricher_once(
+            client=_FakeHn({}, {}),
+            ai_agent=BadAgent(),
+            quality_reviewer=RejectingReviewer(),
+        )
+
+        self.assertEqual(summary["done"], 0)
+        self.assertEqual(summary["retried"], 0)
+        self.assertEqual(summary["failed"], 1)
+
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT enrich_status, enrich_error, title_zh FROM stories WHERE id=703"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["enrich_status"], "failed")
+        self.assertIn("quality review rejected", row["enrich_error"])
+        self.assertEqual(row["title_zh"], "The Letter S, by Donald Knuth (1980) [pdf]")
+
+    def test_quality_gate_rejects_repair_that_drops_reader_content(self):
+        rankings = {"top": [704], "new": [], "best": [], "ask": [], "show": [], "job": []}
+        items = {
+            704: {
+                "id": 704,
+                "type": "story",
+                "title": "The Letter S, by Donald Knuth (1980) [pdf]",
+                "url": "https://example.com/knuth.pdf",
+                "by": "x",
+                "score": 1,
+                "descendants": 1,
+                "time": 1700000000,
+            }
+        }
+        run_fetcher_once(client=_FakeHn(rankings, items))
+
+        class BadAgent:
+            def process_story(self, *_):
+                return {
+                    "titleZh": "唐纳德·克努uth《字母 S》（1980）",
+                    "topic": "science-culture",
+                    "aiSummary": "克努uth解释字母 S 的数学构造。",
+                    "discussionThemes": [
+                        {"title": "观点一", "summary": "第一条观点。"},
+                        {"title": "观点二", "summary": "第二条观点。"},
+                    ],
+                    "insights": [
+                        {"author": "u1", "score": 10, "text": "第一条评论观点。"},
+                        {"author": "u2", "score": 9, "text": "第二条评论观点。"},
+                    ],
+                    "terms": [
+                        {"term": "S", "def": "字母 S。"},
+                    ],
+                }
+
+            def write_digest_intro(self, *_):
+                return ""
+
+        class TruncatingReviewer:
+            def review_story_output(self, *_):
+                return {
+                    "approved": True,
+                    "action": "repair",
+                    "reason": "bad repair drops content",
+                    "repaired": {
+                        "titleZh": "唐纳德·克努斯《字母 S》（1980）",
+                        "aiSummary": "克努斯解释字母 S 的数学构造。",
+                        "discussionThemes": [
+                            {"title": "观点一", "summary": "第一条观点。"},
+                        ],
+                        "insights": [
+                            {"author": "u1", "score": 10, "text": "第一条评论观点。"},
+                        ],
+                        "terms": [],
+                    },
+                }
+
+        summary = run_enricher_once(
+            client=_FakeHn({}, {}),
+            ai_agent=BadAgent(),
+            quality_reviewer=TruncatingReviewer(),
+        )
+
+        self.assertEqual(summary["done"], 0)
+        self.assertEqual(summary["retried"], 0)
+        self.assertEqual(summary["failed"], 1)
+
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT enrich_status, enrich_error FROM stories WHERE id=704"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["enrich_status"], "failed")
+        self.assertIn("must not reduce discussionThemes count", row["enrich_error"])
+
+    def test_batch_quality_repair_does_not_retry_bad_item_as_single(self):
         ids = [711, 712]
         rankings = {"top": ids, "new": [], "best": [], "ask": [], "show": [], "job": []}
         items = {
@@ -5707,28 +5869,28 @@ class EnricherBehavior(_SqliteCase):
             def process_story(self, story_row, *_):
                 sid = int(story_row["id"])
                 self.single_calls.append(sid)
-                return {
-                    "titleZh": "唐纳德·克努斯《字母 S》（1980）",
-                    "topic": "science-culture",
-                    "aiSummary": "克努斯解释字母 S 的数学构造。",
-                    "discussionThemes": [],
-                    "insights": [],
-                    "terms": [],
-                }
+                raise AssertionError("quality repair should not call single retry")
 
             def write_digest_intro(self, *_):
                 return ""
 
-        class RejectingReviewer:
+        class RepairingReviewer:
             def __init__(self):
                 self.calls = 0
 
-            def review_story_output(self, *_):
+            def review_story_output(self, story_row, processed, issues):
                 self.calls += 1
                 return {
-                    "approved": False,
-                    "action": "reject",
-                    "reason": "malformed proper noun",
+                    "approved": True,
+                    "action": "repair",
+                    "reason": "fixed malformed proper noun",
+                    "repaired": {
+                        "titleZh": "唐纳德·克努斯《字母 S》（1980）",
+                        "aiSummary": "克努斯解释字母 S 的数学构造。",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    },
                 }
 
         old_workers = settings.ENRICH_WORKER_COUNT
@@ -5737,7 +5899,7 @@ class EnricherBehavior(_SqliteCase):
             settings.ENRICH_WORKER_COUNT = 1  # type: ignore[assignment]
             settings.ENRICH_BATCH_SIZE = 2  # type: ignore[assignment]
             agent = BatchAgent()
-            reviewer = RejectingReviewer()
+            reviewer = RepairingReviewer()
             summary = run_enricher_once(
                 client=_FakeHn({}, {}),
                 ai_agent=agent,
@@ -5748,8 +5910,10 @@ class EnricherBehavior(_SqliteCase):
             settings.ENRICH_BATCH_SIZE = old_batch  # type: ignore[assignment]
 
         self.assertEqual(summary["done"], 2)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["retried"], 0)
         self.assertEqual(agent.batch_calls, 1)
-        self.assertEqual(agent.single_calls, [711])
+        self.assertEqual(agent.single_calls, [])
         self.assertEqual(reviewer.calls, 1)
 
         conn = db.connect()
@@ -5761,6 +5925,75 @@ class EnricherBehavior(_SqliteCase):
             conn.close()
         self.assertEqual([r["title_zh"] for r in rows], ["唐纳德·克努斯《字母 S》（1980）", "干净故事"])
         self.assertEqual({r["enrich_status"] for r in rows}, {"done"})
+
+    def test_round_quality_repair_completes_without_enrich_alert(self):
+        rankings = {"top": [721], "new": [], "best": [], "ask": [], "show": [], "job": []}
+        items = {
+            721: {
+                "id": 721,
+                "type": "story",
+                "title": "The Letter S, by Donald Knuth (1980) [pdf]",
+                "url": "https://example.com/knuth.pdf",
+                "by": "x",
+                "score": 1,
+                "descendants": 0,
+                "time": 1700000000,
+            }
+        }
+
+        class BadAgent:
+            def process_story(self, *_):
+                return {
+                    "titleZh": "唐纳德·克努uth《字母 S》（1980）",
+                    "topic": "science-culture",
+                    "aiSummary": "克努uth解释字母 S 的数学构造。",
+                    "discussionThemes": [],
+                    "insights": [],
+                    "terms": [],
+                }
+
+            def select_digest_story_ids(self, date, candidates, limit):
+                return [int(r["id"]) for r in candidates[:limit]]
+
+            def write_digest_intro(self, *_):
+                return "digest"
+
+        class RepairingReviewer:
+            def review_story_output(self, *_):
+                return {
+                    "approved": True,
+                    "action": "repair",
+                    "reason": "fixed malformed proper noun",
+                    "repaired": {
+                        "titleZh": "唐纳德·克努斯《字母 S》（1980）",
+                        "aiSummary": "克努斯解释字母 S 的数学构造。",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    },
+                }
+
+        with patch.object(ingest_module, "_LazyAiQualityReviewer", return_value=RepairingReviewer()), patch.object(
+            ingest_module,
+            "_alert",
+        ) as alert:
+            summary = run_ingest_round(
+                run_id="quality-repair-complete",
+                client=_FakeHn(rankings, items),
+                ai_agent=BadAgent(),
+                run_cleanup=False,
+            )
+
+        self.assertEqual(summary["status"], "completed", summary)
+        self.assertEqual(summary["enrich"]["done"], 1)
+        self.assertEqual(summary["enrich"]["failed"], 0)
+        self.assertEqual(summary["enrich"]["retried"], 0)
+        self.assertFalse(
+            any(
+                call.args and call.args[0] in ("enrich_incomplete", "enrich_timeout")
+                for call in alert.call_args_list
+            )
+        )
 
     def test_fetch_score_only_update_does_not_reenrich_done_story(self):
         rankings = {"top": [101], "new": [], "best": [], "ask": [], "show": [], "job": []}
@@ -8766,6 +8999,13 @@ class CodexFirstAiAgentTests(unittest.TestCase):
                     "approved": True,
                     "action": "approve",
                     "reason": "false positive",
+                    "repaired": {
+                        "titleZh": "中文标题",
+                        "aiSummary": "摘要",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    },
                 }
 
         class Fallback:
@@ -8822,6 +9062,13 @@ class CodexFirstAiAgentTests(unittest.TestCase):
                     "approved": True,
                     "action": "approve",
                     "reason": "provider approved",
+                    "repaired": {
+                        "titleZh": "中文标题",
+                        "aiSummary": "摘要",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    },
                 }
 
         codex = FailingCodex()

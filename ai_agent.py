@@ -175,36 +175,98 @@ _DIGEST_INTRO_OUTPUT_SCHEMA: Dict[str, Any] = {
 }
 
 
+_AI_QUALITY_REPAIRED_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "titleZh": {"type": "string"},
+        "aiSummary": {"type": "string"},
+        "discussionThemes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["title", "summary"],
+                "additionalProperties": False,
+            },
+        },
+        "insights": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "author": {"type": "string"},
+                    "score": {"type": "integer"},
+                    "text": {"type": "string"},
+                },
+                "required": ["author", "score", "text"],
+                "additionalProperties": False,
+            },
+        },
+        "terms": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "term": {"type": "string"},
+                    "def": {"type": "string"},
+                },
+                "required": ["term", "def"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": [
+        "titleZh",
+        "aiSummary",
+        "discussionThemes",
+        "insights",
+        "terms",
+    ],
+    "additionalProperties": False,
+}
+
+
 _AI_QUALITY_REVIEW_OUTPUT_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "approved": {"type": "boolean"},
-        "action": {"type": "string", "enum": ["approve", "reject"]},
+        "action": {"type": "string", "enum": ["approve", "repair", "reject"]},
         "reason": {"type": "string"},
+        "repaired": _AI_QUALITY_REPAIRED_OUTPUT_SCHEMA,
     },
-    "required": ["approved", "action", "reason"],
+    "required": ["approved", "action", "reason", "repaired"],
     "additionalProperties": False,
 }
 
 _AI_QUALITY_REVIEW_SYSTEM_PROMPT = (
-    "You are a strict quality gate for a Chinese-language Hacker News reader. "
-    "Review generated reader-facing Chinese editorial output before it is "
-    "persisted. You receive the original source metadata, the full generated "
-    "output, and deterministic heuristic findings. Approve only when the "
+    "You are a strict quality gate and repair editor for a Chinese-language "
+    "Hacker News reader. Review generated reader-facing Chinese editorial "
+    "output before it is persisted. You receive original source metadata, the "
+    "full generated output, and deterministic heuristic findings. If the "
     "heuristic finding is clearly a false positive and the generated output is "
-    "natural, polished Chinese that is safe to show to readers. Reject if any "
-    "title, summary, theme, insight, or term contains malformed bilingual text, "
-    "including a proper noun rendered as Chinese transliteration plus a leftover "
-    "English suffix or prefix; awkward untranslated English fragments; broken "
-    "or unbalanced punctuation; JSON/markdown/prompt delimiter leakage; "
+    "natural, polished Chinese that is safe to show to readers, return action "
+    "approve, approved true, and copy the generated reader-facing fields into "
+    "repaired unchanged. If the output has fixable "
+    "quality problems, return action repair, approved true, and put the full "
+    "corrected reader-facing fields in repaired. Repair malformed bilingual "
+    "text, including a proper noun rendered as Chinese transliteration plus a "
+    "leftover English suffix or prefix; awkward untranslated English fragments; "
+    "broken or unbalanced punctuation; JSON/markdown/prompt delimiter leakage; "
     "machine-like meta disclaimers about missing input; inconsistent person, "
     "product, project, or paper names across fields; or wording that would read "
     "unnatural to a Chinese reader. Treat established acronyms and product names "
-    "as acceptable when they are formatted cleanly. Do not rewrite, shorten, or "
-    "repair the content; only approve or reject. Return one strict JSON object "
+    "as acceptable when they are formatted cleanly. Do not shorten, omit, or "
+    "summarize existing reader-facing fields as a control mechanism; preserve "
+    "valid themes, insights, and terms unless they themselves need repair. If "
+    "you cannot produce a complete natural repaired version, return action "
+    "reject, approved false, and copy the generated reader-facing fields into "
+    "repaired unchanged. Return one strict JSON object "
     "matching the schema."
 )
-_AI_QUALITY_REVIEW_OUTPUT_TOKENS = 800
+_AI_QUALITY_REVIEW_OUTPUT_TOKENS = 4000
 _AI_QUALITY_REVIEW_REASONING_EFFORT = "medium"
 
 
@@ -1760,22 +1822,113 @@ def validate_batch_ai_output(
     return out
 
 
+def _validate_quality_repaired_output(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("AI quality repair must be a JSON object")
+
+    title = raw.get("titleZh")
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError("AI quality repair requires non-empty titleZh")
+    summary = raw.get("aiSummary")
+    if not isinstance(summary, str):
+        raise ValueError("AI quality repair requires aiSummary string")
+
+    def _strict_themes(value: Any) -> List[Dict[str, str]]:
+        if not isinstance(value, list):
+            raise ValueError("AI quality repair discussionThemes must be an array")
+        out: List[Dict[str, str]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise ValueError("AI quality repair discussionThemes item must be object")
+            theme_title = item.get("title")
+            theme_summary = item.get("summary")
+            if not isinstance(theme_title, str) or not isinstance(theme_summary, str):
+                raise ValueError("AI quality repair discussionThemes item has invalid fields")
+            if not theme_title.strip() or not theme_summary.strip():
+                raise ValueError("AI quality repair discussionThemes item must be non-empty")
+            out.append(
+                {
+                    "title": theme_title.strip(),
+                    "summary": theme_summary.strip(),
+                }
+            )
+        return out
+
+    def _strict_insights(value: Any) -> List[Dict[str, Any]]:
+        if not isinstance(value, list):
+            raise ValueError("AI quality repair insights must be an array")
+        out: List[Dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise ValueError("AI quality repair insights item must be object")
+            author = item.get("author")
+            score = item.get("score")
+            text = item.get("text")
+            if not isinstance(author, str) or not isinstance(text, str):
+                raise ValueError("AI quality repair insights item has invalid fields")
+            if not text.strip():
+                raise ValueError("AI quality repair insights text must be non-empty")
+            score_int = _coerce_int_in_range(score, 0, 100000)
+            if score_int is None:
+                raise ValueError("AI quality repair insights score must be integer")
+            out.append(
+                {
+                    "author": author.strip() or "anonymous",
+                    "score": score_int,
+                    "text": text.strip(),
+                }
+            )
+        return out
+
+    def _strict_terms(value: Any) -> List[Dict[str, str]]:
+        if not isinstance(value, list):
+            raise ValueError("AI quality repair terms must be an array")
+        out: List[Dict[str, str]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise ValueError("AI quality repair terms item must be object")
+            term = item.get("term")
+            definition = item.get("def")
+            if not isinstance(term, str) or not isinstance(definition, str):
+                raise ValueError("AI quality repair terms item has invalid fields")
+            if not term.strip() or not definition.strip():
+                raise ValueError("AI quality repair terms item must be non-empty")
+            out.append({"term": term.strip(), "def": definition.strip()})
+        return out
+
+    return {
+        "titleZh": title.strip(),
+        "aiSummary": summary.strip(),
+        "discussionThemes": _strict_themes(raw.get("discussionThemes")),
+        "insights": _strict_insights(raw.get("insights")),
+        "terms": _strict_terms(raw.get("terms")),
+    }
+
+
 def validate_ai_quality_review(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("AI quality review must be a JSON object")
     action = str(raw.get("action") or "").strip().lower()
-    if action not in ("approve", "reject"):
-        raise ValueError("AI quality review action must be approve or reject")
+    if action not in ("approve", "repair", "reject"):
+        raise ValueError("AI quality review action must be approve, repair, or reject")
     approved = raw.get("approved")
     if not isinstance(approved, bool):
         raise ValueError("AI quality review approved must be boolean")
     reason = raw.get("reason")
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("AI quality review reason must be a non-empty string")
+
+    repaired = raw.get("repaired")
+    if action == "repair":
+        repaired = _validate_quality_repaired_output(repaired)
+    elif not isinstance(repaired, dict):
+        raise ValueError("AI quality review repaired must be an object")
+
     return {
-        "approved": bool(approved) and action == "approve",
+        "approved": bool(approved) and action in ("approve", "repair"),
         "action": action,
         "reason": reason.strip(),
+        "repaired": repaired if action == "repair" else None,
     }
 
 

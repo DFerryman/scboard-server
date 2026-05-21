@@ -272,15 +272,67 @@ class _LazyAiQualityReviewer:
         return self._get().review_story_output(story_row, processed, issues)
 
 
-def _ai_output_review_error(
+def _repair_sequence_shrunk(
+    original: Mapping[str, Any],
+    repaired: Mapping[str, Any],
+    key: str,
+) -> bool:
+    original_value = original.get(key)
+    repaired_value = repaired.get(key)
+    if not isinstance(original_value, AbcSequence) or isinstance(
+        original_value, (str, bytes)
+    ):
+        return False
+    if not isinstance(repaired_value, AbcSequence) or isinstance(
+        repaired_value, (str, bytes)
+    ):
+        return False
+    return len(repaired_value) < len(original_value)
+
+
+def _quality_repair_fragment(
+    original: Mapping[str, Any],
+    repaired: Any,
+) -> tuple[Optional[Dict[str, Any]], str]:
+    if not isinstance(repaired, AbcMapping):
+        return None, f"repair payload must be object, got {type(repaired).__name__}"
+
+    title = repaired.get("titleZh")
+    summary = repaired.get("aiSummary")
+    if not isinstance(title, str) or not title.strip():
+        return None, "repair payload requires non-empty titleZh"
+    if not isinstance(summary, str):
+        return None, "repair payload requires aiSummary string"
+    if isinstance(original.get("aiSummary"), str) and original.get("aiSummary"):
+        if not summary.strip():
+            return None, "repair payload must not drop a non-empty aiSummary"
+
+    fragment: Dict[str, Any] = {
+        "titleZh": title.strip(),
+        "aiSummary": summary.strip(),
+    }
+    for key in ("discussionThemes", "insights", "terms"):
+        if _repair_sequence_shrunk(original, repaired, key):
+            return None, f"repair payload must not reduce {key} count"
+        value = repaired.get(key)
+        if not isinstance(value, AbcSequence) or isinstance(value, (str, bytes)):
+            return None, f"repair payload requires {key} array"
+        for item in value:
+            if not isinstance(item, AbcMapping):
+                return None, f"repair payload {key} item must be object"
+        fragment[key] = list(value)
+    return fragment, ""
+
+
+def _apply_ai_output_quality_review(
     story_row: Mapping[str, Any],
     processed: Mapping[str, Any],
     *,
     quality_reviewer,
-) -> str:
+) -> tuple[Optional[Dict[str, Any]], str]:
     issues = _ai_output_quality_issues(story_row, processed)
     if not issues:
-        return ""
+        return dict(processed), ""
     try:
         decision = quality_reviewer.review_story_output(
             story_row,
@@ -288,27 +340,46 @@ def _ai_output_review_error(
             issues,
         )
     except Exception as exc:  # noqa: BLE001
-        return (
+        return None, (
             "AI output quality review failed; suspicious result was not "
             f"approved: {type(exc).__name__}: {exc}"
         )
     if not isinstance(decision, AbcMapping):
-        return (
+        return None, (
             "AI output quality review failed; suspicious result was not "
             f"approved: reviewer returned {type(decision).__name__}"
         )
-    approved = bool(decision.get("approved")) and str(
-        decision.get("action") or ""
-    ).strip().lower() == "approve"
-    if approved:
+    action = str(decision.get("action") or "").strip().lower()
+    approved = bool(decision.get("approved"))
+    if approved and action == "approve":
         log.info(
             "AI output quality review approved story %s despite heuristic findings: %s",
             _row_value(story_row, "id", ""),
             decision.get("reason") or "",
         )
-        return ""
+        return dict(processed), ""
+    if approved and action == "repair":
+        fragment, repair_error = _quality_repair_fragment(
+            processed,
+            decision.get("repaired"),
+        )
+        if repair_error:
+            return None, (
+                "AI output quality repair returned invalid payload: "
+                + repair_error
+                + "; heuristic findings: "
+                + "; ".join(issues)
+            )
+        repaired_processed = dict(processed)
+        repaired_processed.update(fragment or {})
+        log.info(
+            "AI output quality review repaired story %s: %s",
+            _row_value(story_row, "id", ""),
+            decision.get("reason") or "",
+        )
+        return repaired_processed, ""
     reason = str(decision.get("reason") or "review rejected suspicious output")
-    return (
+    return None, (
         "AI output quality review rejected result: "
         + reason
         + "; heuristic findings: "
@@ -772,11 +843,12 @@ def _record_enrich_failure(
     is_refresh: bool,
     error_msg: str,
     bump_visible_version: bool,
+    final: bool = False,
 ) -> None:
     sid = int(story_row["id"])
     if is_refresh:
         attempts = repository.increment_reenrich_attempts(conn, sid)
-        if attempts >= settings.ENRICH_MAX_ATTEMPTS:
+        if final or attempts >= settings.ENRICH_MAX_ATTEMPTS:
             repository.mark_reenrich_failed(conn, sid, error=error_msg)
             summary["failed"] += 1
         else:
@@ -785,7 +857,7 @@ def _record_enrich_failure(
         return
 
     attempts = repository.increment_enrich_attempts(conn, sid)
-    if attempts >= settings.ENRICH_MAX_ATTEMPTS:
+    if final or attempts >= settings.ENRICH_MAX_ATTEMPTS:
         visible_changed = repository.mark_enrich_failed(
             conn,
             sid,
@@ -963,14 +1035,22 @@ def _process_work_item_single_unlocked(
 
     if processed is None:
         return {"status": "failed", "error_msg": "ai agent returned None"}
-    quality_error = _ai_output_review_error(
+    processed, quality_error = _apply_ai_output_quality_review(
         story_row,
         processed,
         quality_reviewer=quality_reviewer,
     )
     if quality_error:
-        log.warning("ai process_story(%d) quality rejected: %s", sid, quality_error)
-        return {"status": "failed", "error_msg": quality_error}
+        log.warning(
+            "ai process_story(%d) quality review failed closed: %s",
+            sid,
+            quality_error,
+        )
+        return {
+            "status": "failed",
+            "error_msg": quality_error,
+            "final_failure": True,
+        }
     return {"status": "done", "processed": processed}
 
 
@@ -1003,6 +1083,7 @@ def _apply_single_work_item_result(
             is_refresh=bool(item["is_refresh"]),
             error_msg=str(result.get("error_msg") or "ai agent returned None"),
             bump_visible_version=bump_visible_version,
+            final=bool(result.get("final_failure")),
         )
         return
 
@@ -1326,26 +1407,31 @@ def _process_work_items(
         )
 
     resolved_items: List[Dict[str, Any]] = []
+    resolved_results: Dict[int, Dict[str, Any]] = {}
     missing_items: List[Dict[str, Any]] = []
-    quality_retry_items: List[Dict[str, Any]] = []
+    quality_failed_results: List[tuple[Dict[str, Any], str]] = []
     for item in work_items:
         sid = int(item["story"]["id"])
         processed = processed_by_id.get(sid)
         if processed is None:
             missing_items.append(item)
-        elif quality_error := _ai_output_review_error(
+            continue
+
+        reviewed, quality_error = _apply_ai_output_quality_review(
             item["story"],
             processed,
             quality_reviewer=quality_reviewer,
-        ):
+        )
+        if quality_error:
             log.warning(
-                "ai batch item %d quality rejected; retrying as single: %s",
+                "ai batch item %d quality review failed closed without single retry: %s",
                 sid,
                 quality_error,
             )
-            quality_retry_items.append(item)
+            quality_failed_results.append((item, quality_error))
         else:
             resolved_items.append(item)
+            resolved_results[sid] = reviewed or processed
 
     if resolved_items:
         with db.transaction(conn):
@@ -1356,28 +1442,40 @@ def _process_work_items(
                     conn,
                     summary,
                     story_row,
-                    processed_by_id[sid],
+                    resolved_results[sid],
                     comments_snapshot_descendants=int(
                         item["comments_fetched_descendants"]
                     ),
                     bump_visible_version=bump_visible_version,
                 )
 
-    retry_items = [*missing_items, *quality_retry_items]
-    if retry_items:
+    if quality_failed_results:
+        with db.transaction(conn):
+            for item, quality_error in quality_failed_results:
+                _record_enrich_failure(
+                    conn,
+                    summary,
+                    item["story"],
+                    is_refresh=bool(item.get("is_refresh")),
+                    error_msg=quality_error,
+                    bump_visible_version=bump_visible_version,
+                    final=True,
+                )
+
+    if missing_items:
         log.info(
             "ai batch returned %d/%d accepted stories; retrying %d missing "
-            "and %d quality-rejected as singles",
+            "as singles and recording %d quality failures without retry",
             len(resolved_items),
             len(work_items),
             len(missing_items),
-            len(quality_retry_items),
+            len(quality_failed_results),
         )
         return _fallback_to_singles(
             conn,
             summary,
             ai_agent,
-            retry_items,
+            missing_items,
             topic_catalog,
             quality_reviewer,
             bump_visible_version=bump_visible_version,
@@ -1674,49 +1772,27 @@ def _enrich_claimed_rows(
                             summary["retried"] += 1
                 continue
 
-            quality_error = _ai_output_review_error(
+            processed, quality_error = _apply_ai_output_quality_review(
                 story_row,
                 processed,
                 quality_reviewer=quality_reviewer,
             )
             if quality_error:
                 log.warning(
-                    "ai process_story(%d) quality rejected: %s",
+                    "ai process_story(%d) quality review failed closed: %s",
                     sid,
                     quality_error,
                 )
                 with db.transaction(conn):
-                    if is_refresh:
-                        attempts = repository.increment_reenrich_attempts(
-                            conn, sid
-                        )
-                        if attempts >= settings.ENRICH_MAX_ATTEMPTS:
-                            repository.mark_reenrich_failed(
-                                conn, sid, error=quality_error
-                            )
-                            summary["failed"] += 1
-                        else:
-                            repository.mark_reenrich_retry(
-                                conn, sid, error=quality_error
-                            )
-                            summary["retried"] += 1
-                    else:
-                        attempts = repository.increment_enrich_attempts(conn, sid)
-                        if attempts >= settings.ENRICH_MAX_ATTEMPTS:
-                            visible_changed = repository.mark_enrich_failed(
-                                conn,
-                                sid,
-                                title_en=story_row["title_en"] or "",
-                                error=quality_error,
-                            )
-                            if visible_changed and bump_visible_version:
-                                repository.bump_catalog_version(conn)
-                            summary["failed"] += 1
-                        else:
-                            repository.mark_enrich_pending_retry(
-                                conn, sid, error=quality_error
-                            )
-                            summary["retried"] += 1
+                    _record_enrich_failure(
+                        conn,
+                        summary,
+                        story_row,
+                        is_refresh=is_refresh,
+                        error_msg=quality_error,
+                        bump_visible_version=bump_visible_version,
+                        final=True,
+                    )
                 continue
 
             with db.transaction(conn):
