@@ -4191,6 +4191,455 @@ class CloudSyncReadModel(_SqliteCase):
                 settings.INSIGHTS_EVIDENCE_BATCH_STORIES,
             ) = old_caps  # type: ignore[assignment]
 
+    def test_run_insights_once_parallelizes_evidence_and_final_agents_with_timings(self):
+        from . import insights
+
+        target = "2026-05-19"
+        target_start, _ = repository.digest_date_epoch_bounds(target)
+
+        class ParallelProbeAgent:
+            def __init__(self):
+                self.lock = Lock()
+                self.evidence_active = 0
+                self.evidence_max_active = 0
+                self.final_active = 0
+                self.final_max_active = 0
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint):
+                return checkpoint, {}
+
+            def _enter_evidence(self):
+                with self.lock:
+                    self.evidence_active += 1
+                    self.evidence_max_active = max(
+                        self.evidence_max_active,
+                        self.evidence_active,
+                    )
+
+            def _exit_evidence(self):
+                with self.lock:
+                    self.evidence_active -= 1
+
+            def _enter_final(self):
+                with self.lock:
+                    self.final_active += 1
+                    self.final_max_active = max(
+                        self.final_max_active,
+                        self.final_active,
+                    )
+
+            def _exit_final(self):
+                with self.lock:
+                    self.final_active -= 1
+
+            def run_evidence(self, payload):
+                self._enter_evidence()
+                try:
+                    time.sleep(0.03)
+                    return {
+                        "evidenceCards": [
+                            {
+                                "topicKey": f"topic-{story['id']}",
+                                "topic": story["topicName"],
+                                "storyIds": [story["id"]],
+                                "synthesis": story["aiSummary"],
+                                "painPoints": ["pain"],
+                                "opportunityAngles": ["angle"],
+                                "debatePoints": ["debate"],
+                                "commentSignals": [],
+                            }
+                            for story in payload["stories"]
+                        ],
+                        "excludedStoryIds": [],
+                        "exclusionReasons": {},
+                        "coverage": {
+                            "inputStoryCount": len(payload["stories"]),
+                            "assignedStoryCount": len(payload["stories"]),
+                            "excludedStoryCount": 0,
+                        },
+                    }
+                finally:
+                    self._exit_evidence()
+
+            def run_topic_scout(self, payload):
+                return {
+                    "selectedTopics": [
+                        {
+                            "topicKey": card["topicKey"],
+                            "reason": "selected",
+                            "routes": ["signals", "opportunities", "debates"],
+                        }
+                        for card in payload["evidenceCards"]
+                    ],
+                    "excludedTopics": [],
+                }
+
+            def run_signals(self, _payload):
+                self._enter_final()
+                try:
+                    time.sleep(0.03)
+                    return {
+                        "headline": "headline",
+                        "summary": "summary",
+                        "signals": [
+                            {
+                                "id": f"s-{i}",
+                                "label": "模式",
+                                "title": f"signal {i}",
+                                "brief": "brief",
+                                "trend": "+0",
+                                "tone": "flat",
+                            }
+                            for i in range(3)
+                        ],
+                    }
+                finally:
+                    self._exit_final()
+
+            def run_opportunities(self, payload):
+                self._enter_final()
+                try:
+                    time.sleep(0.03)
+                    ids = [item["storyIds"][0] for item in payload["candidates"][:3]]
+                    return {
+                        "opportunities": [
+                            {
+                                "rank": index + 1,
+                                "rankText": f"{index + 1:02d}",
+                                "title": f"opp {index}",
+                                "score": 80,
+                                "category": "tool",
+                                "audience": ["dev"],
+                                "thesis": "thesis",
+                                "whyNow": "now",
+                                "risk": "risk",
+                                "linkedStoryIds": [sid],
+                            }
+                            for index, sid in enumerate(ids)
+                        ]
+                    }
+                finally:
+                    self._exit_final()
+
+            def run_debates(self, _payload):
+                self._enter_final()
+                try:
+                    time.sleep(0.03)
+                    return {
+                        "debates": [
+                            {
+                                "topic": f"debate {index}",
+                                "verdict": "观察",
+                                "intensity": 50,
+                                "supportWidth": 50,
+                                "opposeWidth": 50,
+                                "support": "support",
+                                "oppose": "oppose",
+                                "watch": "watch",
+                            }
+                            for index in range(2)
+                        ]
+                    }
+                finally:
+                    self._exit_final()
+
+        old_caps = (
+            settings.INSIGHTS_EVIDENCE_MAX_STORIES,
+            settings.INSIGHTS_EVIDENCE_BATCH_STORIES,
+            settings.INSIGHTS_EVIDENCE_WORKERS,
+            settings.INSIGHTS_FINAL_WORKERS,
+        )
+        try:
+            settings.INSIGHTS_EVIDENCE_MAX_STORIES = 10  # type: ignore[assignment]
+            settings.INSIGHTS_EVIDENCE_BATCH_STORIES = 1  # type: ignore[assignment]
+            settings.INSIGHTS_EVIDENCE_WORKERS = 3  # type: ignore[assignment]
+            settings.INSIGHTS_FINAL_WORKERS = 3  # type: ignore[assignment]
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    for offset in range(10):
+                        self._insert_done_story(
+                            conn,
+                            2700 + offset,
+                            target_start + offset * 60,
+                            topic=self._fixed_topic(offset),
+                            score=160 + offset,
+                            descendants=80 + offset,
+                        )
+            finally:
+                conn.close()
+
+            agent = ParallelProbeAgent()
+            summary = insights.run_insights_once(
+                date=target,
+                force=True,
+                ai_agent=agent,
+            )
+        finally:
+            (
+                settings.INSIGHTS_EVIDENCE_MAX_STORIES,
+                settings.INSIGHTS_EVIDENCE_BATCH_STORIES,
+                settings.INSIGHTS_EVIDENCE_WORKERS,
+                settings.INSIGHTS_FINAL_WORKERS,
+            ) = old_caps  # type: ignore[assignment]
+
+        self.assertEqual(summary["status"], "ok")
+        self.assertGreater(agent.evidence_max_active, 1)
+        self.assertGreater(agent.final_max_active, 1)
+        stage_seconds = summary["run_summary"]["stage_seconds"]
+        for key in (
+            "evidence_seconds",
+            "topic_scout_seconds",
+            "signals_seconds",
+            "opportunities_seconds",
+            "debates_seconds",
+            "final_agents_wall_seconds",
+            "total_seconds",
+        ):
+            self.assertIn(key, stage_seconds)
+        self.assertEqual(
+            summary["run_summary"]["concurrency"],
+            {"evidence_workers": 3, "final_workers": 3},
+        )
+
+    def test_run_insights_once_stops_evidence_submission_after_batch_failure(self):
+        from . import insights
+
+        target = "2026-05-19"
+        target_start, _ = repository.digest_date_epoch_bounds(target)
+
+        class FailingEvidenceAgent:
+            def __init__(self):
+                self.lock = Lock()
+                self.evidence_calls = 0
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint):
+                return checkpoint, {}
+
+            def run_evidence(self, payload):
+                with self.lock:
+                    self.evidence_calls += 1
+                    call_no = self.evidence_calls
+                if call_no == 1:
+                    raise RuntimeError("evidence boom")
+                time.sleep(0.05)
+                return {
+                    "evidenceCards": [
+                        {
+                            "topicKey": f"topic-{story['id']}",
+                            "topic": story["topicName"],
+                            "storyIds": [story["id"]],
+                            "synthesis": story["aiSummary"],
+                            "painPoints": ["pain"],
+                            "opportunityAngles": ["angle"],
+                            "debatePoints": ["debate"],
+                            "commentSignals": [],
+                        }
+                        for story in payload["stories"]
+                    ],
+                    "excludedStoryIds": [],
+                    "exclusionReasons": {},
+                    "coverage": {
+                        "inputStoryCount": len(payload["stories"]),
+                        "assignedStoryCount": len(payload["stories"]),
+                        "excludedStoryCount": 0,
+                    },
+                }
+
+        old_caps = (
+            settings.INSIGHTS_EVIDENCE_MAX_STORIES,
+            settings.INSIGHTS_EVIDENCE_BATCH_STORIES,
+            settings.INSIGHTS_EVIDENCE_WORKERS,
+        )
+        try:
+            settings.INSIGHTS_EVIDENCE_MAX_STORIES = 10  # type: ignore[assignment]
+            settings.INSIGHTS_EVIDENCE_BATCH_STORIES = 1  # type: ignore[assignment]
+            settings.INSIGHTS_EVIDENCE_WORKERS = 2  # type: ignore[assignment]
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    for offset in range(10):
+                        self._insert_done_story(
+                            conn,
+                            2800 + offset,
+                            target_start + offset * 60,
+                            topic=self._fixed_topic(offset),
+                            score=170 + offset,
+                            descendants=90 + offset,
+                        )
+            finally:
+                conn.close()
+
+            agent = FailingEvidenceAgent()
+            summary = insights.run_insights_once(
+                date=target,
+                force=True,
+                ai_agent=agent,
+            )
+        finally:
+            (
+                settings.INSIGHTS_EVIDENCE_MAX_STORIES,
+                settings.INSIGHTS_EVIDENCE_BATCH_STORIES,
+                settings.INSIGHTS_EVIDENCE_WORKERS,
+            ) = old_caps  # type: ignore[assignment]
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertIn("evidence boom", summary["error"])
+        self.assertLessEqual(agent.evidence_calls, 2)
+        run_summary = summary["run_summary"]
+        self.assertTrue(run_summary["failed"])
+        self.assertIn("evidence_seconds", run_summary["stage_seconds"])
+        self.assertIn("total_seconds", run_summary["stage_seconds"])
+
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT status, summary FROM insights_runs WHERE date=?",
+                (target,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["status"], "failed")
+        recorded_summary = json.loads(row["summary"])
+        self.assertIn("evidence_seconds", recorded_summary["stage_seconds"])
+        self.assertIn("total_seconds", recorded_summary["stage_seconds"])
+
+    def test_run_insights_once_records_final_agent_failure_timings(self):
+        from . import insights
+
+        target = "2026-05-19"
+        target_start, _ = repository.digest_date_epoch_bounds(target)
+
+        class FinalFailureAgent:
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint):
+                return checkpoint, {}
+
+            def run_evidence(self, payload):
+                return {
+                    "evidenceCards": [
+                        {
+                            "topicKey": f"topic-{story['id']}",
+                            "topic": story["topicName"],
+                            "storyIds": [story["id"]],
+                            "synthesis": story["aiSummary"],
+                            "painPoints": ["pain"],
+                            "opportunityAngles": ["angle"],
+                            "debatePoints": ["debate"],
+                            "commentSignals": [],
+                        }
+                        for story in payload["stories"]
+                    ],
+                    "excludedStoryIds": [],
+                    "exclusionReasons": {},
+                    "coverage": {
+                        "inputStoryCount": len(payload["stories"]),
+                        "assignedStoryCount": len(payload["stories"]),
+                        "excludedStoryCount": 0,
+                    },
+                }
+
+            def run_topic_scout(self, payload):
+                return {
+                    "selectedTopics": [
+                        {
+                            "topicKey": card["topicKey"],
+                            "reason": "selected",
+                            "routes": ["signals", "opportunities", "debates"],
+                        }
+                        for card in payload["evidenceCards"]
+                    ],
+                    "excludedTopics": [],
+                }
+
+            def run_signals(self, _payload):
+                time.sleep(0.03)
+                return {
+                    "headline": "headline",
+                    "summary": "summary",
+                    "signals": [
+                        {
+                            "id": f"s-{i}",
+                            "label": "模式",
+                            "title": f"signal {i}",
+                            "brief": "brief",
+                            "trend": "+0",
+                            "tone": "flat",
+                        }
+                        for i in range(3)
+                    ],
+                }
+
+            def run_opportunities(self, payload):
+                time.sleep(0.03)
+                ids = [item["storyIds"][0] for item in payload["candidates"][:3]]
+                return {
+                    "opportunities": [
+                        {
+                            "rank": index + 1,
+                            "rankText": f"{index + 1:02d}",
+                            "title": f"opp {index}",
+                            "score": 80,
+                            "category": "tool",
+                            "audience": ["dev"],
+                            "thesis": "thesis",
+                            "whyNow": "now",
+                            "risk": "risk",
+                            "linkedStoryIds": [sid],
+                        }
+                        for index, sid in enumerate(ids)
+                    ]
+                }
+
+            def run_debates(self, _payload):
+                raise RuntimeError("debate boom")
+
+        old_workers = settings.INSIGHTS_FINAL_WORKERS
+        try:
+            settings.INSIGHTS_FINAL_WORKERS = 3  # type: ignore[assignment]
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    for offset in range(10):
+                        self._insert_done_story(
+                            conn,
+                            2900 + offset,
+                            target_start + offset * 60,
+                            topic=self._fixed_topic(offset),
+                            score=180 + offset,
+                            descendants=100 + offset,
+                        )
+            finally:
+                conn.close()
+
+            summary = insights.run_insights_once(
+                date=target,
+                force=True,
+                ai_agent=FinalFailureAgent(),
+            )
+        finally:
+            settings.INSIGHTS_FINAL_WORKERS = old_workers  # type: ignore[assignment]
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertIn("debate boom", summary["error"])
+        run_summary = summary["run_summary"]
+        self.assertTrue(run_summary["failed"])
+        for key in (
+            "evidence_seconds",
+            "topic_scout_seconds",
+            "final_agents_wall_seconds",
+            "total_seconds",
+        ):
+            self.assertIn(key, run_summary["stage_seconds"])
+
     def test_run_insights_once_skips_when_material_fingerprint_is_unchanged(self):
         from . import insights
 
@@ -15896,11 +16345,18 @@ class StoryImagePipelineTests(_SqliteCase):
         src = io.BytesIO()
         Image.new("RGB", (160, 90), (200, 10, 10)).save(src, format="JPEG")
         out = story_images._normalize_image(
-            src.getvalue(), fit="cover", max_pixels=1_000_000
+            src.getvalue(), max_pixels=1_000_000
         )
         with Image.open(io.BytesIO(out)) as im:
             self.assertEqual(im.size, (64, 64))
             self.assertEqual(im.format, "PNG")
+            self.assertEqual(im.convert("RGBA").getpixel((32, 0)), (0, 0, 0, 255))
+            self.assertEqual(im.convert("RGBA").getpixel((32, 63)), (0, 0, 0, 255))
+            r, g, b, a = im.convert("RGBA").getpixel((32, 32))
+            self.assertGreater(r, 150)
+            self.assertLess(g, 80)
+            self.assertLess(b, 80)
+            self.assertEqual(a, 255)
 
     def test_process_story_images_uploads_and_records_asset(self):
         from . import story_images

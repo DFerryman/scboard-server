@@ -513,6 +513,18 @@ INSIGHTS_EVIDENCE_BATCH_STORIES = _require_int_range(
     min_value=1,
     max_value=200,
 )
+INSIGHTS_EVIDENCE_WORKERS = _require_int_range(
+    "HNREADER_INSIGHTS_EVIDENCE_WORKERS",
+    _env_int("HNREADER_INSIGHTS_EVIDENCE_WORKERS", 4),
+    min_value=1,
+    max_value=32,
+)
+INSIGHTS_FINAL_WORKERS = _require_int_range(
+    "HNREADER_INSIGHTS_FINAL_WORKERS",
+    _env_int("HNREADER_INSIGHTS_FINAL_WORKERS", 3),
+    min_value=1,
+    max_value=3,
+)
 INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS = _require_int_range(
     "HNREADER_INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS",
     _env_int(

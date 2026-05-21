@@ -7,7 +7,9 @@ import hashlib
 import json
 import logging
 import re
+import time
 import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -40,6 +42,10 @@ SIGNALS_MIN_STORIES = 3
 OPPORTUNITY_MIN_CANDIDATES = 3
 DEBATE_MIN_CANDIDATES = 2
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _elapsed_seconds(started: float) -> float:
+    return round(max(0.0, time.monotonic() - started), 3)
 
 
 def _json_loads(text: Any, default: Any) -> Any:
@@ -842,8 +848,8 @@ def _run_evidence_batches(
             },
             stats,
         )
-    outputs: List[Mapping[str, Any]] = []
-    for batch_rows in batches:
+
+    def _run_one(index: int, batch_rows: Sequence[Any]) -> Tuple[int, Mapping[str, Any], bool]:
         cache_key = _evidence_batch_cache_key(
             target_date=target_date,
             start_date=start_date,
@@ -853,9 +859,7 @@ def _run_evidence_batches(
         )
         cached = _load_cached_evidence(cache_key)
         if cached is not None:
-            stats["hits"] += 1
-            outputs.append(cached)
-            continue
+            return index, cached, True
 
         payload = build_evidence_input(
             batch_rows,
@@ -866,8 +870,52 @@ def _run_evidence_batches(
         )
         output = agent.run_evidence(payload)
         _store_cached_evidence(cache_key, output, len(batch_rows))
-        stats["misses"] += 1
-        outputs.append(output)
+        return index, output, False
+
+    outputs_by_index: List[Optional[Mapping[str, Any]]] = [None] * len(batches)
+    worker_count = max(
+        1,
+        min(int(settings.INSIGHTS_EVIDENCE_WORKERS), len(batches)),
+    )
+    if worker_count == 1:
+        for index, batch_rows in enumerate(batches):
+            result_index, output, cache_hit = _run_one(index, batch_rows)
+            outputs_by_index[result_index] = output
+            stats["hits" if cache_hit else "misses"] += 1
+    else:
+        executor = ThreadPoolExecutor(max_workers=worker_count)
+        futures: Dict[Any, int] = {}
+        next_index = 0
+
+        def _submit_next() -> None:
+            nonlocal next_index
+            if next_index >= len(batches):
+                return
+            futures[executor.submit(_run_one, next_index, batches[next_index])] = next_index
+            next_index += 1
+
+        try:
+            for _ in range(worker_count):
+                _submit_next()
+            while futures:
+                done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    futures.pop(future, None)
+                    result_index, output, cache_hit = future.result()
+                    outputs_by_index[result_index] = output
+                    stats["hits" if cache_hit else "misses"] += 1
+                    _submit_next()
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+
+    outputs: List[Mapping[str, Any]] = [
+        output for output in outputs_by_index if output is not None
+    ]
     if len(outputs) == 1:
         return dict(outputs[0]), stats
     return _merge_evidence_outputs(outputs), stats
@@ -1147,6 +1195,62 @@ def _insights_input_gaps(counts: Mapping[str, int]) -> List[str]:
     return gaps
 
 
+def _run_final_agents(
+    agent: Any,
+    *,
+    signals_input: Mapping[str, Any],
+    opportunities_input: Mapping[str, Any],
+    debates_input: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, float]]:
+    tasks = (
+        ("signals", agent.run_signals, signals_input),
+        ("opportunities", agent.run_opportunities, opportunities_input),
+        ("debates", agent.run_debates, debates_input),
+    )
+    worker_count = max(
+        1,
+        min(int(settings.INSIGHTS_FINAL_WORKERS), len(tasks)),
+    )
+    timings: Dict[str, float] = {}
+
+    def _run_one(name: str, fn: Any, payload: Mapping[str, Any]) -> Tuple[str, Dict[str, Any], float]:
+        started = time.monotonic()
+        result = fn(payload)
+        return name, result, _elapsed_seconds(started)
+
+    results: Dict[str, Dict[str, Any]] = {}
+    if worker_count == 1:
+        for name, fn, payload in tasks:
+            result_name, result, elapsed = _run_one(name, fn, payload)
+            results[result_name] = result
+            timings[f"{result_name}_seconds"] = elapsed
+    else:
+        executor = ThreadPoolExecutor(max_workers=worker_count)
+        futures = {
+            executor.submit(_run_one, name, fn, payload): name
+            for name, fn, payload in tasks
+        }
+        try:
+            for future in as_completed(futures):
+                result_name, result, elapsed = future.result()
+                results[result_name] = result
+                timings[f"{result_name}_seconds"] = elapsed
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+
+    return (
+        results["signals"],
+        results["opportunities"],
+        results["debates"],
+        timings,
+    )
+
+
 def _usage_checkpoint(agent: Any) -> Optional[Any]:
     fn = getattr(agent, "usage_checkpoint", None)
     if not callable(fn):
@@ -1312,6 +1416,22 @@ def _insights_analysis_fingerprint(
     return hasher.hexdigest()
 
 
+def _attach_stage_timings(
+    summary: Dict[str, Any],
+    stage_timings: Optional[Mapping[str, float]],
+) -> None:
+    if not stage_timings:
+        return
+    summary["stage_seconds"] = {
+        str(key): round(max(0.0, float(value)), 3)
+        for key, value in sorted(stage_timings.items())
+    }
+    summary["concurrency"] = {
+        "evidence_workers": int(settings.INSIGHTS_EVIDENCE_WORKERS),
+        "final_workers": int(settings.INSIGHTS_FINAL_WORKERS),
+    }
+
+
 def _insights_run_summary(
     *,
     today_rows: Sequence[Any],
@@ -1322,6 +1442,7 @@ def _insights_run_summary(
     evidence_cache: str = "",
     evidence_cache_stats: Optional[Mapping[str, int]] = None,
     topic_scout: Optional[Mapping[str, Any]] = None,
+    stage_timings: Optional[Mapping[str, float]] = None,
     skip_reason: str = "",
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {
@@ -1342,6 +1463,7 @@ def _insights_run_summary(
     if topic_scout is not None:
         out["topic_scout_selected_count"] = len(topic_scout.get("selectedTopics") or [])
         out["topic_scout_excluded_count"] = len(topic_scout.get("excludedTopics") or [])
+    _attach_stage_timings(out, stage_timings)
     if skip_reason:
         out["skip_reason"] = skip_reason
     return out
@@ -1383,6 +1505,8 @@ def run_insights_once(
     target_date = _target_date(date)
     run_id = f"insights-{target_date}-{uuid.uuid4().hex[:8]}"
     started_at = repository.now_seconds()
+    total_started = time.monotonic()
+    stage_timings: Dict[str, float] = {}
 
     if not settings.INSIGHTS_ENABLED:
         return {"status": "skipped", "reason": "disabled", "date": target_date}
@@ -1391,6 +1515,7 @@ def run_insights_once(
     start_ts, end_ts, start_date = _window_bounds(target_date, window_days)
     today_start, today_end = repository.digest_date_epoch_bounds(target_date)
 
+    input_started = time.monotonic()
     conn = db.connect()
     try:
         window_rows = repository.candidate_rows_for_insights(
@@ -1408,6 +1533,9 @@ def run_insights_once(
                 "today_story_count": len(today_rows),
                 "skip_reason": reason,
             }
+            stage_timings["input_seconds"] = _elapsed_seconds(input_started)
+            stage_timings["total_seconds"] = _elapsed_seconds(total_started)
+            _attach_stage_timings(summary, stage_timings)
             _finish_run_record(
                 run_id=run_id,
                 date=target_date,
@@ -1431,6 +1559,9 @@ def run_insights_once(
         ):
             reason = "not_due"
             summary = {"skip_reason": reason}
+            stage_timings["input_seconds"] = _elapsed_seconds(input_started)
+            stage_timings["total_seconds"] = _elapsed_seconds(total_started)
+            _attach_stage_timings(summary, stage_timings)
             _finish_run_record(
                 run_id=run_id,
                 date=target_date,
@@ -1476,12 +1607,14 @@ def run_insights_once(
         previous_insight = _previous_insight_context(existing_insight_row)
     finally:
         conn.close()
+    stage_timings["input_seconds"] = _elapsed_seconds(input_started)
 
     agent = None
     usage_checkpoint = None
     run_summary: Optional[dict] = None
 
     try:
+        preflight_started = time.monotonic()
         preflight_counts = {
             "signals_stories": len(today_rows),
             "evidence_stories": len(evidence_rows),
@@ -1503,11 +1636,14 @@ def run_insights_once(
             )
         if preflight_gaps:
             reason = "insufficient_insights_inputs"
+            stage_timings["preflight_seconds"] = _elapsed_seconds(preflight_started)
+            stage_timings["total_seconds"] = _elapsed_seconds(total_started)
             summary = _insights_run_summary(
                 today_rows=today_rows,
                 evidence_rows=evidence_rows,
                 comments_by_story=comments_by_story,
                 material_fingerprint=material_fingerprint,
+                stage_timings=stage_timings,
                 skip_reason=reason,
             )
             _finish_run_record(
@@ -1526,6 +1662,7 @@ def run_insights_once(
                 "input_gaps": preflight_gaps,
                 "run_summary": summary,
             }
+        stage_timings["preflight_seconds"] = _elapsed_seconds(preflight_started)
 
         if (
             not force
@@ -1534,11 +1671,13 @@ def run_insights_once(
             == material_fingerprint
         ):
             reason = "material_unchanged"
+            stage_timings["total_seconds"] = _elapsed_seconds(total_started)
             summary = _insights_run_summary(
                 today_rows=today_rows,
                 evidence_rows=evidence_rows,
                 comments_by_story=comments_by_story,
                 material_fingerprint=material_fingerprint,
+                stage_timings=stage_timings,
                 skip_reason=reason,
             )
             _finish_run_record(
@@ -1557,25 +1696,40 @@ def run_insights_once(
                 "run_summary": summary,
             }
 
-        agent = ai_agent or InsightsAgentRunner()
-        usage_checkpoint = _usage_checkpoint(agent)
+        agent_started = time.monotonic()
+        try:
+            agent = ai_agent or InsightsAgentRunner()
+            usage_checkpoint = _usage_checkpoint(agent)
+        finally:
+            stage_timings["agent_init_seconds"] = _elapsed_seconds(agent_started)
 
-        evidence_out, evidence_cache_stats = _run_evidence_batches(
-            agent,
-            evidence_rows,
-            target_date=target_date,
-            start_date=start_date,
-            feed_ranks=feed_ranks,
-            comments_by_story=comments_by_story,
-        )
+        evidence_started = time.monotonic()
+        try:
+            evidence_out, evidence_cache_stats = _run_evidence_batches(
+                agent,
+                evidence_rows,
+                target_date=target_date,
+                start_date=start_date,
+                feed_ranks=feed_ranks,
+                comments_by_story=comments_by_story,
+            )
+        finally:
+            stage_timings["evidence_seconds"] = _elapsed_seconds(evidence_started)
         evidence_cache_status = _evidence_cache_status(evidence_cache_stats)
+        routing_started = time.monotonic()
         story_refs = _story_refs_by_id(window_rows, feed_ranks)
         topic_scout_input = build_topic_scout_input(
             evidence_out,
             target_date=target_date,
             story_refs=story_refs,
         )
-        topic_scout_out = agent.run_topic_scout(topic_scout_input)
+        stage_timings["topic_scout_input_seconds"] = _elapsed_seconds(routing_started)
+        topic_scout_started = time.monotonic()
+        try:
+            topic_scout_out = agent.run_topic_scout(topic_scout_input)
+        finally:
+            stage_timings["topic_scout_seconds"] = _elapsed_seconds(topic_scout_started)
+        routing_started = time.monotonic()
         signals_input, opportunities_input, debates_input = (
             build_routed_insights_inputs(
                 target_date=target_date,
@@ -1586,6 +1740,7 @@ def run_insights_once(
                 previous_insight=previous_insight,
             )
         )
+        stage_timings["routing_seconds"] = _elapsed_seconds(routing_started)
         run_summary = _insights_run_summary(
             today_rows=today_rows,
             evidence_rows=evidence_rows,
@@ -1594,6 +1749,7 @@ def run_insights_once(
             evidence_cache=evidence_cache_status,
             evidence_cache_stats=evidence_cache_stats,
             topic_scout=topic_scout_out,
+            stage_timings=stage_timings,
         )
 
         input_counts = _insights_input_counts(
@@ -1604,8 +1760,10 @@ def run_insights_once(
         input_gaps = _insights_input_gaps(input_counts)
         if input_gaps:
             reason = "insufficient_insights_inputs"
+            stage_timings["total_seconds"] = _elapsed_seconds(total_started)
             skip_summary = dict(run_summary)
             skip_summary["skip_reason"] = reason
+            _attach_stage_timings(skip_summary, stage_timings)
             _finish_run_record(
                 run_id=run_id,
                 date=target_date,
@@ -1624,26 +1782,40 @@ def run_insights_once(
                 "run_summary": skip_summary,
             }
 
-        analysis_fingerprint = _insights_analysis_fingerprint(
-            target_date=target_date,
-            signals_input=signals_input,
-            opportunities_input=opportunities_input,
-            debates_input=debates_input,
-        )
+        analysis_started = time.monotonic()
+        try:
+            analysis_fingerprint = _insights_analysis_fingerprint(
+                target_date=target_date,
+                signals_input=signals_input,
+                opportunities_input=opportunities_input,
+                debates_input=debates_input,
+            )
+        finally:
+            stage_timings["analysis_fingerprint_seconds"] = _elapsed_seconds(
+                analysis_started
+            )
         run_summary["analysis_fingerprint"] = analysis_fingerprint
         if not force:
-            conn = db.connect()
+            analysis_gate_started = time.monotonic()
             try:
-                previous_analysis_fingerprint = repository.get_meta(
-                    conn,
-                    _analysis_meta_key(target_date),
-                )
+                conn = db.connect()
+                try:
+                    previous_analysis_fingerprint = repository.get_meta(
+                        conn,
+                        _analysis_meta_key(target_date),
+                    )
+                finally:
+                    conn.close()
             finally:
-                conn.close()
+                stage_timings["analysis_gate_seconds"] = _elapsed_seconds(
+                    analysis_gate_started
+                )
             if previous_analysis_fingerprint == analysis_fingerprint:
                 reason = "analysis_unchanged"
+                stage_timings["total_seconds"] = _elapsed_seconds(total_started)
                 skip_summary = dict(run_summary)
                 skip_summary["skip_reason"] = reason
+                _attach_stage_timings(skip_summary, stage_timings)
                 _finish_run_record(
                     run_id=run_id,
                     date=target_date,
@@ -1662,37 +1834,53 @@ def run_insights_once(
                     "run_summary": skip_summary,
                 }
 
-        signals_out = agent.run_signals(signals_input)
-        opportunities_out = agent.run_opportunities(opportunities_input)
-        debates_out = agent.run_debates(debates_input)
+        final_started = time.monotonic()
+        try:
+            signals_out, opportunities_out, debates_out, final_timings = _run_final_agents(
+                agent,
+                signals_input=signals_input,
+                opportunities_input=opportunities_input,
+                debates_input=debates_input,
+            )
+        finally:
+            stage_timings["final_agents_wall_seconds"] = _elapsed_seconds(
+                final_started
+            )
+        stage_timings.update(final_timings)
 
-        source_story_ids = _collect_story_reference_ids(
-            signals_out,
-            opportunities_out,
-            debates_out,
-        )
-        debates = debates_out["debates"]
-        payload = {
-            "version": INSIGHTS_VERSION,
-            "date": target_date,
-            "asOf": target_date,
-            "asOfLabel": _as_of_label(target_date),
-            "generatedAt": _now_iso_in_digest_tz(),
-            "window": INSIGHTS_WINDOW_LABEL,
-            "access": {"unlocked": True, "tier": "pro"},
-            "headline": signals_out["headline"],
-            "summary": signals_out["summary"],
-            "stats": _build_stats(
-                window_rows=window_rows,
-                source_story_ids=source_story_ids,
-                debates=debates,
-            ),
-            "signals": signals_out["signals"],
-            "opportunities": opportunities_out["opportunities"],
-            "debates": debates,
-        }
-        payload = sanitize_forbidden_words(payload)
-        _validate_final_payload(payload, candidate_story_ids)
+        payload_started = time.monotonic()
+        try:
+            source_story_ids = _collect_story_reference_ids(
+                signals_out,
+                opportunities_out,
+                debates_out,
+            )
+            debates = debates_out["debates"]
+            payload = {
+                "version": INSIGHTS_VERSION,
+                "date": target_date,
+                "asOf": target_date,
+                "asOfLabel": _as_of_label(target_date),
+                "generatedAt": _now_iso_in_digest_tz(),
+                "window": INSIGHTS_WINDOW_LABEL,
+                "access": {"unlocked": True, "tier": "pro"},
+                "headline": signals_out["headline"],
+                "summary": signals_out["summary"],
+                "stats": _build_stats(
+                    window_rows=window_rows,
+                    source_story_ids=source_story_ids,
+                    debates=debates,
+                ),
+                "signals": signals_out["signals"],
+                "opportunities": opportunities_out["opportunities"],
+                "debates": debates,
+            }
+            payload = sanitize_forbidden_words(payload)
+            _validate_final_payload(payload, candidate_story_ids)
+        finally:
+            stage_timings["payload_seconds"] = _elapsed_seconds(payload_started)
+        stage_timings["total_seconds"] = _elapsed_seconds(total_started)
+        _attach_stage_timings(run_summary, stage_timings)
 
         model_usage = _usage_since(agent, usage_checkpoint)
         conn = db.connect()
@@ -1743,19 +1931,24 @@ def run_insights_once(
         error = f"{type(exc).__name__}: {exc}"
         log.exception("insights generation failed for %s: %s", target_date, exc)
         model_usage = _usage_since(agent, usage_checkpoint)
+        stage_timings["total_seconds"] = _elapsed_seconds(total_started)
+        failed_summary = dict(run_summary or {})
+        failed_summary["failed"] = True
+        _attach_stage_timings(failed_summary, stage_timings)
         _finish_run_record(
             run_id=run_id,
             date=target_date,
             started_at=started_at,
             status="failed",
             model_usage=model_usage,
-            summary=run_summary,
+            summary=failed_summary,
             error=error,
         )
         return {
             "status": "failed",
             "date": target_date,
             "error": error,
+            "run_summary": failed_summary,
             "agent_usage": model_usage or {},
         }
 
