@@ -2839,6 +2839,80 @@ class CloudSyncReadModel(_SqliteCase):
         )
         self.assertEqual(summary["status"], "ok")
 
+    def test_run_insights_once_skips_while_another_ingest_is_active(self):
+        from . import insights
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.start_ingest_run(
+                    conn,
+                    "active-enrich",
+                    started_at=repository.now_seconds(),
+                    deadline_at=repository.now_seconds() + 300,
+                )
+                repository.update_ingest_run(conn, "active-enrich", phase="enrich")
+        finally:
+            conn.close()
+
+        summary = insights.run_insights_once(date="2026-05-19", force=True)
+
+        self.assertEqual(summary["status"], "skipped")
+        self.assertEqual(summary["reason"], "active_ingest")
+        self.assertEqual(summary["active_ingest"]["run_id"], "active-enrich")
+        self.assertEqual(summary["active_ingest"]["phase"], "enrich")
+        self.assertEqual(summary["run_summary"]["skip_reason"], "active_ingest")
+
+    def test_run_insights_once_allows_current_ingest_insights_phase(self):
+        from . import insights
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.start_ingest_run(
+                    conn,
+                    "current-insights",
+                    started_at=repository.now_seconds(),
+                    deadline_at=repository.now_seconds() + 300,
+                )
+                repository.update_ingest_run(
+                    conn,
+                    "current-insights",
+                    phase="insights",
+                )
+        finally:
+            conn.close()
+
+        summary = insights.run_insights_once(
+            date="2026-05-19",
+            force=True,
+            active_ingest_run_id="current-insights",
+        )
+
+        self.assertEqual(summary["status"], "skipped")
+        self.assertEqual(summary["reason"], "insufficient_today_stories")
+
+    def test_run_insights_once_ignores_stale_running_ingest(self):
+        from . import insights
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.start_ingest_run(
+                    conn,
+                    "stale-enrich",
+                    started_at=repository.now_seconds() - 600,
+                    deadline_at=repository.now_seconds() - 1,
+                )
+                repository.update_ingest_run(conn, "stale-enrich", phase="enrich")
+        finally:
+            conn.close()
+
+        summary = insights.run_insights_once(date="2026-05-19", force=True)
+
+        self.assertEqual(summary["status"], "skipped")
+        self.assertEqual(summary["reason"], "insufficient_today_stories")
+
     def test_run_insights_once_allows_single_topic_when_evidence_is_sufficient(self):
         from . import insights
 
@@ -3988,12 +4062,32 @@ class CloudSyncReadModel(_SqliteCase):
 
         agent = CacheAwareAgent()
         first = insights.run_insights_once(date=target, force=True, ai_agent=agent)
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                conn.execute(
+                    "UPDATE comments SET fetched_at=? WHERE id=?",
+                    (repository.now_seconds() + 60, 9700),
+                )
+                conn.execute(
+                    "UPDATE stories SET enriched_at=enriched_at + 60 WHERE id=?",
+                    (700,),
+                )
+        finally:
+            conn.close()
         second = insights.run_insights_once(date=target, force=True, ai_agent=agent)
         self.assertEqual(first["status"], "ok")
         self.assertEqual(second["status"], "ok")
         self.assertEqual(first["evidence_cache"], "miss")
         self.assertEqual(second["evidence_cache"], "hit")
         self.assertEqual(agent.evidence_calls, 1)
+        self.assertEqual(
+            first["run_summary"]["evidence_cache_key_version"],
+            "v2",
+        )
+        self.assertIn("evidence_story_ids_hash", first["run_summary"])
+        self.assertIn("evidence_payload_fingerprint", first["run_summary"])
+        self.assertIn("evidence_cache_batch_sizes", first["run_summary"])
 
         conn = db.connect()
         try:
@@ -4795,6 +4889,19 @@ class CloudSyncReadModel(_SqliteCase):
             settings.INSIGHTS_UPDATE_INTERVAL_SECONDS = 0  # type: ignore[assignment]
             agent = CountingAgent()
             first = insights.run_insights_once(date=target, ai_agent=agent)
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    conn.execute(
+                        "UPDATE comments SET fetched_at=? WHERE id=?",
+                        (repository.now_seconds() + 60, 9760),
+                    )
+                    conn.execute(
+                        "UPDATE stories SET enriched_at=COALESCE(enriched_at, 0) + 60 WHERE id=?",
+                        (760,),
+                    )
+            finally:
+                conn.close()
             second = insights.run_insights_once(date=target, ai_agent=agent)
         finally:
             settings.INSIGHTS_UPDATE_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]

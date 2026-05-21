@@ -3221,7 +3221,7 @@ def run_ingest_round(
                 conn.close()
             from .insights import run_insights_once
 
-            insights_summary = run_insights_once()
+            insights_summary = run_insights_once(active_ingest_run_id=run_id)
             summary["insights"] = insights_summary
             if insights_summary.get("status") == "failed":
                 log.warning("insights failed: %s", insights_summary)

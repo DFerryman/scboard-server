@@ -42,6 +42,8 @@ SIGNALS_MIN_STORIES = 3
 OPPORTUNITY_MIN_CANDIDATES = 3
 DEBATE_MIN_CANDIDATES = 2
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_EVIDENCE_BATCH_CACHE_KEY_VERSION = "v2"
+_ACTIVE_INGEST_SKIP_REASON = "active_ingest"
 
 
 def _elapsed_seconds(started: float) -> float:
@@ -534,14 +536,6 @@ def build_evidence_input(
     }
 
 
-def _hash_text(value: Any) -> Dict[str, Any]:
-    text = str(value or "")
-    return {
-        "len": len(text),
-        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-    }
-
-
 def _hash_update_json(hasher: "hashlib._Hash", value: Any) -> None:
     encoded = json.dumps(
         value,
@@ -561,65 +555,23 @@ def _insights_material_fingerprint(
     feed_ranks: Mapping[int, Mapping[str, int]],
     comments_by_story: Mapping[int, Sequence[Any]],
 ) -> str:
+    payload = build_evidence_input(
+        window_rows,
+        target_date=target_date,
+        start_date=start_date,
+        feed_ranks=feed_ranks,
+        comments_by_story=comments_by_story,
+    )
     hasher = hashlib.sha256()
     _hash_update_json(
         hasher,
         {
-            "stage": "insights-evidence",
-            "schema": 4,
-            "date": target_date,
-            "startDate": start_date,
+            "stage": "insights-material",
+            "schema": 5,
             "insightsVersion": INSIGHTS_VERSION,
-            "inputCaps": {
-                "maxStories": int(settings.INSIGHTS_EVIDENCE_MAX_STORIES),
-                "commentLimitPerStory": int(
-                    settings.INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY
-                ),
-                "batchStories": int(settings.INSIGHTS_EVIDENCE_BATCH_STORIES),
-            },
+            "payload": payload,
         },
     )
-    for row in sorted(window_rows, key=lambda r: int(r["id"])):
-        sid = int(row["id"])
-        _hash_update_json(
-            hasher,
-            {
-                "id": sid,
-                "kind": row["kind"] or "story",
-                "topic": _row_topic_id(row),
-                "topicName": _row_topic_label(row),
-                "titleZh": row["title_zh"] or "",
-                "titleEn": row["title_en"] or "",
-                "url": row["url"] or "",
-                "domain": row["domain"] or "",
-                "by": row["by"] or "",
-                "score": int(row["score"] or 0),
-                "descendants": int(row["descendants"] or 0),
-                "hnTime": int(row["hn_time"] or 0),
-                "enrichedAt": int(row["enriched_at"] or 0),
-                "feedRanks": dict(feed_ranks.get(sid, {})),
-                "aiSummary": row["ai_summary"] or "",
-                "discussionThemes": row["discussion_themes"] or "[]",
-                "insights": row["insights"] or "[]",
-                "terms": row["terms"] or "[]",
-                "rawText": _hash_text(row["raw_text"] or ""),
-            },
-        )
-        for comment in comments_by_story.get(sid, []):
-            _hash_update_json(
-                hasher,
-                {
-                    "storyId": sid,
-                    "id": int(_row_value(comment, "id", 0) or 0),
-                    "parentId": int(_row_value(comment, "parent_id", 0) or 0),
-                    "by": _row_value(comment, "by", "") or "",
-                    "hnTime": int(_row_value(comment, "hn_time", 0) or 0),
-                    "depth": int(_row_value(comment, "depth", 0) or 0),
-                    "rank": int(_row_value(comment, "rank", 0) or 0),
-                    "fetchedAt": int(_row_value(comment, "fetched_at", 0) or 0),
-                    "text": _hash_text(_row_value(comment, "text", "") or ""),
-                },
-            )
     return hasher.hexdigest()
 
 
@@ -639,6 +591,20 @@ def _insights_evidence_cache_key(
         comments_by_story=comments_by_story,
     )
     return f"insights:evidence:v4:{target_date}:{fingerprint}"
+
+
+def _insights_evidence_payload_fingerprint(payload: Mapping[str, Any]) -> str:
+    hasher = hashlib.sha256()
+    _hash_update_json(
+        hasher,
+        {
+            "stage": "insights-evidence-payload",
+            "schema": 1,
+            "cacheKeyVersion": _EVIDENCE_BATCH_CACHE_KEY_VERSION,
+            "payload": payload,
+        },
+    )
+    return hasher.hexdigest()
 
 
 def _load_cached_evidence(cache_key: str) -> Optional[Dict[str, Any]]:
@@ -735,19 +701,39 @@ def _stable_evidence_batches(
 def _evidence_batch_cache_key(
     *,
     target_date: str,
+    payload: Mapping[str, Any],
+) -> str:
+    fingerprint = _insights_evidence_payload_fingerprint(payload)
+    return (
+        "insights:evidence-batch:"
+        f"{_EVIDENCE_BATCH_CACHE_KEY_VERSION}:{target_date}:{fingerprint}"
+    )
+
+
+def _evidence_cache_diagnostics(
+    evidence_rows: Sequence[Any],
+    *,
+    target_date: str,
     start_date: str,
-    batch_rows: Sequence[Any],
     feed_ranks: Mapping[int, Mapping[str, int]],
     comments_by_story: Mapping[int, Sequence[Any]],
-) -> str:
-    fingerprint = _insights_material_fingerprint(
+    batches: Sequence[Sequence[Any]],
+) -> Dict[str, Any]:
+    payload = build_evidence_input(
+        evidence_rows,
         target_date=target_date,
         start_date=start_date,
-        window_rows=batch_rows,
         feed_ranks=feed_ranks,
         comments_by_story=comments_by_story,
     )
-    return f"insights:evidence-batch:v1:{target_date}:{fingerprint}"
+    return {
+        "cache_key_version": _EVIDENCE_BATCH_CACHE_KEY_VERSION,
+        "story_ids_hash": repository.hash_int_sequence(
+            sorted(int(row["id"]) for row in evidence_rows)
+        ),
+        "payload_fingerprint": _insights_evidence_payload_fingerprint(payload),
+        "batch_sizes": [len(batch) for batch in batches],
+    }
 
 
 def _unique_topic_key(raw_key: Any, seen: set[str], fallback: str) -> str:
@@ -824,16 +810,26 @@ def _run_evidence_batches(
     start_date: str,
     feed_ranks: Mapping[int, Mapping[str, int]],
     comments_by_story: Mapping[int, Sequence[Any]],
-) -> Tuple[Dict[str, Any], Dict[str, int]]:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     batches = _stable_evidence_batches(
         list(evidence_rows),
         settings.INSIGHTS_EVIDENCE_BATCH_STORIES,
     )
-    stats = {
+    stats: Dict[str, Any] = {
         "batches": len(batches),
         "hits": 0,
         "misses": 0,
     }
+    stats.update(
+        _evidence_cache_diagnostics(
+            evidence_rows,
+            target_date=target_date,
+            start_date=start_date,
+            feed_ranks=feed_ranks,
+            comments_by_story=comments_by_story,
+            batches=batches,
+        )
+    )
     if not batches:
         return (
             {
@@ -850,17 +846,6 @@ def _run_evidence_batches(
         )
 
     def _run_one(index: int, batch_rows: Sequence[Any]) -> Tuple[int, Mapping[str, Any], bool]:
-        cache_key = _evidence_batch_cache_key(
-            target_date=target_date,
-            start_date=start_date,
-            batch_rows=batch_rows,
-            feed_ranks=feed_ranks,
-            comments_by_story=comments_by_story,
-        )
-        cached = _load_cached_evidence(cache_key)
-        if cached is not None:
-            return index, cached, True
-
         payload = build_evidence_input(
             batch_rows,
             target_date=target_date,
@@ -868,6 +853,14 @@ def _run_evidence_batches(
             feed_ranks=feed_ranks,
             comments_by_story=comments_by_story,
         )
+        cache_key = _evidence_batch_cache_key(
+            target_date=target_date,
+            payload=payload,
+        )
+        cached = _load_cached_evidence(cache_key)
+        if cached is not None:
+            return index, cached, True
+
         output = agent.run_evidence(payload)
         _store_cached_evidence(cache_key, output, len(batch_rows))
         return index, output, False
@@ -921,7 +914,7 @@ def _run_evidence_batches(
     return _merge_evidence_outputs(outputs), stats
 
 
-def _evidence_cache_status(stats: Mapping[str, int]) -> str:
+def _evidence_cache_status(stats: Mapping[str, Any]) -> str:
     batches = int(stats.get("batches") or 0)
     hits = int(stats.get("hits") or 0)
     misses = int(stats.get("misses") or 0)
@@ -1440,7 +1433,7 @@ def _insights_run_summary(
     material_fingerprint: str = "",
     analysis_fingerprint: str = "",
     evidence_cache: str = "",
-    evidence_cache_stats: Optional[Mapping[str, int]] = None,
+    evidence_cache_stats: Optional[Mapping[str, Any]] = None,
     topic_scout: Optional[Mapping[str, Any]] = None,
     stage_timings: Optional[Mapping[str, float]] = None,
     skip_reason: str = "",
@@ -1460,6 +1453,22 @@ def _insights_run_summary(
         out["evidence_cache_batches"] = int(evidence_cache_stats.get("batches") or 0)
         out["evidence_cache_hits"] = int(evidence_cache_stats.get("hits") or 0)
         out["evidence_cache_misses"] = int(evidence_cache_stats.get("misses") or 0)
+        cache_key_version = evidence_cache_stats.get("cache_key_version")
+        if cache_key_version:
+            out["evidence_cache_key_version"] = str(cache_key_version)
+        story_ids_hash = evidence_cache_stats.get("story_ids_hash")
+        if story_ids_hash:
+            out["evidence_story_ids_hash"] = str(story_ids_hash)
+        payload_fingerprint = evidence_cache_stats.get("payload_fingerprint")
+        if payload_fingerprint:
+            out["evidence_payload_fingerprint"] = str(payload_fingerprint)
+        batch_sizes = evidence_cache_stats.get("batch_sizes")
+        if isinstance(batch_sizes, list):
+            out["evidence_cache_batch_sizes"] = [
+                int(size)
+                for size in batch_sizes
+                if isinstance(size, int) or str(size).isdigit()
+            ]
     if topic_scout is not None:
         out["topic_scout_selected_count"] = len(topic_scout.get("selectedTopics") or [])
         out["topic_scout_excluded_count"] = len(topic_scout.get("excludedTopics") or [])
@@ -1497,10 +1506,48 @@ def _finish_run_record(
         conn.close()
 
 
+def _running_ingest_conflict(
+    conn: Any,
+    *,
+    active_ingest_run_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    allowed_run_id = str(active_ingest_run_id or "")
+    now = repository.now_seconds()
+    for row in repository.running_ingest_runs(conn):
+        run_id = str(row["run_id"] or "")
+        phase = str(row["phase"] or "")
+        deadline_raw = _row_value(row, "deadline_at", None)
+        deadline_at = int(deadline_raw) if deadline_raw is not None else None
+        if deadline_at is not None and deadline_at <= now:
+            continue
+        if allowed_run_id and run_id == allowed_run_id and phase == "insights":
+            continue
+        return {
+            "run_id": run_id,
+            "phase": phase,
+            "started_at": int(row["started_at"] or 0),
+            "deadline_at": deadline_at,
+        }
+    return None
+
+
+def _active_ingest_skip_summary(
+    active_ingest: Mapping[str, Any],
+    stage_timings: Mapping[str, float],
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "skip_reason": _ACTIVE_INGEST_SKIP_REASON,
+        "active_ingest": dict(active_ingest),
+    }
+    _attach_stage_timings(summary, stage_timings)
+    return summary
+
+
 def run_insights_once(
     date: Optional[str] = None,
     force: bool = False,
     ai_agent: Optional[Any] = None,
+    active_ingest_run_id: Optional[str] = None,
 ) -> dict:
     target_date = _target_date(date)
     run_id = f"insights-{target_date}-{uuid.uuid4().hex[:8]}"
@@ -1510,6 +1557,41 @@ def run_insights_once(
 
     if not settings.INSIGHTS_ENABLED:
         return {"status": "skipped", "reason": "disabled", "date": target_date}
+
+    active_gate_started = time.monotonic()
+    conn = db.connect()
+    try:
+        active_ingest = _running_ingest_conflict(
+            conn,
+            active_ingest_run_id=active_ingest_run_id,
+        )
+    finally:
+        conn.close()
+    stage_timings["active_ingest_gate_seconds"] = _elapsed_seconds(
+        active_gate_started
+    )
+    if active_ingest is not None:
+        reason = _ACTIVE_INGEST_SKIP_REASON
+        stage_timings["total_seconds"] = _elapsed_seconds(total_started)
+        summary = _active_ingest_skip_summary(active_ingest, stage_timings)
+        _finish_run_record(
+            run_id=run_id,
+            date=target_date,
+            started_at=started_at,
+            status="skipped",
+            summary=summary,
+            error=(
+                f"{reason}: run_id={active_ingest.get('run_id') or ''} "
+                f"phase={active_ingest.get('phase') or ''}"
+            ),
+        )
+        return {
+            "status": "skipped",
+            "reason": reason,
+            "date": target_date,
+            "active_ingest": active_ingest,
+            "run_summary": summary,
+        }
 
     window_days = int(settings.INSIGHTS_WINDOW_DAYS)
     start_ts, end_ts, start_date = _window_bounds(target_date, window_days)

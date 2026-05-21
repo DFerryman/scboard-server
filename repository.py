@@ -1891,6 +1891,19 @@ def latest_ingest_run(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
     ).fetchone()
 
 
+def running_ingest_runs(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """
+            SELECT *
+            FROM ingest_runs
+            WHERE status='running'
+            ORDER BY started_at DESC, run_id DESC
+            """
+        ).fetchall()
+    )
+
+
 def purge_old_ingest_runs(conn: sqlite3.Connection, retention_days: int) -> int:
     cutoff = now_seconds() - max(0, int(retention_days)) * 24 * 60 * 60
     cursor = conn.execute(
@@ -3148,6 +3161,7 @@ __all__ = [
     "update_ingest_run",
     "finish_ingest_run",
     "latest_ingest_run",
+    "running_ingest_runs",
     "purge_old_ingest_runs",
     "purge_old_cloud_sync_runs",
     "purge_old_ranking_candidates",
