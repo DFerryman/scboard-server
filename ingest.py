@@ -24,12 +24,15 @@ import json
 import logging
 import os
 import random
+import re
 import signal
 import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Mapping as AbcMapping, Sequence as AbcSequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from . import db, normalizer, repository, settings
@@ -50,6 +53,29 @@ FEEDS: Sequence[str] = ("top", "new", "best", "ask", "show", "job")
 # Higher-priority feed wins when one item appears in several rankings.
 _FEED_PRIORITY: Sequence[str] = ("job", "ask", "show", "top", "best", "new")
 _ENRICH_AI_USAGE_PURPOSES: Sequence[str] = ("story", "story-batch")
+_CJK_CHARS = "\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+_LATIN_SOURCE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+-]{2,}")
+_CJK_WITH_LOWERCASE_SUFFIX_RE = re.compile(
+    rf"(?P<cjk>[{_CJK_CHARS}])(?P<tail>[a-z]{{2,8}})(?=$|[^A-Za-z])"
+)
+_LATIN_CJK_GLUE_RE = re.compile(
+    rf"(?P<cjk>[{_CJK_CHARS}])(?P<latin>[A-Za-z][A-Za-z0-9_+.-]{{1,}})"
+    rf"|(?P<latin2>[A-Za-z][A-Za-z0-9_+.-]{{1,}})(?P<cjk2>[{_CJK_CHARS}])"
+)
+_ENGLISH_PHRASE_RE = re.compile(r"\b[A-Za-z]+(?:\s+[A-Za-z]+){4,}\b")
+_OUTPUT_META_PHRASE_RE = re.compile(
+    r"(作为(?:一个|一名)?AI|我(?:无法|不能)|"
+    r"由于(?:输入|原文|材料|正文|评论).{0,16}(?:未|没有|无法|不足)|"
+    r"仅凭(?:标题|链接|现有信息)|"
+    r"(?:原始输入|输入材料|题目|标题)(?:未|没有).{0,12}(?:提供|包含)|"
+    r"(?:无法|不能)(?:确认|判断|确定))"
+)
+_JSON_OR_MARKDOWN_LEAK_RE = re.compile(
+    r"```|</?(?:story_title|story_body|comment)\b|"
+    r'"(?:titleZh|aiSummary|discussionThemes|insights|terms)"\s*:'
+)
+_BRACKET_PAIRS = (("（", "）"), ("(", ")"), ("《", "》"), ("“", "”"), ("「", "」"))
+_MAX_AI_QUALITY_ISSUES = 8
 
 # Plan P3: kind upgrade priority. ``job`` is the strongest signal (the HN
 # item type itself), then explicit ``ask``/``show`` feeds, then plain
@@ -59,6 +85,235 @@ _KIND_PRIORITY = {"story": 0, "ask": 1, "show": 1, "job": 2}
 
 def _kind_can_supersede(current: str, new: str) -> bool:
     return _KIND_PRIORITY.get(new, 0) > _KIND_PRIORITY.get(current, 0)
+
+
+def _row_value(row: Mapping[str, Any], key: str, default: Any = "") -> Any:
+    getter = getattr(row, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    try:
+        return row[key]
+    except (IndexError, KeyError, TypeError):
+        return default
+
+
+def _source_latin_tokens(story_row: Mapping[str, Any]) -> Dict[str, str]:
+    """Map lower-case source tokens to their original spelling for QA checks."""
+    source = "\n".join(
+        str(_row_value(story_row, key, "") or "")
+        for key in ("title_en", "raw_text")
+    )
+    out: Dict[str, str] = {}
+    for match in _LATIN_SOURCE_TOKEN_RE.finditer(source):
+        token = match.group(0)
+        out.setdefault(token.lower(), token)
+    return out
+
+
+def _iter_ai_reader_texts(processed: Mapping[str, Any]) -> Iterable[tuple[str, str]]:
+    for key in ("titleZh", "aiSummary"):
+        value = processed.get(key)
+        if isinstance(value, str) and value:
+            yield key, value
+
+    themes = processed.get("discussionThemes")
+    if isinstance(themes, AbcSequence) and not isinstance(themes, (str, bytes)):
+        for idx, item in enumerate(themes):
+            if not isinstance(item, AbcMapping):
+                continue
+            for key in ("title", "summary"):
+                value = item.get(key)
+                if isinstance(value, str) and value:
+                    yield f"discussionThemes[{idx}].{key}", value
+
+    insights = processed.get("insights")
+    if isinstance(insights, AbcSequence) and not isinstance(insights, (str, bytes)):
+        for idx, item in enumerate(insights):
+            if not isinstance(item, AbcMapping):
+                continue
+            value = item.get("text")
+            if isinstance(value, str) and value:
+                yield f"insights[{idx}].text", value
+
+    terms = processed.get("terms")
+    if isinstance(terms, AbcSequence) and not isinstance(terms, (str, bytes)):
+        for idx, item in enumerate(terms):
+            if not isinstance(item, AbcMapping):
+                continue
+            for key in ("term", "def"):
+                value = item.get(key)
+                if isinstance(value, str) and value:
+                    yield f"terms[{idx}].{key}", value
+
+
+def _append_quality_issue(issues: List[str], seen: set[str], issue: str) -> bool:
+    if issue in seen:
+        return len(issues) >= _MAX_AI_QUALITY_ISSUES
+    seen.add(issue)
+    issues.append(issue)
+    return len(issues) >= _MAX_AI_QUALITY_ISSUES
+
+
+def _text_has_unbalanced_brackets(text: str) -> bool:
+    for left, right in _BRACKET_PAIRS:
+        if text.count(left) != text.count(right):
+            return True
+    return False
+
+
+def _text_has_cjk(text: str) -> bool:
+    return re.search(rf"[{_CJK_CHARS}]", text) is not None
+
+
+def _ai_output_quality_issues(
+    story_row: Mapping[str, Any],
+    processed: Mapping[str, Any],
+) -> List[str]:
+    """Detect suspicious reader-facing AI output for reviewer escalation.
+
+    The deterministic layer is intentionally conservative about acting on its
+    own: findings trigger a Codex-first reviewer, which can approve false
+    positives. The server never edits, shortens, or rewrites generated text.
+    """
+    source_tokens = _source_latin_tokens(story_row)
+    issues: List[str] = []
+    seen: set[str] = set()
+    for path, text in _iter_ai_reader_texts(processed):
+        if "\ufffd" in text or "\x00" in text:
+            if _append_quality_issue(
+                issues,
+                seen,
+                f"{path} contains replacement/control characters",
+            ):
+                return issues
+
+        if _JSON_OR_MARKDOWN_LEAK_RE.search(text):
+            if _append_quality_issue(
+                issues,
+                seen,
+                f"{path} appears to leak JSON, markdown fences, or prompt delimiters",
+            ):
+                return issues
+
+        if _OUTPUT_META_PHRASE_RE.search(text):
+            if _append_quality_issue(
+                issues,
+                seen,
+                f"{path} contains reader-facing meta/disclaimer phrasing instead of natural editorial Chinese",
+            ):
+                return issues
+
+        if _text_has_unbalanced_brackets(text):
+            if _append_quality_issue(
+                issues,
+                seen,
+                f"{path} has unbalanced Chinese/English brackets or quotes",
+            ):
+                return issues
+
+        if _text_has_cjk(text) and _ENGLISH_PHRASE_RE.search(text):
+            if _append_quality_issue(
+                issues,
+                seen,
+                f"{path} contains a long untranslated English phrase",
+            ):
+                return issues
+
+        for match in _LATIN_CJK_GLUE_RE.finditer(text):
+            latin = (match.group("latin") or match.group("latin2") or "").strip()
+            if not latin or latin.isupper():
+                continue
+            if _append_quality_issue(
+                issues,
+                seen,
+                f"{path} contains Latin token {latin!r} glued directly to Chinese; review spacing, translation, or proper noun handling",
+            ):
+                return issues
+
+        if source_tokens:
+            for match in _CJK_WITH_LOWERCASE_SUFFIX_RE.finditer(text):
+                tail = match.group("tail").lower()
+                source_token = ""
+                for token_lower, token_original in source_tokens.items():
+                    if token_lower != tail and token_lower.endswith(tail):
+                        source_token = token_original
+                        break
+                if not source_token:
+                    continue
+                if _append_quality_issue(
+                    issues,
+                    seen,
+                    f"{path} contains partial English suffix {tail!r} glued to Chinese, likely a malformed rendering of source token {source_token!r}",
+                ):
+                    return issues
+    return issues
+
+
+class _LazyAiQualityReviewer:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._reviewer: Optional[Any] = None
+
+    def _get(self):
+        if self._reviewer is None:
+            with self._lock:
+                if self._reviewer is None:
+                    from .ai_agent import build_ai_quality_reviewer
+
+                    self._reviewer = build_ai_quality_reviewer()
+        return self._reviewer
+
+    def review_story_output(
+        self,
+        story_row: Mapping[str, Any],
+        processed: Mapping[str, Any],
+        issues: Sequence[str],
+    ) -> Mapping[str, Any]:
+        return self._get().review_story_output(story_row, processed, issues)
+
+
+def _ai_output_review_error(
+    story_row: Mapping[str, Any],
+    processed: Mapping[str, Any],
+    *,
+    quality_reviewer,
+) -> str:
+    issues = _ai_output_quality_issues(story_row, processed)
+    if not issues:
+        return ""
+    try:
+        decision = quality_reviewer.review_story_output(
+            story_row,
+            processed,
+            issues,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return (
+            "AI output quality review failed; suspicious result was not "
+            f"approved: {type(exc).__name__}: {exc}"
+        )
+    if not isinstance(decision, AbcMapping):
+        return (
+            "AI output quality review failed; suspicious result was not "
+            f"approved: reviewer returned {type(decision).__name__}"
+        )
+    approved = bool(decision.get("approved")) and str(
+        decision.get("action") or ""
+    ).strip().lower() == "approve"
+    if approved:
+        log.info(
+            "AI output quality review approved story %s despite heuristic findings: %s",
+            _row_value(story_row, "id", ""),
+            decision.get("reason") or "",
+        )
+        return ""
+    reason = str(decision.get("reason") or "review rejected suspicious output")
+    return (
+        "AI output quality review rejected result: "
+        + reason
+        + "; heuristic findings: "
+        + "; ".join(issues)
+    )
 
 
 # ---------- Fetcher ----------
@@ -651,10 +906,16 @@ def _enrich_work_item_single(
     ai_agent,
     item: Mapping[str, Any],
     topic_catalog,
+    quality_reviewer,
     *,
     bump_visible_version: bool,
 ) -> None:
-    result = _process_work_item_single_unlocked(ai_agent, item, topic_catalog)
+    result = _process_work_item_single_unlocked(
+        ai_agent,
+        item,
+        topic_catalog,
+        quality_reviewer,
+    )
     _apply_single_work_item_result(
         conn,
         summary,
@@ -668,6 +929,7 @@ def _process_work_item_single_unlocked(
     ai_agent,
     item: Mapping[str, Any],
     topic_catalog,
+    quality_reviewer,
 ) -> Dict[str, Any]:
     """Call AI for one item without holding a SQLite write transaction."""
     story_row = item["story"]
@@ -701,6 +963,14 @@ def _process_work_item_single_unlocked(
 
     if processed is None:
         return {"status": "failed", "error_msg": "ai agent returned None"}
+    quality_error = _ai_output_review_error(
+        story_row,
+        processed,
+        quality_reviewer=quality_reviewer,
+    )
+    if quality_error:
+        log.warning("ai process_story(%d) quality rejected: %s", sid, quality_error)
+        return {"status": "failed", "error_msg": quality_error}
     return {"status": "done", "processed": processed}
 
 
@@ -771,6 +1041,7 @@ def _fallback_to_singles(
     ai_agent,
     items: Sequence[Mapping[str, Any]],
     topic_catalog,
+    quality_reviewer,
     *,
     bump_visible_version: bool,
     deadline_at: Optional[float],
@@ -789,6 +1060,7 @@ def _fallback_to_singles(
             ai_agent,
             item,
             topic_catalog,
+            quality_reviewer,
         )
         with db.transaction(conn):
             _apply_single_work_item_result(
@@ -807,6 +1079,7 @@ def _process_work_items(
     ai_agent,
     work_items: List[Dict[str, Any]],
     topic_catalog,
+    quality_reviewer,
     *,
     bump_visible_version: bool,
     deadline_at: Optional[float],
@@ -845,6 +1118,7 @@ def _process_work_items(
             ai_agent,
             work_items[0],
             topic_catalog,
+            quality_reviewer,
         )
         with db.transaction(conn):
             _apply_single_work_item_result(
@@ -929,6 +1203,7 @@ def _process_work_items(
             ai_agent,
             work_items,
             topic_catalog,
+            quality_reviewer,
             bump_visible_version=bump_visible_version,
             deadline_at=deadline_at,
         )
@@ -950,6 +1225,7 @@ def _process_work_items(
                 ai_agent,
                 work_items,
                 topic_catalog,
+                quality_reviewer,
                 bump_visible_version=bump_visible_version,
                 deadline_at=deadline_at,
             )
@@ -967,6 +1243,7 @@ def _process_work_items(
             ai_agent,
             work_items[:mid],
             topic_catalog,
+            quality_reviewer,
             bump_visible_version=bump_visible_version,
             deadline_at=deadline_at,
         ):
@@ -978,6 +1255,7 @@ def _process_work_items(
             ai_agent,
             work_items[mid:],
             topic_catalog,
+            quality_reviewer,
             bump_visible_version=bump_visible_version,
             deadline_at=deadline_at,
         )
@@ -1042,16 +1320,30 @@ def _process_work_items(
             ai_agent,
             work_items,
             topic_catalog,
+            quality_reviewer,
             bump_visible_version=bump_visible_version,
             deadline_at=deadline_at,
         )
 
     resolved_items: List[Dict[str, Any]] = []
     missing_items: List[Dict[str, Any]] = []
+    quality_retry_items: List[Dict[str, Any]] = []
     for item in work_items:
         sid = int(item["story"]["id"])
-        if processed_by_id.get(sid) is None:
+        processed = processed_by_id.get(sid)
+        if processed is None:
             missing_items.append(item)
+        elif quality_error := _ai_output_review_error(
+            item["story"],
+            processed,
+            quality_reviewer=quality_reviewer,
+        ):
+            log.warning(
+                "ai batch item %d quality rejected; retrying as single: %s",
+                sid,
+                quality_error,
+            )
+            quality_retry_items.append(item)
         else:
             resolved_items.append(item)
 
@@ -1071,19 +1363,23 @@ def _process_work_items(
                     bump_visible_version=bump_visible_version,
                 )
 
-    if missing_items:
+    retry_items = [*missing_items, *quality_retry_items]
+    if retry_items:
         log.info(
-            "ai batch returned %d/%d stories; retrying %d missing as singles",
+            "ai batch returned %d/%d accepted stories; retrying %d missing "
+            "and %d quality-rejected as singles",
             len(resolved_items),
             len(work_items),
             len(missing_items),
+            len(quality_retry_items),
         )
         return _fallback_to_singles(
             conn,
             summary,
             ai_agent,
-            missing_items,
+            retry_items,
             topic_catalog,
+            quality_reviewer,
             bump_visible_version=bump_visible_version,
             deadline_at=deadline_at,
         )
@@ -1095,6 +1391,7 @@ def _enrich_claimed_rows_batch(
     ai_agent,
     claimed_rows,
     *,
+    quality_reviewer,
     bump_visible_version: bool = True,
     deadline_at: Optional[float] = None,
 ) -> Dict[str, Any]:
@@ -1164,6 +1461,7 @@ def _enrich_claimed_rows_batch(
             ai_agent,
             work_items,
             topic_catalog,
+            quality_reviewer,
             bump_visible_version=bump_visible_version,
             deadline_at=deadline_at,
         )
@@ -1178,6 +1476,7 @@ def _enrich_claimed_rows(
     ai_agent,
     claimed_rows,
     *,
+    quality_reviewer=None,
     bump_visible_version: bool = True,
     deadline_at: Optional[float] = None,
 ) -> Dict[str, Any]:
@@ -1192,6 +1491,8 @@ def _enrich_claimed_rows(
     }
     if not claimed_rows:
         return summary
+    if quality_reviewer is None:
+        quality_reviewer = _LazyAiQualityReviewer()
 
     if bool(getattr(ai_agent, "supports_batch_enrich", False)):
         batch_size = _resolve_enrich_batch_size(ai_agent)
@@ -1228,6 +1529,7 @@ def _enrich_claimed_rows(
                 client,
                 ai_agent,
                 claimed_rows[start:end],
+                quality_reviewer=quality_reviewer,
                 bump_visible_version=bump_visible_version,
                 deadline_at=deadline_at,
             )
@@ -1372,6 +1674,51 @@ def _enrich_claimed_rows(
                             summary["retried"] += 1
                 continue
 
+            quality_error = _ai_output_review_error(
+                story_row,
+                processed,
+                quality_reviewer=quality_reviewer,
+            )
+            if quality_error:
+                log.warning(
+                    "ai process_story(%d) quality rejected: %s",
+                    sid,
+                    quality_error,
+                )
+                with db.transaction(conn):
+                    if is_refresh:
+                        attempts = repository.increment_reenrich_attempts(
+                            conn, sid
+                        )
+                        if attempts >= settings.ENRICH_MAX_ATTEMPTS:
+                            repository.mark_reenrich_failed(
+                                conn, sid, error=quality_error
+                            )
+                            summary["failed"] += 1
+                        else:
+                            repository.mark_reenrich_retry(
+                                conn, sid, error=quality_error
+                            )
+                            summary["retried"] += 1
+                    else:
+                        attempts = repository.increment_enrich_attempts(conn, sid)
+                        if attempts >= settings.ENRICH_MAX_ATTEMPTS:
+                            visible_changed = repository.mark_enrich_failed(
+                                conn,
+                                sid,
+                                title_en=story_row["title_en"] or "",
+                                error=quality_error,
+                            )
+                            if visible_changed and bump_visible_version:
+                                repository.bump_catalog_version(conn)
+                            summary["failed"] += 1
+                        else:
+                            repository.mark_enrich_pending_retry(
+                                conn, sid, error=quality_error
+                            )
+                            summary["retried"] += 1
+                continue
+
             with db.transaction(conn):
                 repository.write_enriched_story(
                     conn,
@@ -1495,6 +1842,7 @@ def run_enricher_once(
     client=None,
     ai_agent=None,
     *,
+    quality_reviewer=None,
     deadline_at: Optional[float] = None,
     max_waves: Optional[int] = None,
     target_ids: Optional[Sequence[int]] = None,
@@ -1508,6 +1856,8 @@ def run_enricher_once(
 
     if ai_agent is None:
         ai_agent = build_ai_agent()
+    if quality_reviewer is None:
+        quality_reviewer = _LazyAiQualityReviewer()
 
     summary: Dict[str, Any] = {
         "claimed": 0,
@@ -1565,6 +1915,7 @@ def run_enricher_once(
                     client if client is not None else HnClient(),
                     ai_agent,
                     chunk,
+                    quality_reviewer=quality_reviewer,
                     bump_visible_version=bump_visible_version,
                     deadline_at=deadline_at,
                 )

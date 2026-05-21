@@ -5521,6 +5521,247 @@ class EnricherBehavior(_SqliteCase):
         self.assertEqual(visible_after.descendants, settings.COMMENT_MIN_DESCENDANTS + 10)
         self.assertEqual(visible_after.aiSummary, f"{settings.COMMENT_MIN_DESCENDANTS + 10}:1")
 
+    def test_quality_gate_rejects_unapproved_hybrid_name_before_persistence(self):
+        rankings = {"top": [701], "new": [], "best": [], "ask": [], "show": [], "job": []}
+        items = {
+            701: {
+                "id": 701,
+                "type": "story",
+                "title": "The Letter S, by Donald Knuth (1980) [pdf]",
+                "url": "https://example.com/knuth.pdf",
+                "by": "x",
+                "score": 1,
+                "descendants": 0,
+                "time": 1700000000,
+            }
+        }
+        run_fetcher_once(client=_FakeHn(rankings, items))
+
+        class BadAgent:
+            def process_story(self, *_):
+                return {
+                    "titleZh": "唐纳德·克努uth《字母 S》（1980）",
+                    "topic": "science-culture",
+                    "aiSummary": "克努uth解释字母 S 的数学构造。",
+                    "discussionThemes": [],
+                    "insights": [],
+                    "terms": [],
+                }
+
+            def write_digest_intro(self, *_):
+                return ""
+
+        class RejectingReviewer:
+            def __init__(self):
+                self.calls = []
+
+            def review_story_output(self, story_row, processed, issues):
+                self.calls.append((story_row, processed, issues))
+                return {
+                    "approved": False,
+                    "action": "reject",
+                    "reason": "malformed proper noun",
+                }
+
+        reviewer = RejectingReviewer()
+        summary = run_enricher_once(
+            client=_FakeHn({}, {}),
+            ai_agent=BadAgent(),
+            quality_reviewer=reviewer,
+        )
+
+        self.assertEqual(summary["done"], 0)
+        self.assertEqual(summary["retried"], 1)
+        self.assertEqual(len(reviewer.calls), 1)
+        self.assertTrue(any("Knuth" in issue for issue in reviewer.calls[0][2]))
+
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT enrich_status, enrich_error, title_zh FROM stories WHERE id=701"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["enrich_status"], "pending")
+        self.assertIn("quality review rejected", row["enrich_error"])
+        self.assertEqual(row["title_zh"], "The Letter S, by Donald Knuth (1980) [pdf]")
+
+    def test_quality_gate_reviews_reader_facing_meta_disclaimers(self):
+        rankings = {"top": [702], "new": [], "best": [], "ask": [], "show": [], "job": []}
+        items = {
+            702: {
+                "id": 702,
+                "type": "story",
+                "title": "A small database note",
+                "url": "https://example.com/db",
+                "by": "x",
+                "score": 1,
+                "descendants": 0,
+                "time": 1700000000,
+            }
+        }
+        run_fetcher_once(client=_FakeHn(rankings, items))
+
+        class MetaAgent:
+            def process_story(self, *_):
+                return {
+                    "titleZh": "一篇数据库小笔记",
+                    "topic": "database",
+                    "aiSummary": "由于输入未提供正文或评论，仅凭标题可判断这可能是一篇数据库相关笔记。",
+                    "discussionThemes": [],
+                    "insights": [],
+                    "terms": [],
+                }
+
+            def write_digest_intro(self, *_):
+                return ""
+
+        class RejectingReviewer:
+            def __init__(self):
+                self.issues = []
+
+            def review_story_output(self, story_row, processed, issues):
+                self.issues.extend(issues)
+                return {
+                    "approved": False,
+                    "action": "reject",
+                    "reason": "reader-facing meta disclaimer",
+                }
+
+        reviewer = RejectingReviewer()
+        summary = run_enricher_once(
+            client=_FakeHn({}, {}),
+            ai_agent=MetaAgent(),
+            quality_reviewer=reviewer,
+        )
+
+        self.assertEqual(summary["done"], 0)
+        self.assertEqual(summary["retried"], 1)
+        self.assertTrue(any("meta/disclaimer" in issue for issue in reviewer.issues))
+
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT enrich_status, enrich_error FROM stories WHERE id=702"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["enrich_status"], "pending")
+        self.assertIn("quality review rejected", row["enrich_error"])
+
+    def test_batch_quality_rejection_retries_bad_item_as_single(self):
+        ids = [711, 712]
+        rankings = {"top": ids, "new": [], "best": [], "ask": [], "show": [], "job": []}
+        items = {
+            711: {
+                "id": 711,
+                "type": "story",
+                "title": "The Letter S, by Donald Knuth (1980) [pdf]",
+                "url": "https://example.com/knuth.pdf",
+                "by": "x",
+                "score": 1,
+                "descendants": 0,
+                "time": 1700000000,
+            },
+            712: {
+                "id": 712,
+                "type": "story",
+                "title": "Clean Story",
+                "url": "https://example.com/clean",
+                "by": "x",
+                "score": 1,
+                "descendants": 0,
+                "time": 1700000000,
+            },
+        }
+        run_fetcher_once(client=_FakeHn(rankings, items))
+
+        class BatchAgent:
+            supports_batch_enrich = True
+
+            def __init__(self):
+                self.batch_calls = 0
+                self.single_calls = []
+
+            def process_stories_batch(self, batch_items):
+                self.batch_calls += 1
+                return {
+                    711: {
+                        "titleZh": "唐纳德·克努uth《字母 S》（1980）",
+                        "topic": "science-culture",
+                        "aiSummary": "克努uth解释字母 S 的数学构造。",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    },
+                    712: {
+                        "titleZh": "干净故事",
+                        "topic": "web",
+                        "aiSummary": "干净摘要",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    },
+                }
+
+            def process_story(self, story_row, *_):
+                sid = int(story_row["id"])
+                self.single_calls.append(sid)
+                return {
+                    "titleZh": "唐纳德·克努斯《字母 S》（1980）",
+                    "topic": "science-culture",
+                    "aiSummary": "克努斯解释字母 S 的数学构造。",
+                    "discussionThemes": [],
+                    "insights": [],
+                    "terms": [],
+                }
+
+            def write_digest_intro(self, *_):
+                return ""
+
+        class RejectingReviewer:
+            def __init__(self):
+                self.calls = 0
+
+            def review_story_output(self, *_):
+                self.calls += 1
+                return {
+                    "approved": False,
+                    "action": "reject",
+                    "reason": "malformed proper noun",
+                }
+
+        old_workers = settings.ENRICH_WORKER_COUNT
+        old_batch = settings.ENRICH_BATCH_SIZE
+        try:
+            settings.ENRICH_WORKER_COUNT = 1  # type: ignore[assignment]
+            settings.ENRICH_BATCH_SIZE = 2  # type: ignore[assignment]
+            agent = BatchAgent()
+            reviewer = RejectingReviewer()
+            summary = run_enricher_once(
+                client=_FakeHn({}, {}),
+                ai_agent=agent,
+                quality_reviewer=reviewer,
+            )
+        finally:
+            settings.ENRICH_WORKER_COUNT = old_workers  # type: ignore[assignment]
+            settings.ENRICH_BATCH_SIZE = old_batch  # type: ignore[assignment]
+
+        self.assertEqual(summary["done"], 2)
+        self.assertEqual(agent.batch_calls, 1)
+        self.assertEqual(agent.single_calls, [711])
+        self.assertEqual(reviewer.calls, 1)
+
+        conn = db.connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, title_zh, enrich_status FROM stories ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual([r["title_zh"] for r in rows], ["唐纳德·克努斯《字母 S》（1980）", "干净故事"])
+        self.assertEqual({r["enrich_status"] for r in rows}, {"done"})
+
     def test_fetch_score_only_update_does_not_reenrich_done_story(self):
         rankings = {"top": [101], "new": [], "best": [], "ask": [], "show": [], "job": []}
         items = {
@@ -8514,6 +8755,127 @@ class CodexFirstAiAgentTests(unittest.TestCase):
             "kind": "story",
         }
 
+    def test_quality_reviewer_uses_codex_before_provider_fallback(self):
+        class GoodCodex:
+            def __init__(self):
+                self.calls = []
+
+            def complete_json(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "approved": True,
+                    "action": "approve",
+                    "reason": "false positive",
+                }
+
+        class Fallback:
+            def __init__(self):
+                self.calls = []
+
+            def complete_json(self, **kwargs):
+                self.calls.append(kwargs)
+                raise AssertionError("fallback should not be called")
+
+        codex = GoodCodex()
+        fallback = Fallback()
+        old_codex_enabled = settings.CODEX_ENABLED
+        try:
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            reviewer = ai_agent_module.AiOutputQualityReviewer(
+                codex_client=codex,  # type: ignore[arg-type]
+                fallback_agent=fallback,
+            )
+
+            out = reviewer.review_story_output(
+                self._story_row(),
+                {"titleZh": "中文标题", "aiSummary": "摘要"},
+                ["heuristic issue"],
+            )
+        finally:
+            settings.CODEX_ENABLED = old_codex_enabled  # type: ignore[assignment]
+
+        self.assertTrue(out["approved"])
+        self.assertEqual(len(codex.calls), 1)
+        self.assertEqual(fallback.calls, [])
+        self.assertEqual(codex.calls[0]["purpose"], "quality-review")
+        self.assertEqual(
+            codex.calls[0]["output_schema"],
+            ai_agent_module._AI_QUALITY_REVIEW_OUTPUT_SCHEMA,
+        )
+
+    def test_quality_reviewer_falls_back_to_ai_provider_after_codex_failure(self):
+        class FailingCodex:
+            def __init__(self):
+                self.calls = []
+
+            def complete_json(self, **kwargs):
+                self.calls.append(kwargs)
+                raise ai_agent_module.CodexCliError("codex down")
+
+        class ProviderFallback:
+            def __init__(self):
+                self.calls = []
+
+            def complete_json(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "approved": True,
+                    "action": "approve",
+                    "reason": "provider approved",
+                }
+
+        codex = FailingCodex()
+        fallback = ProviderFallback()
+        old_codex_enabled = settings.CODEX_ENABLED
+        try:
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            reviewer = ai_agent_module.AiOutputQualityReviewer(
+                codex_client=codex,  # type: ignore[arg-type]
+                fallback_agent=fallback,
+            )
+
+            out = reviewer.review_story_output(
+                self._story_row(),
+                {"titleZh": "中文标题", "aiSummary": "摘要"},
+                ["heuristic issue"],
+            )
+        finally:
+            settings.CODEX_ENABLED = old_codex_enabled  # type: ignore[assignment]
+
+        self.assertTrue(out["approved"])
+        self.assertEqual(len(codex.calls), 1)
+        self.assertEqual(len(fallback.calls), 1)
+        self.assertEqual(fallback.calls[0]["purpose"], "quality-review")
+
+    def test_quality_reviewer_fails_closed_when_codex_and_provider_fail(self):
+        class FailingCodex:
+            def complete_json(self, **kwargs):
+                raise ai_agent_module.CodexCliError("codex down")
+
+        class FailingProvider:
+            def complete_json(self, **kwargs):
+                raise RuntimeError("provider down")
+
+        old_codex_enabled = settings.CODEX_ENABLED
+        try:
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            reviewer = ai_agent_module.AiOutputQualityReviewer(
+                codex_client=FailingCodex(),  # type: ignore[arg-type]
+                fallback_agent=FailingProvider(),
+            )
+
+            with self.assertRaisesRegex(
+                ai_agent_module.AiOutputQualityReviewError,
+                "quality review failed",
+            ):
+                reviewer.review_story_output(
+                    self._story_row(),
+                    {"titleZh": "唐纳德·克努uth《字母 S》", "aiSummary": "克努uth"},
+                    ["heuristic issue"],
+                )
+        finally:
+            settings.CODEX_ENABLED = old_codex_enabled  # type: ignore[assignment]
+
     def test_codex_output_schemas_are_strict_response_format_compatible(self):
         def assert_strict_objects(schema):
             if not isinstance(schema, dict):
@@ -8534,6 +8896,7 @@ class CodexFirstAiAgentTests(unittest.TestCase):
         assert_strict_objects(ai_agent_module._BATCH_ENRICH_OUTPUT_SCHEMA)
         assert_strict_objects(ai_agent_module._DIGEST_SELECTION_OUTPUT_SCHEMA)
         assert_strict_objects(ai_agent_module._DIGEST_INTRO_OUTPUT_SCHEMA)
+        assert_strict_objects(ai_agent_module._AI_QUALITY_REVIEW_OUTPUT_SCHEMA)
 
     def test_codex_first_usage_summary_accepts_purpose_filter(self):
         class UsageClient:

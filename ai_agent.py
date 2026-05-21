@@ -175,6 +175,39 @@ _DIGEST_INTRO_OUTPUT_SCHEMA: Dict[str, Any] = {
 }
 
 
+_AI_QUALITY_REVIEW_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "approved": {"type": "boolean"},
+        "action": {"type": "string", "enum": ["approve", "reject"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["approved", "action", "reason"],
+    "additionalProperties": False,
+}
+
+_AI_QUALITY_REVIEW_SYSTEM_PROMPT = (
+    "You are a strict quality gate for a Chinese-language Hacker News reader. "
+    "Review generated reader-facing Chinese editorial output before it is "
+    "persisted. You receive the original source metadata, the full generated "
+    "output, and deterministic heuristic findings. Approve only when the "
+    "heuristic finding is clearly a false positive and the generated output is "
+    "natural, polished Chinese that is safe to show to readers. Reject if any "
+    "title, summary, theme, insight, or term contains malformed bilingual text, "
+    "including a proper noun rendered as Chinese transliteration plus a leftover "
+    "English suffix or prefix; awkward untranslated English fragments; broken "
+    "or unbalanced punctuation; JSON/markdown/prompt delimiter leakage; "
+    "machine-like meta disclaimers about missing input; inconsistent person, "
+    "product, project, or paper names across fields; or wording that would read "
+    "unnatural to a Chinese reader. Treat established acronyms and product names "
+    "as acceptable when they are formatted cleanly. Do not rewrite, shorten, or "
+    "repair the content; only approve or reject. Return one strict JSON object "
+    "matching the schema."
+)
+_AI_QUALITY_REVIEW_OUTPUT_TOKENS = 800
+_AI_QUALITY_REVIEW_REASONING_EFFORT = "medium"
+
+
 def _clamp_int(value: int, lower: int, upper: int) -> int:
     return max(lower, min(upper, int(value)))
 
@@ -352,6 +385,10 @@ class AiProviderHttpError(RuntimeError):
 
 class AiProviderResponseError(ValueError):
     pass
+
+
+class AiOutputQualityReviewError(RuntimeError):
+    """Raised when the AI output quality reviewer cannot approve a result."""
 
 
 class AiCapacityDeferred(RuntimeError):
@@ -1420,7 +1457,11 @@ _SYSTEM_PROMPT = (
     "reader. Given an English article (title, body excerpt, top comments), "
     "output a single strict JSON object (output JSON only, no surrounding "
     "prose) with these fields:\n"
-    "- titleZh: string, Chinese title.\n"
+    "- titleZh: string, Chinese title. Preserve proper nouns, product names, "
+    "project names, acronyms, code identifiers, and paper/book titles cleanly: "
+    "use an established Chinese rendering when one is obvious, otherwise keep "
+    "the full source term. Never emit a hybrid name made from a Chinese "
+    "transliteration plus a leftover English suffix/prefix.\n"
     "- topicId: string, required. Choose exactly one id from the fixed topic "
     "catalog provided below. Do NOT create, rename, translate, merge, or "
     "invent topics. Do NOT classify by Hacker News feed "
@@ -1717,6 +1758,35 @@ def validate_batch_ai_output(
             strict_topic=strict_topic,
         )
     return out
+
+
+def validate_ai_quality_review(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("AI quality review must be a JSON object")
+    action = str(raw.get("action") or "").strip().lower()
+    if action not in ("approve", "reject"):
+        raise ValueError("AI quality review action must be approve or reject")
+    approved = raw.get("approved")
+    if not isinstance(approved, bool):
+        raise ValueError("AI quality review approved must be boolean")
+    reason = raw.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("AI quality review reason must be a non-empty string")
+    return {
+        "approved": bool(approved) and action == "approve",
+        "action": action,
+        "reason": reason.strip(),
+    }
+
+
+def _mapping_get(row: Mapping[str, Any], key: str, default: Any = "") -> Any:
+    getter = getattr(row, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    try:
+        return row[key]
+    except (IndexError, KeyError, TypeError):
+        return default
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -2795,6 +2865,48 @@ class RealAiAgent(AiAgent):
             return _loads_json_from_model_text(content)
         raise ValueError(f"unexpected content type: {type(content).__name__}")
 
+    def complete_json(
+        self,
+        *,
+        purpose: str,
+        system_prompt: str,
+        user_content: str,
+        output_schema: Mapping[str, Any],
+        max_tokens: int = 1200,
+        temperature: float = 0.1,
+    ) -> Dict[str, Any]:
+        schema_text = json.dumps(output_schema, ensure_ascii=False, indent=2)
+
+        def _process_with_config(config: AiProviderConfig) -> Dict[str, Any]:
+            effective_max_tokens = _resolve_max_tokens(config, max_tokens)
+            response = self._post_chat_for_purpose(
+                purpose,
+                config,
+                {
+                    "temperature": float(temperature),
+                    "response_format": {"type": "json_object"},
+                    "model": config.model,
+                    "max_tokens": effective_max_tokens,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                system_prompt
+                                + "\n\nReturn JSON matching this schema:\n"
+                                + schema_text
+                            ),
+                        },
+                        {"role": "user", "content": user_content},
+                    ],
+                },
+            )
+            raw = self._extract_json(response)
+            if not isinstance(raw, dict):
+                raise ValueError("AI JSON response must be an object")
+            return raw
+
+        return self._with_failover(purpose, _process_with_config)
+
     def process_story(
         self,
         story_row,
@@ -3010,6 +3122,125 @@ class RealAiAgent(AiAgent):
         return self._with_failover("digest", _write_with_config)
 
 
+# ---------- AI output quality review ----------
+
+class AiOutputQualityReviewer:
+    """Codex-first reviewer for suspicious reader-facing AI output."""
+
+    def __init__(
+        self,
+        *,
+        codex_client: Optional[CodexCliJsonClient] = None,
+        fallback_agent: Optional[Any] = None,
+    ) -> None:
+        self.codex_client = codex_client or CodexCliJsonClient()
+        self.fallback_agent = fallback_agent
+
+    def _payload(
+        self,
+        story_row: Mapping[str, Any],
+        processed: Mapping[str, Any],
+        issues: Sequence[str],
+    ) -> str:
+        source = {
+            "id": _mapping_get(story_row, "id", None),
+            "kind": _mapping_get(story_row, "kind", "") or "story",
+            "titleEn": _mapping_get(story_row, "title_en", "") or "",
+            "url": _mapping_get(story_row, "url", "") or "",
+            "bodyExcerpt": str(_mapping_get(story_row, "raw_text", "") or "")[:1600],
+        }
+        generated = {
+            "titleZh": processed.get("titleZh") or "",
+            "aiSummary": processed.get("aiSummary") or "",
+            "discussionThemes": processed.get("discussionThemes") or [],
+            "insights": processed.get("insights") or [],
+            "terms": processed.get("terms") or [],
+        }
+        return json.dumps(
+            {
+                "source": source,
+                "generated": generated,
+                "heuristicIssues": list(issues),
+            },
+            ensure_ascii=False,
+        )
+
+    def _complete_with_fallback(self, user_content: str) -> Dict[str, Any]:
+        if self.fallback_agent is None:
+            raise AiOutputQualityReviewError(
+                "Codex CLI quality review failed and no AI provider fallback is configured"
+            )
+        method = getattr(self.fallback_agent, "complete_json", None)
+        if not callable(method):
+            raise AiOutputQualityReviewError(
+                "AI provider fallback cannot perform JSON quality review"
+            )
+        return method(
+            purpose="quality-review",
+            system_prompt=_AI_QUALITY_REVIEW_SYSTEM_PROMPT,
+            user_content=user_content,
+            output_schema=_AI_QUALITY_REVIEW_OUTPUT_SCHEMA,
+            max_tokens=_AI_QUALITY_REVIEW_OUTPUT_TOKENS,
+            temperature=0.1,
+        )
+
+    def review_story_output(
+        self,
+        story_row: Mapping[str, Any],
+        processed: Mapping[str, Any],
+        issues: Sequence[str],
+    ) -> Dict[str, Any]:
+        user_content = self._payload(story_row, processed, issues)
+        codex_error: Optional[Exception] = None
+        if settings.CODEX_ENABLED:
+            try:
+                raw = self.codex_client.complete_json(
+                    purpose="quality-review",
+                    system_prompt=_AI_QUALITY_REVIEW_SYSTEM_PROMPT,
+                    user_content=user_content,
+                    output_schema=_AI_QUALITY_REVIEW_OUTPUT_SCHEMA,
+                    reasoning_effort=_AI_QUALITY_REVIEW_REASONING_EFFORT,
+                )
+                return validate_ai_quality_review(raw)
+            except (CodexCliError, subprocess.SubprocessError, OSError, ValueError) as exc:
+                codex_error = exc
+                log.warning(
+                    "Codex CLI quality review failed; trying AI provider fallback: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+        try:
+            raw = self._complete_with_fallback(user_content)
+            return validate_ai_quality_review(raw)
+        except Exception as exc:  # noqa: BLE001
+            if codex_error is not None:
+                raise AiOutputQualityReviewError(
+                    "AI output quality review failed with Codex CLI and provider "
+                    f"fallback: codex={type(codex_error).__name__}: {codex_error}; "
+                    f"fallback={type(exc).__name__}: {exc}"
+                ) from exc
+            raise AiOutputQualityReviewError(
+                f"AI output quality review failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+
+def build_ai_quality_reviewer() -> AiOutputQualityReviewer:
+    """Build the Codex-first quality reviewer.
+
+    Unlike the enrichment factory, there is no offline fallback here: if Codex
+    and configured AI providers cannot review a suspicious result, the caller
+    must reject it rather than publish an unapproved item.
+    """
+    settings.refresh_ai_settings_from_env_files()
+    fallback_agent: Optional[RealAiAgent] = None
+    provider = (settings.AI_PROVIDER or "none").strip().lower()
+    if provider not in ("", "none", "fallback", "off", "disabled"):
+        configs = build_ai_provider_configs()
+        if configs:
+            fallback_agent = RealAiAgent(configs=configs)
+    return AiOutputQualityReviewer(fallback_agent=fallback_agent)
+
+
 # ---------- factory ----------
 
 def build_ai_agent() -> AiAgent:
@@ -3047,17 +3278,21 @@ __all__ = [
     "CodexFirstAiAgent",
     "FallbackAiAgent",
     "AiCapacityDeferred",
+    "AiOutputQualityReviewError",
+    "AiOutputQualityReviewer",
     "AiProviderConfig",
     "AiProviderHttpError",
     "AiProviderResponseError",
     "RealAiAgent",
     "build_ai_agent",
+    "build_ai_quality_reviewer",
     "build_ai_provider_configs",
     "build_ai_provider_configs_from_raw",
     "build_insights_compression_ai_provider_configs",
     "build_insights_ai_provider_configs",
     "is_ai_capacity_error",
     "is_ai_quota_or_balance_error",
+    "validate_ai_quality_review",
     "validate_ai_output",
     "validate_batch_ai_output",
     "validate_digest_selection",
