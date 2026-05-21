@@ -16445,7 +16445,7 @@ class StoryImagePipelineTests(_SqliteCase):
             [c.url for c in candidates],
         )
 
-    def test_normalize_image_outputs_real_64_png(self):
+    def test_normalize_image_outputs_real_128_png(self):
         from PIL import Image
         from . import story_images
 
@@ -16455,11 +16455,11 @@ class StoryImagePipelineTests(_SqliteCase):
             src.getvalue(), max_pixels=1_000_000
         )
         with Image.open(io.BytesIO(out)) as im:
-            self.assertEqual(im.size, (64, 64))
+            self.assertEqual(im.size, (128, 128))
             self.assertEqual(im.format, "PNG")
-            self.assertEqual(im.convert("RGBA").getpixel((32, 0)), (0, 0, 0, 255))
-            self.assertEqual(im.convert("RGBA").getpixel((32, 63)), (0, 0, 0, 255))
-            r, g, b, a = im.convert("RGBA").getpixel((32, 32))
+            self.assertEqual(im.convert("RGBA").getpixel((64, 0)), (0, 0, 0, 255))
+            self.assertEqual(im.convert("RGBA").getpixel((64, 127)), (0, 0, 0, 255))
+            r, g, b, a = im.convert("RGBA").getpixel((64, 64))
             self.assertGreater(r, 150)
             self.assertLess(g, 80)
             self.assertLess(b, 80)

@@ -33,6 +33,7 @@ _UA = (
 )
 _MAX_REDIRECTS = 5
 _PNG_MIME = "image/png"
+_THUMBNAIL_SIZE = 128
 
 
 class StoryImageError(RuntimeError):
@@ -205,11 +206,18 @@ def _normalize_image(raw: bytes, *, max_pixels: int) -> bytes:
                 )
             im = im.convert("RGBA")
             thumb = ImageOps.contain(
-                im, (64, 64), method=Image.Resampling.LANCZOS
+                im, (_THUMBNAIL_SIZE, _THUMBNAIL_SIZE),
+                method=Image.Resampling.LANCZOS,
             )
-            out = Image.new("RGBA", (64, 64), (0, 0, 0, 255))
+            out = Image.new(
+                "RGBA", (_THUMBNAIL_SIZE, _THUMBNAIL_SIZE), (0, 0, 0, 255)
+            )
             out.alpha_composite(
-                thumb, ((64 - thumb.width) // 2, (64 - thumb.height) // 2)
+                thumb,
+                (
+                    (_THUMBNAIL_SIZE - thumb.width) // 2,
+                    (_THUMBNAIL_SIZE - thumb.height) // 2,
+                ),
             )
             buf = BytesIO()
             out.save(buf, format="PNG", optimize=True)

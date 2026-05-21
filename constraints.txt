@@ -11,7 +11,7 @@
 #   .venv/bin/pip install -r server/requirements.txt -c server/constraints.txt
 #
 # Pydantic transitives are listed explicitly; Pillow is a direct dependency for
-# 64x64 story thumbnail normalization.
+# 128x128 story thumbnail normalization.
 
 pydantic==2.12.5
 pydantic_core==2.41.5
