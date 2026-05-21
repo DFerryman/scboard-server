@@ -2065,6 +2065,24 @@ def _stable_json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def _publishable_payload_for_change(value: Any) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    out = dict(value)
+    out.pop("generatedAt", None)
+    return out
+
+
+def _decode_payload_for_change(value: Any) -> dict:
+    if isinstance(value, dict):
+        return _publishable_payload_for_change(value)
+    try:
+        decoded = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        decoded = {}
+    return _publishable_payload_for_change(decoded)
+
+
 def _stable_int_ids(ids: Sequence[int]) -> List[int]:
     out: List[int] = []
     seen: set[int] = set()
@@ -2088,13 +2106,18 @@ def upsert_insight(
     generated_at: int,
     window_days: int,
     model_usage: Optional[dict] = None,
+    material_fingerprint: str = "",
 ) -> bool:
     """Insert/update one insights payload.
 
     Returns True only when publishable content changed. Caller owns the
     transaction and bumps ``catalog_version`` on True.
     """
-    encoded_payload = _stable_json_dumps(payload if isinstance(payload, dict) else {})
+    clean_payload = payload if isinstance(payload, dict) else {}
+    encoded_payload = _stable_json_dumps(clean_payload)
+    encoded_payload_for_change = _stable_json_dumps(
+        _publishable_payload_for_change(clean_payload)
+    )
     encoded_source_ids = _stable_json_dumps(_stable_int_ids(source_story_ids))
     encoded_usage = (
         _stable_json_dumps(model_usage)
@@ -2111,20 +2134,24 @@ def upsert_insight(
     ).fetchone()
     changed = not (
         existing
-        and (existing["payload"] or "{}") == encoded_payload
+        and _stable_json_dumps(
+            _decode_payload_for_change(existing["payload"])
+        ) == encoded_payload_for_change
         and (existing["source_story_ids"] or "[]") == encoded_source_ids
         and int(existing["window_days"] or 0) == int(window_days)
     )
     conn.execute(
         """
         INSERT INTO insights(
-            date, payload, source_story_ids, generated_at, window_days, model_usage
-        ) VALUES(?, ?, ?, ?, ?, ?)
+            date, payload, source_story_ids, generated_at, window_days,
+            material_fingerprint, model_usage
+        ) VALUES(?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(date) DO UPDATE SET
             payload=excluded.payload,
             source_story_ids=excluded.source_story_ids,
             generated_at=excluded.generated_at,
             window_days=excluded.window_days,
+            material_fingerprint=excluded.material_fingerprint,
             model_usage=excluded.model_usage
         """,
         (
@@ -2133,6 +2160,7 @@ def upsert_insight(
             encoded_source_ids,
             int(generated_at),
             int(window_days),
+            str(material_fingerprint or ""),
             encoded_usage,
         ),
     )
@@ -2303,19 +2331,21 @@ def record_insight_run(
     finished_at: Optional[int],
     status: str,
     model_usage: Optional[dict] = None,
+    summary: Optional[dict] = None,
     error: str = "",
 ) -> None:
     conn.execute(
         """
         INSERT INTO insights_runs(
-            run_id, date, started_at, finished_at, status, model_usage, error
-        ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            run_id, date, started_at, finished_at, status, model_usage, summary, error
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(run_id) DO UPDATE SET
             date=excluded.date,
             started_at=excluded.started_at,
             finished_at=excluded.finished_at,
             status=excluded.status,
             model_usage=excluded.model_usage,
+            summary=excluded.summary,
             error=excluded.error
         """,
         (
@@ -2325,6 +2355,7 @@ def record_insight_run(
             finished_at,
             status,
             _stable_json_dumps(model_usage) if isinstance(model_usage, dict) else None,
+            _stable_json_dumps(summary) if isinstance(summary, dict) else None,
             error[:1000] if error else None,
         ),
     )

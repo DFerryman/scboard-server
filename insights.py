@@ -370,6 +370,60 @@ def _story_refs_by_id(
     return {int(row["id"]): _story_ref(row, feed_ranks) for row in rows}
 
 
+def _card_story_ids(item: Mapping[str, Any]) -> List[int]:
+    out: List[int] = []
+    seen: set[int] = set()
+    for raw_id in item.get("storyIds") or []:
+        try:
+            sid = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if sid in seen:
+            continue
+        seen.add(sid)
+        out.append(sid)
+    return out
+
+
+def _evidence_card_metrics(
+    item: Mapping[str, Any],
+    *,
+    story_refs: Mapping[int, Mapping[str, Any]],
+    target_end_ts: int,
+) -> Dict[str, Any]:
+    refs = [
+        story_refs[sid]
+        for sid in _card_story_ids(item)
+        if sid in story_refs
+    ]
+    scores = [int(ref.get("score") or 0) for ref in refs]
+    descendants = [int(ref.get("descendants") or 0) for ref in refs]
+    times = [int(ref.get("time") or 0) for ref in refs if int(ref.get("time") or 0) > 0]
+    feed_ranks = [
+        _feed_rank_score(ref.get("feedRanks") or {})
+        for ref in refs
+        if isinstance(ref.get("feedRanks"), Mapping)
+    ]
+    best_feed_rank = min(feed_ranks) if feed_ranks else 999
+    newest_time = max(times) if times else 0
+    return {
+        "storyCount": len(refs),
+        "totalScore": sum(scores),
+        "maxScore": max(scores) if scores else 0,
+        "totalDescendants": sum(descendants),
+        "maxDescendants": max(descendants) if descendants else 0,
+        "oldestTime": min(times) if times else 0,
+        "newestTime": newest_time,
+        "recencyHours": (
+            max(0, int(target_end_ts) - newest_time) // 3600
+            if newest_time
+            else None
+        ),
+        "bestFeedRank": best_feed_rank if best_feed_rank < 999 else None,
+        "rankedFeedCount": sum(1 for rank in feed_ranks if rank < 999),
+    }
+
+
 def _insight_row_signal_key(
     row: Any,
     feed_ranks: Mapping[int, Mapping[str, int]],
@@ -493,7 +547,7 @@ def _hash_update_json(hasher: "hashlib._Hash", value: Any) -> None:
     hasher.update(b"\n")
 
 
-def _insights_evidence_cache_key(
+def _insights_material_fingerprint(
     *,
     target_date: str,
     start_date: str,
@@ -506,7 +560,7 @@ def _insights_evidence_cache_key(
         hasher,
         {
             "stage": "insights-evidence",
-            "schema": 3,
+            "schema": 4,
             "date": target_date,
             "startDate": start_date,
             "insightsVersion": INSIGHTS_VERSION,
@@ -560,7 +614,25 @@ def _insights_evidence_cache_key(
                     "text": _hash_text(_row_value(comment, "text", "") or ""),
                 },
             )
-    return f"insights:evidence:v3:{target_date}:{hasher.hexdigest()}"
+    return hasher.hexdigest()
+
+
+def _insights_evidence_cache_key(
+    *,
+    target_date: str,
+    start_date: str,
+    window_rows: Sequence[Any],
+    feed_ranks: Mapping[int, Mapping[str, int]],
+    comments_by_story: Mapping[int, Sequence[Any]],
+) -> str:
+    fingerprint = _insights_material_fingerprint(
+        target_date=target_date,
+        start_date=start_date,
+        window_rows=window_rows,
+        feed_ranks=feed_ranks,
+        comments_by_story=comments_by_story,
+    )
+    return f"insights:evidence:v4:{target_date}:{fingerprint}"
 
 
 def _load_cached_evidence(cache_key: str) -> Optional[Dict[str, Any]]:
@@ -708,11 +780,25 @@ def build_topic_scout_input(
     evidence: Mapping[str, Any],
     *,
     target_date: str,
+    story_refs: Optional[Mapping[int, Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    _target_start, target_end_ts = repository.digest_date_epoch_bounds(target_date)
+    refs = story_refs or {}
+    cards = []
+    for item in evidence.get("evidenceCards") or []:
+        if not isinstance(item, Mapping):
+            continue
+        card = dict(item)
+        card["metrics"] = _evidence_card_metrics(
+            card,
+            story_refs=refs,
+            target_end_ts=target_end_ts,
+        )
+        cards.append(card)
     return {
         "date": target_date,
         "evidenceCoverage": evidence.get("coverage") or {},
-        "evidenceCards": evidence.get("evidenceCards") or [],
+        "evidenceCards": cards,
         "excludedStoryIds": evidence.get("excludedStoryIds") or [],
     }
 
@@ -752,19 +838,14 @@ def _enrich_evidence_cards(
     evidence: Mapping[str, Any],
     *,
     story_refs: Mapping[int, Mapping[str, Any]],
+    target_date: str,
 ) -> List[Dict[str, Any]]:
     cards = []
+    _target_start, target_end_ts = repository.digest_date_epoch_bounds(target_date)
     for item in evidence.get("evidenceCards") or []:
         if not isinstance(item, Mapping):
             continue
-        story_ids = []
-        for raw_id in item.get("storyIds") or []:
-            try:
-                sid = int(raw_id)
-            except (TypeError, ValueError):
-                continue
-            if sid not in story_ids:
-                story_ids.append(sid)
+        story_ids = _card_story_ids(item)
         topic = str(item.get("topic") or "")
         cards.append(
             {
@@ -781,6 +862,12 @@ def _enrich_evidence_cards(
                 "opportunityAngles": item.get("opportunityAngles") or [],
                 "debatePoints": item.get("debatePoints") or [],
                 "commentSignals": item.get("commentSignals") or [],
+                "storySignals": item.get("storySignals") or [],
+                "metrics": _evidence_card_metrics(
+                    item,
+                    story_refs=story_refs,
+                    target_end_ts=target_end_ts,
+                ),
             }
         )
     return cards
@@ -826,10 +913,12 @@ def build_routed_insights_inputs(
     evidence: Mapping[str, Any],
     scout: Mapping[str, Any],
     story_refs: Mapping[int, Mapping[str, Any]],
+    previous_insight: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     cards = _enrich_evidence_cards(
         evidence,
         story_refs=story_refs,
+        target_date=target_date,
     )
     compact_scout = _scout_summary(scout)
     signals_input = {
@@ -843,6 +932,8 @@ def build_routed_insights_inputs(
             min_cards=SIGNALS_MIN_STORIES,
         ),
     }
+    if previous_insight:
+        signals_input["previousInsight"] = previous_insight.get("signals") or {}
     opportunities_input = {
         "topicScout": compact_scout,
         "candidates": _cards_for_route(
@@ -852,6 +943,10 @@ def build_routed_insights_inputs(
             min_cards=OPPORTUNITY_MIN_CANDIDATES,
         ),
     }
+    if previous_insight:
+        opportunities_input["previousInsight"] = (
+            previous_insight.get("opportunities") or {}
+        )
     debates_input = {
         "topicScout": compact_scout,
         "candidates": _cards_for_route(
@@ -861,6 +956,8 @@ def build_routed_insights_inputs(
             min_cards=DEBATE_MIN_CANDIDATES,
         ),
     }
+    if previous_insight:
+        debates_input["previousInsight"] = previous_insight.get("debates") or {}
     return signals_input, opportunities_input, debates_input
 
 
@@ -1012,6 +1109,88 @@ def _build_stats(
     ]
 
 
+def _previous_insight_context(row: Any) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    payload = _json_loads(row["payload"], {})
+    if not isinstance(payload, Mapping):
+        return None
+    return {
+        "headline": payload.get("headline") or "",
+        "summary": payload.get("summary") or "",
+        "signals": {
+            "headline": payload.get("headline") or "",
+            "summary": payload.get("summary") or "",
+            "items": [
+                {
+                    "title": item.get("title") or "",
+                    "brief": item.get("brief") or "",
+                    "label": item.get("label") or "",
+                }
+                for item in payload.get("signals") or []
+                if isinstance(item, Mapping)
+            ],
+        },
+        "opportunities": {
+            "items": [
+                {
+                    "title": item.get("title") or "",
+                    "thesis": item.get("thesis") or "",
+                    "whyNow": item.get("whyNow") or "",
+                    "risk": item.get("risk") or "",
+                    "linkedStoryIds": item.get("linkedStoryIds") or [],
+                }
+                for item in payload.get("opportunities") or []
+                if isinstance(item, Mapping)
+            ],
+        },
+        "debates": {
+            "items": [
+                {
+                    "topic": item.get("topic") or "",
+                    "verdict": item.get("verdict") or "",
+                    "support": item.get("support") or "",
+                    "oppose": item.get("oppose") or "",
+                    "watch": item.get("watch") or "",
+                }
+                for item in payload.get("debates") or []
+                if isinstance(item, Mapping)
+            ],
+        },
+    }
+
+
+def _comment_count(comments_by_story: Mapping[int, Sequence[Any]]) -> int:
+    return sum(len(items) for items in comments_by_story.values())
+
+
+def _insights_run_summary(
+    *,
+    today_rows: Sequence[Any],
+    evidence_rows: Sequence[Any],
+    comments_by_story: Mapping[int, Sequence[Any]],
+    material_fingerprint: str = "",
+    evidence_cache: str = "",
+    topic_scout: Optional[Mapping[str, Any]] = None,
+    skip_reason: str = "",
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "today_story_count": len(today_rows),
+        "evidence_story_count": len(evidence_rows),
+        "comment_count": _comment_count(comments_by_story),
+    }
+    if material_fingerprint:
+        out["material_fingerprint"] = material_fingerprint
+    if evidence_cache:
+        out["evidence_cache"] = evidence_cache
+    if topic_scout is not None:
+        out["topic_scout_selected_count"] = len(topic_scout.get("selectedTopics") or [])
+        out["topic_scout_excluded_count"] = len(topic_scout.get("excludedTopics") or [])
+    if skip_reason:
+        out["skip_reason"] = skip_reason
+    return out
+
+
 def _finish_run_record(
     *,
     run_id: str,
@@ -1019,6 +1198,7 @@ def _finish_run_record(
     started_at: int,
     status: str,
     model_usage: Optional[dict] = None,
+    summary: Optional[dict] = None,
     error: str = "",
 ) -> None:
     conn = db.connect()
@@ -1032,6 +1212,7 @@ def _finish_run_record(
                 finished_at=repository.now_seconds(),
                 status=status,
                 model_usage=model_usage,
+                summary=summary,
                 error=error,
             )
     finally:
@@ -1064,13 +1245,19 @@ def run_insights_once(
             if today_start <= int(row["hn_time"] or 0) < today_end
         ]
         candidate_story_ids = [int(row["id"]) for row in window_rows]
+        existing_insight_row = repository.get_insight_row(conn, target_date)
         if len(today_rows) < int(settings.INSIGHTS_MIN_TODAY_STORIES):
             reason = "insufficient_today_stories"
+            summary = {
+                "today_story_count": len(today_rows),
+                "skip_reason": reason,
+            }
             _finish_run_record(
                 run_id=run_id,
                 date=target_date,
                 started_at=started_at,
                 status="skipped",
+                summary=summary,
                 error=reason,
             )
             return {
@@ -1078,6 +1265,7 @@ def run_insights_once(
                 "reason": reason,
                 "date": target_date,
                 "today_story_count": len(today_rows),
+                "run_summary": summary,
             }
         if not force and not repository.insight_needs_update(
             conn,
@@ -1086,14 +1274,21 @@ def run_insights_once(
             candidate_story_ids,
         ):
             reason = "not_due"
+            summary = {"skip_reason": reason}
             _finish_run_record(
                 run_id=run_id,
                 date=target_date,
                 started_at=started_at,
                 status="skipped",
+                summary=summary,
                 error=reason,
             )
-            return {"status": "skipped", "reason": reason, "date": target_date}
+            return {
+                "status": "skipped",
+                "reason": reason,
+                "date": target_date,
+                "run_summary": summary,
+            }
 
         feed_ranks = repository.insight_feed_ranks_for_story_ids(
             conn, candidate_story_ids
@@ -1115,11 +1310,20 @@ def run_insights_once(
             comment_ids,
             limit_per_story=settings.INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY,
         )
+        material_fingerprint = _insights_material_fingerprint(
+            target_date=target_date,
+            start_date=start_date,
+            window_rows=evidence_rows,
+            feed_ranks=feed_ranks,
+            comments_by_story=comments_by_story,
+        )
+        previous_insight = _previous_insight_context(existing_insight_row)
     finally:
         conn.close()
 
     agent = None
     usage_checkpoint = None
+    run_summary: Optional[dict] = None
 
     try:
         preflight_counts = {
@@ -1143,11 +1347,19 @@ def run_insights_once(
             )
         if preflight_gaps:
             reason = "insufficient_insights_inputs"
+            summary = _insights_run_summary(
+                today_rows=today_rows,
+                evidence_rows=evidence_rows,
+                comments_by_story=comments_by_story,
+                material_fingerprint=material_fingerprint,
+                skip_reason=reason,
+            )
             _finish_run_record(
                 run_id=run_id,
                 date=target_date,
                 started_at=started_at,
                 status="skipped",
+                summary=summary,
                 error=f"{reason}: {'; '.join(preflight_gaps)}",
             )
             return {
@@ -1156,15 +1368,40 @@ def run_insights_once(
                 "date": target_date,
                 "input_counts": preflight_counts,
                 "input_gaps": preflight_gaps,
+                "run_summary": summary,
             }
 
-        evidence_cache_key = _insights_evidence_cache_key(
-            target_date=target_date,
-            start_date=start_date,
-            window_rows=evidence_rows,
-            feed_ranks=feed_ranks,
-            comments_by_story=comments_by_story,
-        )
+        if (
+            not force
+            and material_fingerprint
+            and str(_row_value(existing_insight_row, "material_fingerprint", "") or "")
+            == material_fingerprint
+        ):
+            reason = "material_unchanged"
+            summary = _insights_run_summary(
+                today_rows=today_rows,
+                evidence_rows=evidence_rows,
+                comments_by_story=comments_by_story,
+                material_fingerprint=material_fingerprint,
+                skip_reason=reason,
+            )
+            _finish_run_record(
+                run_id=run_id,
+                date=target_date,
+                started_at=started_at,
+                status="skipped",
+                summary=summary,
+                error=reason,
+            )
+            return {
+                "status": "skipped",
+                "reason": reason,
+                "date": target_date,
+                "material_fingerprint": material_fingerprint,
+                "run_summary": summary,
+            }
+
+        evidence_cache_key = f"insights:evidence:v4:{target_date}:{material_fingerprint}"
 
         agent = ai_agent or InsightsAgentRunner()
         usage_checkpoint = _usage_checkpoint(agent)
@@ -1186,12 +1423,13 @@ def run_insights_once(
                 evidence_out,
                 len(evidence_rows),
             )
+        story_refs = _story_refs_by_id(window_rows, feed_ranks)
         topic_scout_input = build_topic_scout_input(
             evidence_out,
             target_date=target_date,
+            story_refs=story_refs,
         )
         topic_scout_out = agent.run_topic_scout(topic_scout_input)
-        story_refs = _story_refs_by_id(window_rows, feed_ranks)
         signals_input, opportunities_input, debates_input = (
             build_routed_insights_inputs(
                 target_date=target_date,
@@ -1199,7 +1437,16 @@ def run_insights_once(
                 evidence=evidence_out,
                 scout=topic_scout_out,
                 story_refs=story_refs,
+                previous_insight=previous_insight,
             )
+        )
+        run_summary = _insights_run_summary(
+            today_rows=today_rows,
+            evidence_rows=evidence_rows,
+            comments_by_story=comments_by_story,
+            material_fingerprint=material_fingerprint,
+            evidence_cache=evidence_cache_status,
+            topic_scout=topic_scout_out,
         )
 
         input_counts = _insights_input_counts(
@@ -1210,12 +1457,15 @@ def run_insights_once(
         input_gaps = _insights_input_gaps(input_counts)
         if input_gaps:
             reason = "insufficient_insights_inputs"
+            skip_summary = dict(run_summary)
+            skip_summary["skip_reason"] = reason
             _finish_run_record(
                 run_id=run_id,
                 date=target_date,
                 started_at=started_at,
                 status="skipped",
                 model_usage=_usage_since(agent, usage_checkpoint),
+                summary=skip_summary,
                 error=f"{reason}: {'; '.join(input_gaps)}",
             )
             return {
@@ -1224,6 +1474,7 @@ def run_insights_once(
                 "date": target_date,
                 "input_counts": input_counts,
                 "input_gaps": input_gaps,
+                "run_summary": skip_summary,
             }
 
         signals_out = agent.run_signals(signals_input)
@@ -1270,6 +1521,7 @@ def run_insights_once(
                     repository.now_seconds(),
                     window_days,
                     model_usage=model_usage,
+                    material_fingerprint=material_fingerprint,
                 )
                 if changed:
                     repository.bump_catalog_version(conn)
@@ -1281,6 +1533,7 @@ def run_insights_once(
                     finished_at=repository.now_seconds(),
                     status="ok",
                     model_usage=model_usage,
+                    summary=run_summary,
                     error="",
                 )
         finally:
@@ -1291,6 +1544,8 @@ def run_insights_once(
             "date": target_date,
             "source_story_ids_count": len(set(source_story_ids)),
             "evidence_cache": evidence_cache_status,
+            "material_fingerprint": material_fingerprint,
+            "run_summary": run_summary or {},
             "agent_usage": model_usage or {},
         }
     except Exception as exc:  # noqa: BLE001
@@ -1303,6 +1558,7 @@ def run_insights_once(
             started_at=started_at,
             status="failed",
             model_usage=model_usage,
+            summary=run_summary,
             error=error,
         )
         return {

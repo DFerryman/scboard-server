@@ -315,6 +315,9 @@ def _latest_insight_summary(
             else int(now) - generated_at >= interval
         ),
     }
+    material_fingerprint = row["material_fingerprint"] or ""
+    if material_fingerprint:
+        out["material_fingerprint"] = material_fingerprint
     model_usage = _decode_json_dict(row["model_usage"])
     if model_usage is not None:
         out["model_usage"] = model_usage
@@ -345,6 +348,9 @@ def _latest_insight_run_summary(conn: sqlite3.Connection) -> Optional[Dict[str, 
     model_usage = _decode_json_dict(row["model_usage"])
     if model_usage is not None:
         out["model_usage"] = model_usage
+    summary = _decode_json_dict(row["summary"])
+    if summary is not None:
+        out["summary"] = summary
     return out
 
 

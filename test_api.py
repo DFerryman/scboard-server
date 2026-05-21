@@ -964,26 +964,29 @@ class ServerHttpSurfaceGone(unittest.TestCase):
 
 
 class SettingsValidation(unittest.TestCase):
-    def test_default_insights_interval_tracks_ingest_interval_at_4x(self):
+    def test_default_insights_interval_is_one_hour(self):
         with patch.dict(
             os.environ,
             {
-                "HNREADER_INGEST_INTERVAL_SECONDS": "3600",
                 "HNREADER_INSIGHTS_UPDATE_INTERVAL_SECONDS": "",
             },
             clear=True,
         ):
             self.assertEqual(
                 settings._default_insights_update_interval_seconds(),  # type: ignore[attr-defined]
-                4 * 3600,
+                3600,
             )
 
-    def test_launcher_insights_interval_default_tracks_ingest_interval_at_4x(self):
+    def test_launcher_insights_interval_default_is_one_hour(self):
         launcher = (Path(__file__).resolve().parent / "launcher.sh").read_text(
             encoding="utf-8"
         )
         self.assertIn(
-            'HNREADER_INSIGHTS_UPDATE_INTERVAL_SECONDS="${HNREADER_INSIGHTS_UPDATE_INTERVAL_SECONDS:-$(( HNREADER_INGEST_INTERVAL_SECONDS * 4 ))}"',
+            'HNREADER_INSIGHTS_UPDATE_INTERVAL_SECONDS="${HNREADER_INSIGHTS_UPDATE_INTERVAL_SECONDS:-3600}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_INSIGHTS_MAX_TODAY_STORIES="${HNREADER_INSIGHTS_MAX_TODAY_STORIES:-120}"',
             launcher,
         )
 
@@ -2520,7 +2523,7 @@ class CloudSyncReadModel(_SqliteCase):
                     repository.insight_needs_update(
                         conn,
                         "2026-05-19",
-                        4 * 60 * 60,
+                        60 * 60,
                         [101, 102, 103],
                     )
                 )
@@ -2539,21 +2542,21 @@ class CloudSyncReadModel(_SqliteCase):
                     1_000,
                     7,
                 )
-                with patch.object(repository, "now_seconds", return_value=1_000 + 14_399):
+                with patch.object(repository, "now_seconds", return_value=1_000 + 3_599):
                     self.assertFalse(
                         repository.insight_needs_update(
                             conn,
                             "2026-05-19",
-                            4 * 60 * 60,
+                            60 * 60,
                             [101, 102],
                         )
                     )
-                with patch.object(repository, "now_seconds", return_value=1_000 + 14_400):
+                with patch.object(repository, "now_seconds", return_value=1_000 + 3_600):
                     self.assertTrue(
                         repository.insight_needs_update(
                             conn,
                             "2026-05-19",
-                            4 * 60 * 60,
+                            60 * 60,
                             [101, 102],
                         )
                     )
@@ -2576,7 +2579,7 @@ class CloudSyncReadModel(_SqliteCase):
         conn = db.connect()
         try:
             with db.transaction(conn):
-                for offset in range(5):
+                for offset in range(10):
                     self._insert_done_story(
                         conn,
                         200 + offset,
@@ -2715,7 +2718,7 @@ class CloudSyncReadModel(_SqliteCase):
         conn = db.connect()
         try:
             with db.transaction(conn):
-                for offset in range(5):
+                for offset in range(10):
                     self._insert_done_story(
                         conn,
                         400 + offset,
@@ -2842,7 +2845,7 @@ class CloudSyncReadModel(_SqliteCase):
         conn = db.connect()
         try:
             with db.transaction(conn):
-                for offset in range(5):
+                for offset in range(10):
                     self._insert_done_story(
                         conn,
                         300 + offset,
@@ -2892,7 +2895,7 @@ class CloudSyncReadModel(_SqliteCase):
         conn = db.connect()
         try:
             with db.transaction(conn):
-                for offset in range(8):
+                for offset in range(10):
                     self._insert_done_story(
                         conn,
                         200 + offset,
@@ -3135,6 +3138,80 @@ class CloudSyncReadModel(_SqliteCase):
             self.assertNotIn("topic-1", topic_keys)
             self.assertNotIn("topic-2", topic_keys)
 
+    def test_routed_insights_inputs_include_previous_insight_context(self):
+        from . import insights
+
+        signals_input, opportunities_input, debates_input = (
+            insights.build_routed_insights_inputs(
+                target_date="2026-05-19",
+                today_rows=[],
+                evidence={
+                    "coverage": {},
+                    "evidenceCards": [
+                        {
+                            "topicKey": f"topic-{index}",
+                            "topic": "Topic",
+                            "storyIds": [100 + index],
+                            "synthesis": "summary",
+                            "painPoints": [],
+                            "opportunityAngles": [],
+                            "debatePoints": [],
+                            "commentSignals": [],
+                            "storySignals": [
+                                {
+                                    "storyId": 100 + index,
+                                    "whyItMatters": "why",
+                                    "distinctSignals": ["distinct"],
+                                    "buyerSignals": [],
+                                    "riskSignals": [],
+                                    "disagreementSignals": [],
+                                }
+                            ],
+                        }
+                        for index in range(3)
+                    ],
+                },
+                scout={
+                    "selectedTopics": [
+                        {
+                            "topicKey": f"topic-{index}",
+                            "routes": ["signals", "opportunities", "debates"],
+                        }
+                        for index in range(3)
+                    ],
+                    "excludedTopics": [],
+                },
+                story_refs={
+                    100 + index: {
+                        "id": 100 + index,
+                        "score": 80 + index,
+                        "descendants": 20 + index,
+                        "time": repository.digest_date_epoch_bounds("2026-05-19")[0],
+                        "feedRanks": {"top": index + 1},
+                    }
+                    for index in range(3)
+                },
+                previous_insight={
+                    "signals": {"items": [{"title": "old signal"}]},
+                    "opportunities": {"items": [{"title": "old opportunity"}]},
+                    "debates": {"items": [{"topic": "old debate"}]},
+                },
+            )
+        )
+
+        self.assertEqual(
+            signals_input["previousInsight"]["items"][0]["title"],
+            "old signal",
+        )
+        self.assertEqual(
+            opportunities_input["previousInsight"]["items"][0]["title"],
+            "old opportunity",
+        )
+        self.assertEqual(
+            debates_input["previousInsight"]["items"][0]["topic"],
+            "old debate",
+        )
+
     def test_insights_system_prompts_encode_product_brief_shape(self):
         from . import insights_agents
 
@@ -3154,6 +3231,12 @@ class CloudSyncReadModel(_SqliteCase):
             "where smart readers disagree",
             insights_agents.DEBATE_SYSTEM_PROMPT,
         )
+        self.assertIn(
+            "paraphrase-only update",
+            insights_agents.TODAY_SIGNALS_SYSTEM_PROMPT,
+        )
+        self.assertIn("storySignals", insights_agents.EVIDENCE_SYSTEM_PROMPT)
+        self.assertIn("compact metrics", insights_agents.TOPIC_SCOUT_SYSTEM_PROMPT)
         self.assertIn(
             "evidence digestion layer",
             insights_agents.EVIDENCE_SYSTEM_PROMPT,
@@ -3465,6 +3548,16 @@ class CloudSyncReadModel(_SqliteCase):
                             "commentSignals": [
                                 item["text"] for item in story.get("comments", [])
                             ],
+                            "storySignals": [
+                                {
+                                    "storyId": story["id"],
+                                    "whyItMatters": "specific reason",
+                                    "distinctSignals": ["specific signal"],
+                                    "buyerSignals": ["buyer signal"],
+                                    "riskSignals": ["risk signal"],
+                                    "disagreementSignals": ["disagreement signal"],
+                                }
+                            ],
                         }
                         for index, story in enumerate(payload["stories"])
                     ],
@@ -3610,9 +3703,20 @@ class CloudSyncReadModel(_SqliteCase):
             self.assertNotIn("OLD_STORY_SHOULD_NOT_REACH_PROMPT", prompts_json)
             self.assertEqual(len(agent.inputs["evidence"]["stories"]), 12)
             self.assertEqual(len(agent.inputs["topic_scout"]["evidenceCards"]), 12)
+            first_scout_card = agent.inputs["topic_scout"]["evidenceCards"][0]
+            self.assertIn("metrics", first_scout_card)
+            self.assertIn("maxScore", first_scout_card["metrics"])
+            self.assertIn("recencyHours", first_scout_card["metrics"])
             self.assertEqual(len(agent.inputs["signals"]["evidenceCards"]), 8)
             self.assertEqual(len(agent.inputs["opportunities"]["candidates"]), 8)
             self.assertEqual(len(agent.inputs["debates"]["candidates"]), 8)
+            self.assertEqual(
+                agent.inputs["signals"]["evidenceCards"][0]["storySignals"][0][
+                    "distinctSignals"
+                ],
+                ["specific signal"],
+            )
+            self.assertIn("metrics", agent.inputs["opportunities"]["candidates"][0])
             evidence_story_300 = next(
                 item for item in agent.inputs["evidence"]["stories"] if int(item["id"]) == 300
             )
@@ -3762,7 +3866,7 @@ class CloudSyncReadModel(_SqliteCase):
         conn = db.connect()
         try:
             with db.transaction(conn):
-                for offset in range(8):
+                for offset in range(10):
                     self._insert_done_story(
                         conn,
                         700 + offset,
@@ -3805,6 +3909,175 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(third["evidence_cache"], "miss")
         self.assertEqual(agent.evidence_calls, 2)
 
+    def test_run_insights_once_skips_when_material_fingerprint_is_unchanged(self):
+        from . import insights
+
+        target = "2026-05-19"
+        target_start, _ = repository.digest_date_epoch_bounds(target)
+
+        class CountingAgent:
+            def __init__(self):
+                self.calls = {
+                    "evidence": 0,
+                    "topic_scout": 0,
+                    "signals": 0,
+                    "opportunities": 0,
+                    "debates": 0,
+                }
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint):
+                return checkpoint, {}
+
+            def run_evidence(self, payload):
+                self.calls["evidence"] += 1
+                return {
+                    "evidenceCards": [
+                        {
+                            "topicKey": f"topic-{index}",
+                            "topic": story["topicName"],
+                            "storyIds": [story["id"]],
+                            "synthesis": story["aiSummary"],
+                            "painPoints": ["pain"],
+                            "opportunityAngles": ["angle"],
+                            "debatePoints": ["debate"],
+                            "commentSignals": [],
+                            "storySignals": [
+                                {
+                                    "storyId": story["id"],
+                                    "whyItMatters": "distinct",
+                                    "distinctSignals": ["signal"],
+                                    "buyerSignals": ["buyer"],
+                                    "riskSignals": ["risk"],
+                                    "disagreementSignals": ["disagreement"],
+                                }
+                            ],
+                        }
+                        for index, story in enumerate(payload["stories"])
+                    ],
+                    "excludedStoryIds": [],
+                    "exclusionReasons": {},
+                    "coverage": {
+                        "inputStoryCount": len(payload["stories"]),
+                        "assignedStoryCount": len(payload["stories"]),
+                        "excludedStoryCount": 0,
+                    },
+                }
+
+            def run_topic_scout(self, payload):
+                self.calls["topic_scout"] += 1
+                return {
+                    "selectedTopics": [
+                        {
+                            "topicKey": card["topicKey"],
+                            "reason": "selected",
+                            "routes": ["signals", "opportunities", "debates"],
+                        }
+                        for card in payload["evidenceCards"]
+                    ],
+                    "excludedTopics": [],
+                }
+
+            def run_signals(self, _payload):
+                self.calls["signals"] += 1
+                return {
+                    "headline": "headline",
+                    "summary": "summary",
+                    "signals": [
+                        {
+                            "id": f"s-{i}",
+                            "label": "模式",
+                            "title": f"signal {i}",
+                            "brief": "brief",
+                            "trend": "+0",
+                            "tone": "flat",
+                        }
+                        for i in range(3)
+                    ],
+                }
+
+            def run_opportunities(self, payload):
+                self.calls["opportunities"] += 1
+                ids = [item["storyIds"][0] for item in payload["candidates"][:3]]
+                return {
+                    "opportunities": [
+                        {
+                            "rank": index + 1,
+                            "rankText": f"{index + 1:02d}",
+                            "title": f"opp {index}",
+                            "score": 80,
+                            "category": "tool",
+                            "audience": ["dev"],
+                            "thesis": "thesis",
+                            "whyNow": "now",
+                            "risk": "risk",
+                            "linkedStoryIds": [sid],
+                        }
+                        for index, sid in enumerate(ids)
+                    ]
+                }
+
+            def run_debates(self, _payload):
+                self.calls["debates"] += 1
+                return {
+                    "debates": [
+                        {
+                            "topic": f"debate {index}",
+                            "verdict": "观察",
+                            "intensity": 50,
+                            "supportWidth": 50,
+                            "opposeWidth": 50,
+                            "support": "support",
+                            "oppose": "oppose",
+                            "watch": "watch",
+                        }
+                        for index in range(2)
+                    ]
+                }
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                for offset in range(10):
+                    self._insert_done_story(
+                        conn,
+                        760 + offset,
+                        target_start + offset * 60,
+                        topic=self._fixed_topic(offset),
+                        score=120 + offset,
+                        descendants=60 + offset,
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO comments(id, story_id, text, rank, fetched_at)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (9760, 760, "stable comment evidence", 0, repository.now_seconds()),
+                )
+        finally:
+            conn.close()
+
+        old_interval = settings.INSIGHTS_UPDATE_INTERVAL_SECONDS
+        try:
+            settings.INSIGHTS_UPDATE_INTERVAL_SECONDS = 0  # type: ignore[assignment]
+            agent = CountingAgent()
+            first = insights.run_insights_once(date=target, ai_agent=agent)
+            second = insights.run_insights_once(date=target, ai_agent=agent)
+        finally:
+            settings.INSIGHTS_UPDATE_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
+
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(second["status"], "skipped")
+        self.assertEqual(second["reason"], "material_unchanged")
+        self.assertEqual(second["run_summary"]["skip_reason"], "material_unchanged")
+        self.assertEqual(agent.calls["evidence"], 1)
+        self.assertEqual(agent.calls["topic_scout"], 1)
+        self.assertEqual(agent.calls["signals"], 1)
+        self.assertEqual(agent.calls["opportunities"], 1)
+        self.assertEqual(agent.calls["debates"], 1)
+
     def test_insights_usage_checkpoint_preserves_structured_checkpoint(self):
         from . import insights
 
@@ -3834,7 +4107,7 @@ class CloudSyncReadModel(_SqliteCase):
         conn = db.connect()
         try:
             with db.transaction(conn):
-                for offset in range(8):
+                for offset in range(10):
                     self._insert_done_story(
                         conn,
                         500 + offset,
@@ -3975,7 +4248,7 @@ class CloudSyncReadModel(_SqliteCase):
         conn = db.connect()
         try:
             with db.transaction(conn):
-                for offset in range(8):
+                for offset in range(10):
                     self._insert_done_story(
                         conn,
                         400 + offset,
@@ -4087,6 +4360,7 @@ class CloudSyncReadModel(_SqliteCase):
         long_angle = "机会-" + ("判断" * 160)
         long_debate = "争议-" + ("证据" * 160)
         long_signal = "评论-" + ("线索" * 160)
+        long_story_signal = "单帖-" + ("差异" * 160)
         out = agent.validate(
             {
                 "evidenceCards": [
@@ -4099,6 +4373,16 @@ class CloudSyncReadModel(_SqliteCase):
                         "opportunityAngles": [long_angle],
                         "debatePoints": [long_debate],
                         "commentSignals": [long_signal],
+                        "storySignals": [
+                            {
+                                "storyId": 101,
+                                "whyItMatters": long_story_signal,
+                                "distinctSignals": [long_story_signal],
+                                "buyerSignals": [long_story_signal],
+                                "riskSignals": [long_story_signal],
+                                "disagreementSignals": [long_story_signal],
+                            }
+                        ],
                     }
                 ],
                 "excludedStoryIds": [],
@@ -4112,6 +4396,11 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(card["opportunityAngles"], [long_angle])
         self.assertEqual(card["debatePoints"], [long_debate])
         self.assertEqual(card["commentSignals"], [long_signal])
+        self.assertEqual(card["storySignals"][0]["whyItMatters"], long_story_signal)
+        self.assertEqual(
+            card["storySignals"][0]["distinctSignals"],
+            [long_story_signal],
+        )
 
     def test_evidence_agent_accepts_strict_schema_exclusion_reason_array(self):
         from .insights_agents import EvidenceAgent
@@ -4300,8 +4589,12 @@ class CloudSyncReadModel(_SqliteCase):
                 if changed:
                     repository.bump_catalog_version(conn)
                 v1 = repository.get_catalog_version(conn)
+                payload_with_new_generated_at = dict(payload)
+                payload_with_new_generated_at["generatedAt"] = (
+                    "2026-05-19T12:00:00+08:00"
+                )
                 changed_again = repository.upsert_insight(
-                    conn, "2026-05-19", payload, [101], 2, 7
+                    conn, "2026-05-19", payload_with_new_generated_at, [101], 2, 7
                 )
                 if changed_again:
                     repository.bump_catalog_version(conn)
@@ -12133,6 +12426,7 @@ class DashboardProjectionContract(_SqliteCase):
                     now - 120,
                     7,
                     model_usage={"total_tokens": 123},
+                    material_fingerprint="fp-dashboard",
                 )
                 repository.record_insight_run(
                     conn,
@@ -12142,6 +12436,13 @@ class DashboardProjectionContract(_SqliteCase):
                     finished_at=now - 50,
                     status="failed",
                     model_usage={"total_tokens": 9},
+                    summary={
+                        "evidence_story_count": 12,
+                        "today_story_count": 10,
+                        "comment_count": 24,
+                        "material_fingerprint": "fp-dashboard",
+                        "skip_reason": "material_unchanged",
+                    },
                     error="provider stack with private details",
                 )
                 summary = dashboard_projection.build_dashboard_summary(
@@ -12159,8 +12460,20 @@ class DashboardProjectionContract(_SqliteCase):
         self.assertEqual(insights_status["latest"]["date"], "2026-05-19")
         self.assertEqual(insights_status["latest"]["source_story_count"], 2)
         self.assertEqual(
+            insights_status["latest"]["material_fingerprint"],
+            "fp-dashboard",
+        )
+        self.assertEqual(
             insights_status["latestRun"]["run_id"],
             "insights-run-failed",
+        )
+        self.assertEqual(
+            insights_status["latestRun"]["summary"]["evidence_story_count"],
+            12,
+        )
+        self.assertEqual(
+            insights_status["latestRun"]["summary"]["skip_reason"],
+            "material_unchanged",
         )
         self.assertTrue(insights_status["latestRun"]["has_error"])
         self.assertNotIn("private details", json.dumps(summary))
@@ -14094,6 +14407,41 @@ class CloudSyncCleanupStatusObservability(_SqliteCase):
                     "INSERT INTO cloud_sync_runs "
                     "(run_id, started_at, status) VALUES ('legacy', 1, 'ok')"
                 )
+                conn.execute("DROP TABLE insights")
+                conn.execute(
+                    """
+                    CREATE TABLE insights (
+                      date TEXT PRIMARY KEY,
+                      payload TEXT NOT NULL DEFAULT '{}',
+                      source_story_ids TEXT NOT NULL DEFAULT '[]',
+                      generated_at INTEGER NOT NULL,
+                      window_days INTEGER NOT NULL DEFAULT 7,
+                      model_usage TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO insights(date, generated_at) "
+                    "VALUES ('2026-05-19', 1)"
+                )
+                conn.execute("DROP TABLE insights_runs")
+                conn.execute(
+                    """
+                    CREATE TABLE insights_runs (
+                      run_id TEXT PRIMARY KEY,
+                      date TEXT NOT NULL,
+                      started_at INTEGER NOT NULL,
+                      finished_at INTEGER,
+                      status TEXT NOT NULL,
+                      model_usage TEXT,
+                      error TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO insights_runs(run_id, date, started_at, status) "
+                    "VALUES ('legacy-insights', '2026-05-19', 1, 'ok')"
+                )
         finally:
             conn.close()
 
@@ -14102,15 +14450,29 @@ class CloudSyncCleanupStatusObservability(_SqliteCase):
         conn = db.connect_readonly()
         try:
             cols = [r[1] for r in conn.execute("PRAGMA table_info(cloud_sync_runs)")]
+            insight_cols = [r[1] for r in conn.execute("PRAGMA table_info(insights)")]
+            insight_run_cols = [
+                r[1] for r in conn.execute("PRAGMA table_info(insights_runs)")
+            ]
             row = conn.execute(
                 "SELECT cleanup_status FROM cloud_sync_runs WHERE run_id='legacy'"
+            ).fetchone()
+            insight_row = conn.execute(
+                "SELECT material_fingerprint FROM insights WHERE date='2026-05-19'"
+            ).fetchone()
+            insight_run_row = conn.execute(
+                "SELECT summary FROM insights_runs WHERE run_id='legacy-insights'"
             ).fetchone()
         finally:
             conn.close()
         self.assertIn("cleanup_status", cols)
+        self.assertIn("material_fingerprint", insight_cols)
+        self.assertIn("summary", insight_run_cols)
         # Existing rows must keep cleanup_status NULL — the migration must
         # not back-fill anything for runs that predate the column.
         self.assertIsNone(row["cleanup_status"])
+        self.assertEqual(insight_row["material_fingerprint"], "")
+        self.assertIsNone(insight_run_row["summary"])
 
 
 class DbBackupRoundTrip(_SqliteCase):

@@ -145,6 +145,7 @@ CREATE TABLE IF NOT EXISTS insights (
   source_story_ids TEXT NOT NULL DEFAULT '[]',
   generated_at INTEGER NOT NULL,
   window_days INTEGER NOT NULL DEFAULT 7,
+  material_fingerprint TEXT NOT NULL DEFAULT '',
   model_usage TEXT
 );
 
@@ -155,6 +156,7 @@ CREATE TABLE IF NOT EXISTS insights_runs (
   finished_at INTEGER,
   status TEXT NOT NULL,
   model_usage TEXT,
+  summary TEXT,
   error TEXT
 );
 
@@ -296,6 +298,17 @@ CLOUD_SYNC_RUN_COLUMN_MIGRATIONS = {
     ),
 }
 
+INSIGHT_COLUMN_MIGRATIONS = {
+    "material_fingerprint": (
+        "ALTER TABLE insights ADD COLUMN "
+        "material_fingerprint TEXT NOT NULL DEFAULT ''"
+    ),
+}
+
+INSIGHT_RUN_COLUMN_MIGRATIONS = {
+    "summary": "ALTER TABLE insights_runs ADD COLUMN summary TEXT",
+}
+
 
 def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -371,6 +384,8 @@ def init_db(path: Optional[Path] = None) -> None:
         conn.executescript(SCHEMA_SQL)
         _migrate_story_columns(conn)
         _migrate_ingest_run_columns(conn)
+        _migrate_insight_columns(conn)
+        _migrate_insight_run_columns(conn)
         _migrate_cloud_sync_run_columns(conn)
         now = int(time.time())
         conn.execute(
@@ -431,6 +446,22 @@ def _migrate_ingest_run_columns(conn: sqlite3.Connection) -> None:
     rows = conn.execute("PRAGMA table_info(ingest_runs)").fetchall()
     existing = {str(r["name"]) for r in rows}
     for name, sql in INGEST_RUN_COLUMN_MIGRATIONS.items():
+        if name not in existing:
+            conn.execute(sql)
+
+
+def _migrate_insight_columns(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("PRAGMA table_info(insights)").fetchall()
+    existing = {str(r["name"]) for r in rows}
+    for name, sql in INSIGHT_COLUMN_MIGRATIONS.items():
+        if name not in existing:
+            conn.execute(sql)
+
+
+def _migrate_insight_run_columns(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("PRAGMA table_info(insights_runs)").fetchall()
+    existing = {str(r["name"]) for r in rows}
+    for name, sql in INSIGHT_RUN_COLUMN_MIGRATIONS.items():
         if name not in existing:
             conn.execute(sql)
 

@@ -459,11 +459,7 @@ DIGEST_TIMEZONE = _require_timezone(
 # ---------- Insights cadence and gates ----------
 
 def _default_insights_update_interval_seconds() -> int:
-    return _env_int(
-        "HNREADER_INGEST_INTERVAL_SECONDS",
-        60 * 60,
-        fallback="HACKERMINI_INGEST_INTERVAL_SECONDS",
-    ) * 4
+    return 60 * 60
 
 
 INSIGHTS_ENABLED = _env_bool("HNREADER_INSIGHTS_ENABLED", True)
@@ -484,13 +480,13 @@ INSIGHTS_UPDATE_INTERVAL_SECONDS = _require_int_range(
 )
 INSIGHTS_MIN_TODAY_STORIES = _require_int_range(
     "HNREADER_INSIGHTS_MIN_TODAY_STORIES",
-    _env_int("HNREADER_INSIGHTS_MIN_TODAY_STORIES", 5),
+    _env_int("HNREADER_INSIGHTS_MIN_TODAY_STORIES", 10),
     min_value=0,
     max_value=500,
 )
 INSIGHTS_MAX_TODAY_STORIES = _require_int_range(
     "HNREADER_INSIGHTS_MAX_TODAY_STORIES",
-    _env_int("HNREADER_INSIGHTS_MAX_TODAY_STORIES", 80),
+    _env_int("HNREADER_INSIGHTS_MAX_TODAY_STORIES", 120),
     min_value=1,
     max_value=1000,
 )
@@ -501,13 +497,13 @@ if INSIGHTS_MAX_TODAY_STORIES < INSIGHTS_MIN_TODAY_STORIES:
     )
 INSIGHTS_EVIDENCE_MAX_STORIES = _require_int_range(
     "HNREADER_INSIGHTS_EVIDENCE_MAX_STORIES",
-    _env_int("HNREADER_INSIGHTS_EVIDENCE_MAX_STORIES", 120),
+    _env_int("HNREADER_INSIGHTS_EVIDENCE_MAX_STORIES", 200),
     min_value=1,
     max_value=1000,
 )
 INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY = _require_int_range(
     "HNREADER_INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY",
-    _env_int("HNREADER_INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY", 8),
+    _env_int("HNREADER_INSIGHTS_EVIDENCE_COMMENT_LIMIT_PER_STORY", 12),
     min_value=0,
     max_value=200,
 )
