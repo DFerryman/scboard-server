@@ -2032,7 +2032,7 @@ class IngestRoundBehavior(_SqliteCase):
         self.assertEqual(compact["insights"]["run_summary"]["today_story_count"], 120)
         self.assertEqual(compact["insights"]["agent_usage"]["requests"], 3)
 
-    def test_successful_round_finishes_after_cloud_sync_phase(self):
+    def test_successful_round_finishes_before_cloud_sync_dashboard_projection(self):
         from . import insights as insights_module
 
         old_enabled = settings.CLOUD_SYNC_ENABLED
@@ -2053,6 +2053,25 @@ class IngestRoundBehavior(_SqliteCase):
                     }
                 },
             )
+            observed_before_cloud_sync = []
+
+            def fake_cloud_sync(run_id, **kw):
+                conn = db.connect()
+                try:
+                    row = conn.execute(
+                        "SELECT status, phase, finished_at FROM ingest_runs WHERE run_id=?",
+                        (run_id,),
+                    ).fetchone()
+                finally:
+                    conn.close()
+                observed_before_cloud_sync.append(dict(row))
+                return {
+                    "status": "ok",
+                    "sync_version": 9,
+                    "elapsed_seconds": 1.0,
+                    "error": None,
+                }
+
             with patch.object(
                 insights_module,
                 "run_insights_once",
@@ -2060,12 +2079,7 @@ class IngestRoundBehavior(_SqliteCase):
             ), patch.object(
                 ingest_module,
                 "_trigger_and_record_cloud_sync",
-                return_value={
-                    "status": "ok",
-                    "sync_version": 9,
-                    "elapsed_seconds": 1.0,
-                    "error": None,
-                },
+                side_effect=fake_cloud_sync,
             ):
                 summary = run_ingest_round(
                     run_id="finish-after-cloud-sync",
@@ -2079,6 +2093,9 @@ class IngestRoundBehavior(_SqliteCase):
         self.assertEqual(summary["status"], "completed")
         self.assertEqual(summary["insights"]["status"], "skipped")
         self.assertEqual(summary["cloud_sync"]["sync_version"], 9)
+        self.assertEqual(observed_before_cloud_sync[0]["status"], "completed")
+        self.assertEqual(observed_before_cloud_sync[0]["phase"], "cloud_sync")
+        self.assertIsNotNone(observed_before_cloud_sync[0]["finished_at"])
 
         conn = db.connect()
         try:

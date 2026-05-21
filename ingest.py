@@ -3219,27 +3219,33 @@ def run_ingest_round(
                     ),
                 )
 
-        # Half-migration: push the newly published read model to the cloud
-        # database. This only makes sense when the publish actually has visible
-        # stories (completed / partial). Failures are already swallowed and
-        # recorded in the helper, so they do not affect the main ingest flow's status.
-        if settings.CLOUD_SYNC_ENABLED and summary.get("status") in ("completed", "partial"):
-            conn = db.connect()
-            try:
-                with db.transaction(conn):
-                    repository.update_ingest_run(conn, run_id, phase="cloud_sync")
-            finally:
-                conn.close()
-            summary["cloud_sync"] = _trigger_and_record_cloud_sync(
-                run_id, deadline_at=deadline_at
-            )
-
         if summary.get("status") in ("completed", "partial"):
+            final_status = str(summary.get("status") or "completed")
+            final_error = str(summary.get("error") or "")
+            # The dashboard projection is built inside cloud sync. Finish the
+            # ingest run before that projection so the cloud dashboard receives
+            # the same terminal run state the server has locally, not a
+            # transient "running" snapshot.
+            if settings.CLOUD_SYNC_ENABLED:
+                conn = db.connect()
+                try:
+                    with db.transaction(conn):
+                        repository.update_ingest_run(conn, run_id, phase="cloud_sync")
+                finally:
+                    conn.close()
             _finish_run(
                 run_id,
-                str(summary.get("status") or "completed"),
-                error=str(summary.get("error") or ""),
+                final_status,
+                error=final_error,
             )
+            # Half-migration: push the newly published read model to the cloud
+            # database. This only makes sense when the publish actually has visible
+            # stories (completed / partial). Failures are already swallowed and
+            # recorded in the helper, so they do not affect the main ingest flow's status.
+            if settings.CLOUD_SYNC_ENABLED:
+                summary["cloud_sync"] = _trigger_and_record_cloud_sync(
+                    run_id, deadline_at=deadline_at
+                )
 
         return summary
 
