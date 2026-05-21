@@ -1807,6 +1807,16 @@ STORY_IMAGE_MAX_PIXELS = _require_int_range(
     min_value=64 * 64,
     max_value=200_000_000,
 )
+STORY_IMAGE_THUMBNAIL_SIZE = _require_int_range(
+    "HNREADER_STORY_IMAGE_THUMBNAIL_SIZE",
+    _env_int(
+        "HNREADER_STORY_IMAGE_THUMBNAIL_SIZE",
+        96,
+        fallback="HACKERMINI_STORY_IMAGE_THUMBNAIL_SIZE",
+    ),
+    min_value=32,
+    max_value=256,
+)
 STORY_IMAGE_DELETE_GRACE_SECONDS = _require_int_range(
     "HNREADER_STORY_IMAGE_DELETE_GRACE_SECONDS",
     _env_int(

@@ -1024,6 +1024,10 @@ class SettingsValidation(unittest.TestCase):
             launcher,
         )
         self.assertIn(
+            'HNREADER_STORY_IMAGE_THUMBNAIL_SIZE="${HNREADER_STORY_IMAGE_THUMBNAIL_SIZE:-96}"',
+            launcher,
+        )
+        self.assertIn(
             'HNREADER_DASHBOARD_INGEST_RUN_LIMIT="${HNREADER_DASHBOARD_INGEST_RUN_LIMIT:-20}"',
             launcher,
         )
@@ -16453,25 +16457,30 @@ class StoryImagePipelineTests(_SqliteCase):
             [c.url for c in candidates],
         )
 
-    def test_normalize_image_outputs_real_128_png(self):
+    def test_normalize_image_outputs_configured_square_png(self):
         from PIL import Image
         from . import story_images
 
         src = io.BytesIO()
         Image.new("RGB", (160, 90), (200, 10, 10)).save(src, format="JPEG")
-        out = story_images._normalize_image(
-            src.getvalue(), max_pixels=1_000_000
-        )
-        with Image.open(io.BytesIO(out)) as im:
-            self.assertEqual(im.size, (128, 128))
-            self.assertEqual(im.format, "PNG")
-            self.assertEqual(im.convert("RGBA").getpixel((64, 0)), (0, 0, 0, 255))
-            self.assertEqual(im.convert("RGBA").getpixel((64, 127)), (0, 0, 0, 255))
-            r, g, b, a = im.convert("RGBA").getpixel((64, 64))
-            self.assertGreater(r, 150)
-            self.assertLess(g, 80)
-            self.assertLess(b, 80)
-            self.assertEqual(a, 255)
+        old_size = settings.STORY_IMAGE_THUMBNAIL_SIZE
+        try:
+            settings.STORY_IMAGE_THUMBNAIL_SIZE = 64  # type: ignore[assignment]
+            out = story_images._normalize_image(
+                src.getvalue(), max_pixels=1_000_000
+            )
+            with Image.open(io.BytesIO(out)) as im:
+                self.assertEqual(im.size, (64, 64))
+                self.assertEqual(im.format, "PNG")
+                self.assertEqual(im.convert("RGBA").getpixel((32, 0)), (0, 0, 0, 255))
+                self.assertEqual(im.convert("RGBA").getpixel((32, 63)), (0, 0, 0, 255))
+                r, g, b, a = im.convert("RGBA").getpixel((32, 32))
+                self.assertGreater(r, 150)
+                self.assertLess(g, 80)
+                self.assertLess(b, 80)
+                self.assertEqual(a, 255)
+        finally:
+            settings.STORY_IMAGE_THUMBNAIL_SIZE = old_size  # type: ignore[assignment]
 
     def test_process_story_images_uploads_and_records_asset(self):
         from . import story_images
