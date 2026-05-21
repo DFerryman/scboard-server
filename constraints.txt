@@ -2,7 +2,7 @@
 #
 # Regenerate with the project venv after a clean upgrade:
 #   .venv/bin/pip install -U -r server/requirements.txt
-#   .venv/bin/pip freeze | grep -E '^(pydantic|pydantic_core|annotated-types|typing[-_].*)' > server/constraints.txt
+#   .venv/bin/pip freeze | grep -E '^(pydantic|pydantic_core|annotated-types|typing[-_].*|Pillow)' > server/constraints.txt
 #
 # Install for production uses both files together so requirements.txt stays
 # the source of truth for what we depend on, and this file is the source of
@@ -18,4 +18,4 @@ pydantic_core==2.41.5
 annotated-types==0.7.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
-Pillow==11.3.0
+Pillow==12.1.1
