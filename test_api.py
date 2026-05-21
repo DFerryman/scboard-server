@@ -2651,7 +2651,7 @@ class CloudSyncReadModel(_SqliteCase):
                         {
                             "topicKey": card["topicKey"],
                             "reason": "selected",
-                            "routes": ["signals", "trends", "opportunities", "debates"],
+                            "routes": ["signals", "opportunities", "debates"],
                         }
                         for card in payload["evidenceCards"]
                     ],
@@ -2673,23 +2673,6 @@ class CloudSyncReadModel(_SqliteCase):
                         }
                         for i in range(3)
                     ],
-                }
-
-            def run_trends(self, payload):
-                return {
-                    "trendHeatmap": {
-                        "title": "趋势温度",
-                        "note": "note",
-                        "items": [
-                            {
-                                "topic": item["topic"],
-                                "heat": item["heat"],
-                                "deltaText": item["deltaText"],
-                                "trendKey": item["trendKey"],
-                            }
-                            for item in payload["topicDailyStats"][:5]
-                        ],
-                    }
                 }
 
             def run_opportunities(self, payload):
@@ -2752,15 +2735,109 @@ class CloudSyncReadModel(_SqliteCase):
         )
         self.assertEqual(summary["status"], "ok")
 
-    def test_run_insights_once_skips_when_trend_topics_are_insufficient(self):
+    def test_run_insights_once_allows_single_topic_when_evidence_is_sufficient(self):
         from . import insights
 
         target = "2026-05-19"
         start, _ = repository.digest_date_epoch_bounds(target)
 
-        class ExplodingAgent:
+        class SingleTopicAgent:
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint):
+                return checkpoint, {}
+
+            def run_evidence(self, payload):
+                return {
+                    "evidenceCards": [
+                        {
+                            "topicKey": f"topic-{index}",
+                            "topic": story["topicName"],
+                            "storyIds": [story["id"]],
+                            "synthesis": story["aiSummary"],
+                            "painPoints": ["pain"],
+                            "opportunityAngles": ["angle"],
+                            "debatePoints": ["debate"],
+                            "commentSignals": [],
+                        }
+                        for index, story in enumerate(payload["stories"])
+                    ],
+                    "excludedStoryIds": [],
+                    "exclusionReasons": [],
+                    "coverage": {
+                        "inputStoryCount": len(payload["stories"]),
+                        "assignedStoryCount": len(payload["stories"]),
+                        "excludedStoryCount": 0,
+                    },
+                }
+
+            def run_topic_scout(self, payload):
+                return {
+                    "selectedTopics": [
+                        {
+                            "topicKey": card["topicKey"],
+                            "reason": "selected",
+                            "routes": ["signals", "opportunities", "debates"],
+                        }
+                        for card in payload["evidenceCards"]
+                    ],
+                    "excludedTopics": [],
+                }
+
             def run_signals(self, _payload):
-                raise AssertionError("agent should not run when inputs are insufficient")
+                return {
+                    "headline": "headline",
+                    "summary": "summary",
+                    "signals": [
+                        {
+                            "id": f"s-{i}",
+                            "label": "模式",
+                            "title": f"signal {i}",
+                            "brief": "brief",
+                            "trend": "+0",
+                            "tone": "flat",
+                        }
+                        for i in range(3)
+                    ],
+                }
+
+            def run_opportunities(self, payload):
+                ids = [item["storyIds"][0] for item in payload["candidates"][:3]]
+                return {
+                    "opportunities": [
+                        {
+                            "rank": index + 1,
+                            "rankText": f"{index + 1:02d}",
+                            "title": f"opp {index}",
+                            "score": 80,
+                            "category": "tool",
+                            "audience": ["dev"],
+                            "thesis": "thesis",
+                            "whyNow": "now",
+                            "risk": "risk",
+                            "linkedStoryIds": [sid],
+                        }
+                        for index, sid in enumerate(ids)
+                    ]
+                }
+
+            def run_debates(self, _payload):
+                return {
+                    "debates": [
+                        {
+                            "topic": f"debate {index}",
+                            "verdict": "观察",
+                            "intensity": 50,
+                            "supportWidth": 50,
+                            "opposeWidth": 50,
+                            "support": "support",
+                            "oppose": "oppose",
+                            "watch": "watch",
+                        }
+                        for index in range(2)
+                    ]
+                }
 
         conn = db.connect()
         try:
@@ -2780,17 +2857,32 @@ class CloudSyncReadModel(_SqliteCase):
         summary = insights.run_insights_once(
             date=target,
             force=True,
-            ai_agent=ExplodingAgent(),
+            ai_agent=SingleTopicAgent(),
         )
-        self.assertEqual(summary["status"], "skipped")
-        self.assertEqual(summary["reason"], "insufficient_insights_inputs")
-        self.assertEqual(summary["input_counts"]["trend_topics"], 1)
-        self.assertIn("trend topics 1/5", summary["input_gaps"])
+        self.assertEqual(summary["status"], "ok")
         conn = db.connect()
         try:
-            self.assertIsNone(repository.get_insight_row(conn, target))
+            payload = json.loads(repository.get_insight_row(conn, target)["payload"])
         finally:
             conn.close()
+        self.assertEqual(
+            set(payload),
+            {
+                "version",
+                "date",
+                "asOf",
+                "asOfLabel",
+                "generatedAt",
+                "window",
+                "access",
+                "headline",
+                "summary",
+                "stats",
+                "signals",
+                "opportunities",
+                "debates",
+            },
+        )
 
     def test_insights_agent_inputs_are_minimal_by_section(self):
         from . import insights
@@ -2828,24 +2920,16 @@ class CloudSyncReadModel(_SqliteCase):
                 target_date=target,
                 feed_ranks=ranks,
             )
-            trends_input = insights.build_trend_heat_input(
-                rows,
-                target_date=target,
-                start_date=target,
-            )
         finally:
             conn.close()
 
         signals_json = json.dumps(signals_input, ensure_ascii=False)
-        trends_json = json.dumps(trends_input, ensure_ascii=False)
         self.assertNotIn("rawTextSnippet", signals_json)
         self.assertNotIn("comments", signals_json)
         self.assertNotIn("insights", signals_json)
         self.assertNotIn("example.com", signals_json)
         self.assertNotIn("RAW_TEXT_SHOULD_NOT_LEAK", signals_json)
         self.assertNotIn("COMMENT_SHOULD_NOT_LEAK", signals_json)
-        self.assertNotIn("comments", trends_json)
-        self.assertNotIn("RAW_TEXT_SHOULD_NOT_LEAK", trends_json)
 
     def test_today_signals_input_can_include_comment_evidence(self):
         from . import insights
@@ -2992,7 +3076,6 @@ class CloudSyncReadModel(_SqliteCase):
         target = "2026-05-19"
         evidence_cards = []
         story_refs = {}
-        topic_stats = []
         for index in range(8):
             sid = 800 + index
             key = f"topic-{index}"
@@ -3020,21 +3103,12 @@ class CloudSyncReadModel(_SqliteCase):
                 "time": 1_800_000_000 + index,
                 "feedRanks": {},
             }
-            topic_stats.append(
-                {
-                    "topic": topic,
-                    "heat": 80 - index,
-                    "deltaText": "+1 / 24h",
-                    "trendKey": "rising",
-                }
-            )
-
         scout = {
             "selectedTopics": [
                 {
                     "topicKey": "topic-0",
                     "reason": "selected",
-                    "routes": ["signals", "trends", "opportunities", "debates"],
+                    "routes": ["signals", "opportunities", "debates"],
                 }
             ],
             "excludedTopics": [
@@ -3042,11 +3116,10 @@ class CloudSyncReadModel(_SqliteCase):
                 {"topicKey": "topic-2", "reason": "noise"},
             ],
         }
-        signals_input, trends_input, opportunities_input, debates_input = (
+        signals_input, opportunities_input, debates_input = (
             insights.build_routed_insights_inputs(
                 target_date=target,
                 today_rows=[],
-                trends_input={"date": target, "topicDailyStats": topic_stats},
                 evidence={"coverage": {}, "evidenceCards": evidence_cards},
                 scout=scout,
                 story_refs=story_refs,
@@ -3061,158 +3134,6 @@ class CloudSyncReadModel(_SqliteCase):
             topic_keys = [item[key] for item in items]
             self.assertNotIn("topic-1", topic_keys)
             self.assertNotIn("topic-2", topic_keys)
-        trend_topics = [item["topic"] for item in trends_input["topicDailyStats"]]
-        self.assertNotIn("Topic 1", trend_topics)
-        self.assertNotIn("Topic 2", trend_topics)
-        self.assertGreaterEqual(len(trend_topics), insights.TREND_HEAT_MIN_TOPICS)
-
-    def test_trend_heat_uses_fixed_topic_display_names(self):
-        from . import insights
-
-        target = "2026-05-19"
-        start, _ = repository.digest_date_epoch_bounds(target)
-        conn = db.connect()
-        try:
-            with db.transaction(conn):
-                conn.execute(
-                    """
-                    INSERT INTO topics(id, name, created_at, updated_at, last_seen_at)
-                    VALUES('ai-devtools', 'AI Coding', ?, ?, ?)
-                    """,
-                    (start, start, start),
-                )
-                self._insert_done_story(
-                    conn,
-                    101,
-                    start,
-                    topic="ai-devtools",
-                    score=120,
-                    descendants=80,
-                )
-                rows = repository.candidate_rows_for_insights(
-                    conn,
-                    start_ts=start,
-                    end_ts=start + 86400,
-                )
-            payload = insights.build_trend_heat_input(
-                rows,
-                target_date=target,
-                start_date=target,
-            )
-        finally:
-            conn.close()
-
-        self.assertEqual(rows[0]["topic_name"], "AI Coding")
-        self.assertEqual(
-            payload["topicDailyStats"][0]["topic"],
-            topic_name_from_id("ai-devtools"),
-        )
-
-    def test_trend_heat_delta_tracks_activity_heat_not_story_count(self):
-        from . import insights
-
-        target = "2026-05-19"
-        start_ts, end_ts, start_date = insights._window_bounds(target, 7)
-        dates = insights._date_list(start_date, settings.INSIGHTS_WINDOW_DAYS)
-        conn = db.connect()
-        try:
-            with db.transaction(conn):
-                conn.execute(
-                    """
-                    INSERT INTO topics(id, name, created_at, updated_at, last_seen_at)
-                    VALUES('ai-devtools', 'AI Coding', ?, ?, ?)
-                    """,
-                    (start_ts, start_ts, start_ts),
-                )
-                for offset, day in enumerate(dates[:-1]):
-                    day_start, _ = repository.digest_date_epoch_bounds(day)
-                    self._insert_done_story(
-                        conn,
-                        200 + offset,
-                        day_start,
-                        topic="ai-devtools",
-                        score=18,
-                        descendants=9,
-                    )
-                today_start, _ = repository.digest_date_epoch_bounds(target)
-                self._insert_done_story(
-                    conn,
-                    300,
-                    today_start,
-                    topic="ai-devtools",
-                    score=180,
-                    descendants=90,
-                )
-                for offset in range(4):
-                    self._insert_done_story(
-                        conn,
-                        400 + offset,
-                        today_start + offset + 1,
-                        topic=self._fixed_topic(offset + 2),
-                        score=50,
-                        descendants=9,
-                    )
-                rows = repository.candidate_rows_for_insights(
-                    conn,
-                    start_ts=start_ts,
-                    end_ts=end_ts,
-                )
-            payload = insights.build_trend_heat_input(
-                rows,
-                target_date=target,
-                start_date=start_date,
-            )
-        finally:
-            conn.close()
-
-        item = next(
-            item for item in payload["topicDailyStats"]
-            if item["topic"] == topic_name_from_id("ai-devtools")
-        )
-        self.assertEqual(item["heat"], 100)
-        self.assertEqual(item["previousHeat"], 78)
-        self.assertEqual(item["deltaText"], "+22 / 24h")
-        self.assertEqual(item["trendKey"], "burst")
-
-    def test_trend_heat_agent_uses_server_metrics_not_model_inventions(self):
-        from .insights_agents import TrendHeatAgent
-
-        agent = object.__new__(TrendHeatAgent)
-        payload = {
-            "topicDailyStats": [
-                {
-                    "topic": f"Topic {i}",
-                    "heat": 60 + i,
-                    "deltaText": f"+{i} / 24h",
-                    "trendKey": "rising" if i % 2 else "stable",
-                }
-                for i in range(5)
-            ]
-        }
-        raw = {
-            "trendHeatmap": {
-                "title": "瓒嬪娍娓╁害",
-                "note": "妯″瀷鍙啓瑙ｉ噴",
-                "items": [
-                    {
-                        "topic": f"Topic {i}",
-                        "heat": 0,
-                        "deltaText": "-99 / 24h",
-                        "trendKey": "cooling",
-                    }
-                    for i in range(5)
-                ],
-            }
-        }
-
-        out = agent.validate(raw, payload)
-        items = out["trendHeatmap"]["items"]
-        self.assertEqual([item["heat"] for item in items], [60, 61, 62, 63, 64])
-        self.assertEqual([item["deltaText"] for item in items], [f"+{i} / 24h" for i in range(5)])
-        self.assertEqual(
-            [item["trendKey"] for item in items],
-            ["stable", "rising", "stable", "rising", "stable"],
-        )
 
     def test_insights_system_prompts_encode_product_brief_shape(self):
         from . import insights_agents
@@ -3224,10 +3145,6 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertIn(
             "ten seconds",
             insights_agents.TODAY_SIGNALS_SYSTEM_PROMPT,
-        )
-        self.assertIn(
-            "simple ranked bar list",
-            insights_agents.TREND_HEAT_SYSTEM_PROMPT,
         )
         self.assertIn(
             "main paid module",
@@ -3247,7 +3164,6 @@ class CloudSyncReadModel(_SqliteCase):
         )
         for prompt in (
             insights_agents.TODAY_SIGNALS_SYSTEM_PROMPT,
-            insights_agents.TREND_HEAT_SYSTEM_PROMPT,
             insights_agents.OPPORTUNITY_SYSTEM_PROMPT,
             insights_agents.DEBATE_SYSTEM_PROMPT,
         ):
@@ -3299,7 +3215,6 @@ class CloudSyncReadModel(_SqliteCase):
                 "insights-evidence",
                 "insights-topic-scout",
                 "insights-signals",
-                "insights-trends",
                 "insights-opportunities",
                 "insights-debates",
             },
@@ -3569,7 +3484,7 @@ class CloudSyncReadModel(_SqliteCase):
                         {
                             "topicKey": card["topicKey"],
                             "reason": "selected",
-                            "routes": ["signals", "trends", "opportunities", "debates"],
+                            "routes": ["signals", "opportunities", "debates"],
                         }
                         for card in payload["evidenceCards"][:8]
                     ],
@@ -3595,24 +3510,6 @@ class CloudSyncReadModel(_SqliteCase):
                         }
                         for i in range(3)
                     ],
-                }
-
-            def run_trends(self, payload):
-                self.inputs["trends"] = payload
-                return {
-                    "trendHeatmap": {
-                        "title": "趋势温度",
-                        "note": "note",
-                        "items": [
-                            {
-                                "topic": item["topic"],
-                                "heat": item["heat"],
-                                "deltaText": item["deltaText"],
-                                "trendKey": item["trendKey"],
-                            }
-                            for item in payload["topicDailyStats"][:5]
-                        ],
-                    }
                 }
 
             def run_opportunities(self, payload):
@@ -3714,7 +3611,6 @@ class CloudSyncReadModel(_SqliteCase):
             self.assertEqual(len(agent.inputs["evidence"]["stories"]), 12)
             self.assertEqual(len(agent.inputs["topic_scout"]["evidenceCards"]), 12)
             self.assertEqual(len(agent.inputs["signals"]["evidenceCards"]), 8)
-            self.assertEqual(len(agent.inputs["trends"]["topicDailyStats"]), 8)
             self.assertEqual(len(agent.inputs["opportunities"]["candidates"]), 8)
             self.assertEqual(len(agent.inputs["debates"]["candidates"]), 8)
             evidence_story_300 = next(
@@ -3802,7 +3698,7 @@ class CloudSyncReadModel(_SqliteCase):
                         {
                             "topicKey": card["topicKey"],
                             "reason": "selected",
-                            "routes": ["signals", "trends", "opportunities", "debates"],
+                            "routes": ["signals", "opportunities", "debates"],
                         }
                         for card in payload["evidenceCards"]
                     ],
@@ -3824,23 +3720,6 @@ class CloudSyncReadModel(_SqliteCase):
                         }
                         for i in range(3)
                     ],
-                }
-
-            def run_trends(self, payload):
-                return {
-                    "trendHeatmap": {
-                        "title": "趋势温度",
-                        "note": "note",
-                        "items": [
-                            {
-                                "topic": item["topic"],
-                                "heat": item["heat"],
-                                "deltaText": item["deltaText"],
-                                "trendKey": item["trendKey"],
-                            }
-                            for item in payload["topicDailyStats"][:5]
-                        ],
-                    }
                 }
 
             def run_opportunities(self, payload):
@@ -4033,7 +3912,7 @@ class CloudSyncReadModel(_SqliteCase):
                         {
                             "topicKey": card["topicKey"],
                             "reason": "selected",
-                            "routes": ["signals", "trends", "opportunities", "debates"],
+                            "routes": ["signals", "opportunities", "debates"],
                         }
                         for card in payload["evidenceCards"]
                     ],
@@ -4055,23 +3934,6 @@ class CloudSyncReadModel(_SqliteCase):
                         }
                         for i in range(3)
                     ],
-                }
-
-            def run_trends(self, payload):
-                return {
-                    "trendHeatmap": {
-                        "title": "趋势温度",
-                        "note": "note",
-                        "items": [
-                            {
-                                "topic": item["topic"],
-                                "heat": item["heat"],
-                                "deltaText": item["deltaText"],
-                                "trendKey": item["trendKey"],
-                            }
-                            for item in payload["topicDailyStats"][:5]
-                        ],
-                    }
                 }
 
             def run_opportunities(self, _payload):
@@ -4425,7 +4287,6 @@ class CloudSyncReadModel(_SqliteCase):
             "summary": "摘要",
             "stats": [],
             "signals": [],
-            "trendHeatmap": {"items": []},
             "opportunities": [],
             "debates": [],
         }
@@ -4466,7 +4327,6 @@ class CloudSyncReadModel(_SqliteCase):
             "summary": "摘要",
             "stats": [],
             "signals": [],
-            "trendHeatmap": {"title": "趋势温度", "items": []},
             "opportunities": [],
             "debates": [],
         }

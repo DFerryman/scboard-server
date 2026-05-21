@@ -6,7 +6,6 @@ import html
 import hashlib
 import json
 import logging
-import math
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -38,7 +37,6 @@ log = logging.getLogger(__name__)
 INSIGHTS_VERSION = 1
 INSIGHTS_WINDOW_LABEL = "24h"
 SIGNALS_MIN_STORIES = 3
-TREND_HEAT_MIN_TOPICS = 5
 OPPORTUNITY_MIN_CANDIDATES = 3
 DEBATE_MIN_CANDIDATES = 2
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -242,166 +240,6 @@ def build_today_signals_input(
         "topicSummary": _build_today_topic_summary(rows),
         "stories": stories,
     }
-
-
-def _date_list(start_date: str, days: int) -> List[str]:
-    start = datetime.strptime(start_date, "%Y-%m-%d")
-    return [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
-
-
-def _daily_topic_activity_score(item: Mapping[str, Any]) -> float:
-    count = max(0, int(item.get("count") or 0))
-    score_sum = max(0, int(item.get("scoreSum") or 0))
-    descendants_sum = max(0, int(item.get("descendantsSum") or 0))
-    if count <= 0:
-        return 0.0
-    # Raw activity is intentionally unbounded. Display heat is normalized
-    # against today's peer topics later so multiple active topics do not all
-    # flatten into 100.
-    return (
-        count * 14.0
-        + math.log1p(score_sum) * 8.0
-        + math.log1p(descendants_sum) * 10.0
-    )
-
-
-def _relative_topic_heat(score: float, max_today_score: float) -> int:
-    if score <= 0 or max_today_score <= 0:
-        return 0
-    return max(0, min(100, int(round(100.0 * math.sqrt(score / max_today_score)))))
-
-
-def _trend_key(
-    today_heat: float,
-    previous_avg_heat: float,
-    *,
-    today_count: int,
-    previous_avg_count: float,
-    total_count: int,
-) -> str:
-    heat_delta = today_heat - previous_avg_heat
-    if (
-        (heat_delta >= 18 and today_heat >= 55)
-        or (today_count >= previous_avg_count * 2 + 1 and today_count >= 2)
-    ):
-        return "burst"
-    if heat_delta >= 6:
-        return "rising"
-    if heat_delta <= -6 and total_count > 1:
-        return "cooling"
-    return "stable"
-
-
-def build_trend_heat_input(
-    window_rows: Sequence[Any],
-    *,
-    target_date: str,
-    start_date: str,
-) -> Dict[str, Any]:
-    dates = _date_list(start_date, settings.INSIGHTS_WINDOW_DAYS)
-    by_topic: Dict[str, Dict[str, Any]] = {}
-    for row in window_rows:
-        topic = _row_topic_label(row)
-        day = repository.date_in_digest_tz(int(row["hn_time"] or 0))
-        if day not in dates:
-            continue
-        bucket = by_topic.setdefault(
-            topic,
-            {
-                "topic": topic,
-                "daily": {
-                    d: {"date": d, "count": 0, "scoreSum": 0, "descendantsSum": 0}
-                    for d in dates
-                },
-                "todayStoryIds": [],
-                "sampleTitles": [],
-            },
-        )
-        stats = bucket["daily"][day]
-        stats["count"] += 1
-        stats["scoreSum"] += int(row["score"] or 0)
-        stats["descendantsSum"] += int(row["descendants"] or 0)
-        title = row["title_zh"] or row["title_en"] or ""
-        if day == target_date:
-            bucket["todayStoryIds"].append(int(row["id"]))
-        if title:
-            bucket["sampleTitles"].append(title)
-
-    scored = []
-    max_today_score = 0.0
-    for topic, bucket in by_topic.items():
-        daily = [bucket["daily"][d] for d in dates]
-        today = daily[-1]
-        today_score = _daily_topic_activity_score(today)
-        bucket["_todayActivityScore"] = today_score
-        max_today_score = max(max_today_score, today_score)
-
-    for topic, bucket in by_topic.items():
-        daily = [bucket["daily"][d] for d in dates]
-        today = daily[-1]
-        previous = daily[:-1] or daily[-1:]
-        prev_count = sum(item["count"] for item in previous) / max(1, len(previous))
-        prev_score = sum(item["scoreSum"] for item in previous) / max(1, len(previous))
-        prev_desc = sum(item["descendantsSum"] for item in previous) / max(1, len(previous))
-        today_activity_score = float(bucket.get("_todayActivityScore") or 0.0)
-        previous_avg_activity_score = sum(
-            _daily_topic_activity_score(item) for item in previous
-        ) / max(1, len(previous))
-        today_heat = _relative_topic_heat(today_activity_score, max_today_score)
-        previous_avg_heat = _relative_topic_heat(
-            previous_avg_activity_score,
-            max_today_score,
-        )
-        count_delta = today["count"] - prev_count
-        score_delta = today["scoreSum"] - prev_score
-        descendants_delta = today["descendantsSum"] - prev_desc
-        heat_delta = today_heat - previous_avg_heat
-        rank_score = today_heat + max(0.0, heat_delta) * 0.75 + min(
-            10.0,
-            sum(item["count"] for item in daily),
-        )
-        scored.append(
-            {
-                "topic": topic,
-                "daily": daily,
-                "todayStoryIds": bucket["todayStoryIds"],
-                "sampleTitles": bucket["sampleTitles"],
-                "countDelta": round(count_delta, 2),
-                "scoreDelta": round(score_delta, 2),
-                "descendantsDelta": round(descendants_delta, 2),
-                "heatDelta": round(heat_delta, 2),
-                "activityScore": round(today_activity_score, 2),
-                "previousAvgActivityScore": round(previous_avg_activity_score, 2),
-                "previousHeat": int(previous_avg_heat),
-                "_todayHeat": today_heat,
-                "_rankScore": rank_score,
-                "trendKey": _trend_key(
-                    today_heat,
-                    previous_avg_heat,
-                    today_count=int(today["count"]),
-                    previous_avg_count=prev_count,
-                    total_count=sum(item["count"] for item in daily),
-                ),
-            }
-        )
-    scored.sort(key=lambda item: (item["_rankScore"], len(item["todayStoryIds"])), reverse=True)
-    out_items = []
-    for item in scored:
-        heat = int(round(float(item["_todayHeat"])))
-        delta = int(round(float(item["heatDelta"])))
-        sign = "+" if delta >= 0 else ""
-        out_items.append(
-            {
-                **{
-                    k: v
-                    for k, v in item.items()
-                    if k not in ("_todayHeat", "_rankScore")
-                },
-                "heat": max(0, min(100, heat)),
-                "deltaText": f"{sign}{int(round(delta))} / 24h",
-            }
-        )
-    return {"date": target_date, "topicDailyStats": out_items}
 
 
 def _feed_rank_score(feed_ranks: Mapping[str, int]) -> int:
@@ -868,25 +706,15 @@ def _run_evidence_batches(
 
 def build_topic_scout_input(
     evidence: Mapping[str, Any],
-    trends_input: Mapping[str, Any],
+    *,
+    target_date: str,
 ) -> Dict[str, Any]:
     return {
-        "date": trends_input.get("date") or "",
+        "date": target_date,
         "evidenceCoverage": evidence.get("coverage") or {},
         "evidenceCards": evidence.get("evidenceCards") or [],
         "excludedStoryIds": evidence.get("excludedStoryIds") or [],
-        "topicDailyStats": trends_input.get("topicDailyStats") or [],
     }
-
-
-def _topic_stats_by_topic(trends_input: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
-    out: Dict[str, Mapping[str, Any]] = {}
-    for item in trends_input.get("topicDailyStats") or []:
-        if isinstance(item, Mapping):
-            topic = str(item.get("topic") or "")
-            if topic:
-                out[topic] = item
-    return out
 
 
 def _selected_routes(scout: Mapping[str, Any]) -> Dict[str, List[str]]:
@@ -924,9 +752,7 @@ def _enrich_evidence_cards(
     evidence: Mapping[str, Any],
     *,
     story_refs: Mapping[int, Mapping[str, Any]],
-    trends_input: Mapping[str, Any],
 ) -> List[Dict[str, Any]]:
-    metrics_by_topic = _topic_stats_by_topic(trends_input)
     cards = []
     for item in evidence.get("evidenceCards") or []:
         if not isinstance(item, Mapping):
@@ -950,7 +776,6 @@ def _enrich_evidence_cards(
                     for sid in story_ids
                     if sid in story_refs
                 ],
-                "metrics": dict(metrics_by_topic.get(topic, {})),
                 "synthesis": item.get("synthesis") or "",
                 "painPoints": item.get("painPoints") or [],
                 "opportunityAngles": item.get("opportunityAngles") or [],
@@ -994,61 +819,18 @@ def _cards_for_route(
     return selected
 
 
-def _trend_stats_for_scout(
-    trends_input: Mapping[str, Any],
-    scout: Mapping[str, Any],
-) -> List[Dict[str, Any]]:
-    stats = [
-        dict(item)
-        for item in trends_input.get("topicDailyStats") or []
-        if isinstance(item, Mapping)
-    ]
-    routes = _selected_routes(scout)
-    excluded_keys = _excluded_topic_keys(scout)
-    trend_keys = {
-        key
-        for key, route_names in routes.items()
-        if key not in excluded_keys and "trends" in route_names
-    }
-    topic_keys_by_topic = {
-        str(item.get("topic") or ""): str(item.get("topicKey") or "")
-        for item in scout.get("evidenceCards") or []
-        if isinstance(item, Mapping)
-    }
-    routed = [
-        item
-        for item in stats
-        if topic_keys_by_topic.get(str(item.get("topic") or "")) in trend_keys
-    ]
-    if len(routed) >= TREND_HEAT_MIN_TOPICS:
-        return routed
-    seen_topics = {str(item.get("topic") or "") for item in routed}
-    for item in stats:
-        topic = str(item.get("topic") or "")
-        if topic in seen_topics or topic_keys_by_topic.get(topic) in excluded_keys:
-            continue
-        routed.append(item)
-        seen_topics.add(topic)
-        if len(routed) >= TREND_HEAT_MIN_TOPICS:
-            break
-    return routed
-
-
 def build_routed_insights_inputs(
     *,
     target_date: str,
     today_rows: Sequence[Any],
-    trends_input: Mapping[str, Any],
     evidence: Mapping[str, Any],
     scout: Mapping[str, Any],
     story_refs: Mapping[int, Mapping[str, Any]],
-) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     cards = _enrich_evidence_cards(
         evidence,
         story_refs=story_refs,
-        trends_input=trends_input,
     )
-    scout_with_cards = {**scout, "evidenceCards": cards}
     compact_scout = _scout_summary(scout)
     signals_input = {
         "date": target_date,
@@ -1060,12 +842,6 @@ def build_routed_insights_inputs(
             "signals",
             min_cards=SIGNALS_MIN_STORIES,
         ),
-    }
-    routed_trend_stats = _trend_stats_for_scout(trends_input, scout_with_cards)
-    trends_routed_input = {
-        **dict(trends_input),
-        "topicDailyStats": routed_trend_stats,
-        "topicScout": compact_scout,
     }
     opportunities_input = {
         "topicScout": compact_scout,
@@ -1085,7 +861,7 @@ def build_routed_insights_inputs(
             min_cards=DEBATE_MIN_CANDIDATES,
         ),
     }
-    return signals_input, trends_routed_input, opportunities_input, debates_input
+    return signals_input, opportunities_input, debates_input
 
 
 def _collect_story_reference_ids(*payloads: Mapping[str, Any]) -> List[int]:
@@ -1140,13 +916,11 @@ def _first_input_count(value: Mapping[str, Any], keys: Sequence[str]) -> int:
 def _insights_input_counts(
     *,
     signals_input: Mapping[str, Any],
-    trends_input: Mapping[str, Any],
     opportunities_input: Mapping[str, Any],
     debates_input: Mapping[str, Any],
 ) -> Dict[str, int]:
     return {
         "signals_stories": _first_input_count(signals_input, ("stories", "evidenceCards")),
-        "trend_topics": _input_count(trends_input, "topicDailyStats"),
         "opportunity_candidates": _input_count(opportunities_input, "candidates"),
         "debate_candidates": _input_count(debates_input, "candidates"),
     }
@@ -1155,7 +929,6 @@ def _insights_input_counts(
 def _insights_input_gaps(counts: Mapping[str, int]) -> List[str]:
     checks = (
         ("signals_stories", SIGNALS_MIN_STORIES, "signals stories"),
-        ("trend_topics", TREND_HEAT_MIN_TOPICS, "trend topics"),
         ("opportunity_candidates", OPPORTUNITY_MIN_CANDIDATES, "opportunity candidates"),
         ("debate_candidates", DEBATE_MIN_CANDIDATES, "debate candidates"),
     )
@@ -1204,7 +977,6 @@ def _validate_final_payload(payload: Mapping[str, Any], allowed_story_ids: Seque
         "summary",
         "stats",
         "signals",
-        "trendHeatmap",
         "opportunities",
         "debates",
     )
@@ -1213,9 +985,6 @@ def _validate_final_payload(payload: Mapping[str, Any], allowed_story_ids: Seque
             raise InsightsValidationError(f"insights payload missing {key}")
     if len(payload.get("signals") or []) != 3:
         raise InsightsValidationError("signals must contain exactly 3 items")
-    trend_items = ((payload.get("trendHeatmap") or {}).get("items") or [])
-    if not (TREND_HEAT_MIN_TOPICS <= len(trend_items) <= 8):
-        raise InsightsValidationError("trendHeatmap.items must contain 5-8 items")
     if not (OPPORTUNITY_MIN_CANDIDATES <= len(payload.get("opportunities") or []) <= 5):
         raise InsightsValidationError("opportunities must contain 3-5 items")
     if not (DEBATE_MIN_CANDIDATES <= len(payload.get("debates") or []) <= 4):
@@ -1353,16 +1122,9 @@ def run_insights_once(
     usage_checkpoint = None
 
     try:
-        trends_seed_input = build_trend_heat_input(
-            window_rows,
-            target_date=target_date,
-            start_date=start_date,
-        )
-
         preflight_counts = {
             "signals_stories": len(today_rows),
             "evidence_stories": len(evidence_rows),
-            "trend_topics": _input_count(trends_seed_input, "topicDailyStats"),
         }
         preflight_gaps: List[str] = []
         if preflight_counts["signals_stories"] < SIGNALS_MIN_STORIES:
@@ -1378,10 +1140,6 @@ def run_insights_once(
             preflight_gaps.append(
                 "evidence stories "
                 f"{preflight_counts['evidence_stories']}/{required_evidence_stories}"
-            )
-        if preflight_counts["trend_topics"] < TREND_HEAT_MIN_TOPICS:
-            preflight_gaps.append(
-                f"trend topics {preflight_counts['trend_topics']}/{TREND_HEAT_MIN_TOPICS}"
             )
         if preflight_gaps:
             reason = "insufficient_insights_inputs"
@@ -1428,14 +1186,16 @@ def run_insights_once(
                 evidence_out,
                 len(evidence_rows),
             )
-        topic_scout_input = build_topic_scout_input(evidence_out, trends_seed_input)
+        topic_scout_input = build_topic_scout_input(
+            evidence_out,
+            target_date=target_date,
+        )
         topic_scout_out = agent.run_topic_scout(topic_scout_input)
         story_refs = _story_refs_by_id(window_rows, feed_ranks)
-        signals_input, trends_input, opportunities_input, debates_input = (
+        signals_input, opportunities_input, debates_input = (
             build_routed_insights_inputs(
                 target_date=target_date,
                 today_rows=today_rows,
-                trends_input=trends_seed_input,
                 evidence=evidence_out,
                 scout=topic_scout_out,
                 story_refs=story_refs,
@@ -1444,7 +1204,6 @@ def run_insights_once(
 
         input_counts = _insights_input_counts(
             signals_input=signals_input,
-            trends_input=trends_input,
             opportunities_input=opportunities_input,
             debates_input=debates_input,
         )
@@ -1468,13 +1227,11 @@ def run_insights_once(
             }
 
         signals_out = agent.run_signals(signals_input)
-        trends_out = agent.run_trends(trends_input)
         opportunities_out = agent.run_opportunities(opportunities_input)
         debates_out = agent.run_debates(debates_input)
 
         source_story_ids = _collect_story_reference_ids(
             signals_out,
-            trends_out,
             opportunities_out,
             debates_out,
         )
@@ -1495,7 +1252,6 @@ def run_insights_once(
                 debates=debates,
             ),
             "signals": signals_out["signals"],
-            "trendHeatmap": trends_out["trendHeatmap"],
             "opportunities": opportunities_out["opportunities"],
             "debates": debates,
         }
@@ -1564,6 +1320,5 @@ __all__ = [
     "build_routed_insights_inputs",
     "build_today_signals_input",
     "build_topic_scout_input",
-    "build_trend_heat_input",
     "run_insights_once",
 ]
