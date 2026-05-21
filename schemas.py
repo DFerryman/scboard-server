@@ -75,6 +75,9 @@ class Story(BaseModel):
     time: int = Field(description="Actual time the event occurred, unix seconds")
     updatedAt: Optional[int] = Field(default=None, description="Last update time of the AI-consolidated output, unix seconds; may be empty")
     topic: str = Field(description="Topic/category id; must appear in the category catalog")
+    imageUrl: str = Field(default="", description="64x64 PNG thumbnail download URL; empty when unavailable")
+    imageFileID: str = Field(default="", description="CloudBase storage fileID for the thumbnail; empty when unavailable")
+    imageSourceUrl: str = Field(default="", description="Original page image URL used to derive the thumbnail; empty when unavailable")
 
     # The following are AI-consolidated fields: on failure / when not yet
     # available use null or an empty array, but the key must be present

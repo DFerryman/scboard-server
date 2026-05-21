@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS stories (
   enriched_hn_time INTEGER NOT NULL DEFAULT 0,
   enriched_score INTEGER NOT NULL DEFAULT 0,
   enriched_descendants INTEGER NOT NULL DEFAULT 0,
+  image_url TEXT NOT NULL DEFAULT '',
+  image_file_id TEXT NOT NULL DEFAULT '',
+  image_source_url TEXT NOT NULL DEFAULT '',
+  image_status TEXT NOT NULL DEFAULT '',
+  image_checked_at INTEGER NOT NULL DEFAULT 0,
+  image_error TEXT NOT NULL DEFAULT '',
   comments_fetched_descendants INTEGER NOT NULL DEFAULT 0,
   needs_reenrich INTEGER NOT NULL DEFAULT 0,
   reenrich_started_at INTEGER,
@@ -223,6 +229,25 @@ CREATE TABLE IF NOT EXISTS cloud_sync_runs (
 
 CREATE INDEX IF NOT EXISTS idx_cloud_sync_runs_started
 ON cloud_sync_runs(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS story_image_assets (
+  story_id INTEGER PRIMARY KEY,
+  image_file_id TEXT NOT NULL DEFAULT '',
+  image_url TEXT NOT NULL DEFAULT '',
+  image_source_url TEXT NOT NULL DEFAULT '',
+  cloud_path TEXT NOT NULL DEFAULT '',
+  sha256 TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT ''
+    CHECK (status IN ('ready', 'pending_delete', 'deleted', 'delete_failed', '')),
+  uploaded_at INTEGER NOT NULL DEFAULT 0,
+  last_referenced_at INTEGER NOT NULL DEFAULT 0,
+  delete_after INTEGER NOT NULL DEFAULT 0,
+  deleted_at INTEGER NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_story_image_assets_status_delete
+ON story_image_assets(status, delete_after);
 """
 
 
@@ -284,6 +309,30 @@ STORY_COLUMN_MIGRATIONS = {
     "reenrich_retry_after": (
         "ALTER TABLE stories ADD COLUMN "
         "reenrich_retry_after INTEGER NOT NULL DEFAULT 0"
+    ),
+    "image_url": (
+        "ALTER TABLE stories ADD COLUMN "
+        "image_url TEXT NOT NULL DEFAULT ''"
+    ),
+    "image_file_id": (
+        "ALTER TABLE stories ADD COLUMN "
+        "image_file_id TEXT NOT NULL DEFAULT ''"
+    ),
+    "image_source_url": (
+        "ALTER TABLE stories ADD COLUMN "
+        "image_source_url TEXT NOT NULL DEFAULT ''"
+    ),
+    "image_status": (
+        "ALTER TABLE stories ADD COLUMN "
+        "image_status TEXT NOT NULL DEFAULT ''"
+    ),
+    "image_checked_at": (
+        "ALTER TABLE stories ADD COLUMN "
+        "image_checked_at INTEGER NOT NULL DEFAULT 0"
+    ),
+    "image_error": (
+        "ALTER TABLE stories ADD COLUMN "
+        "image_error TEXT NOT NULL DEFAULT ''"
     ),
 }
 

@@ -10,12 +10,12 @@
 #
 #   .venv/bin/pip install -r server/requirements.txt -c server/constraints.txt
 #
-# All transitive deps below ship with pydantic itself (no extras). Optional
-# pydantic extras like ``[email]`` are NOT used by the server code, so
-# email-validator / dnspython / idna are intentionally absent.
+# Pydantic transitives are listed explicitly; Pillow is a direct dependency for
+# 64x64 story thumbnail normalization.
 
 pydantic==2.12.5
 pydantic_core==2.41.5
 annotated-types==0.7.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
+Pillow==12.1.1

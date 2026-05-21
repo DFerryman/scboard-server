@@ -121,6 +121,9 @@ def _story_to_doc(
         "time": story.time,
         "updatedAt": story.updatedAt,
         "topic": story.topic,
+        "imageUrl": story.imageUrl,
+        "imageFileID": story.imageFileID,
+        "imageSourceUrl": story.imageSourceUrl,
         "aiSummary": story.aiSummary,
         "discussionThemes": [t.model_dump() for t in story.discussionThemes],
         "insights": [i.model_dump() for i in story.insights],
@@ -148,6 +151,9 @@ def _client_story_dict_from_story(story: Story) -> dict:
         "time": story.time,
         "updatedAt": story.updatedAt,
         "topic": story.topic,
+        "imageUrl": story.imageUrl,
+        "imageFileID": story.imageFileID,
+        "imageSourceUrl": story.imageSourceUrl,
         "aiSummary": story.aiSummary,
         "discussionThemes": [t.model_dump() for t in story.discussionThemes],
         "insights": [i.model_dump() for i in story.insights],
@@ -383,6 +389,28 @@ def build_read_model(
             })
         _write_jsonl_atomic(digests_path, digest_docs)
 
+        active_image_file_ids = sorted({
+            str(doc.get("imageFileID") or "")
+            for doc in story_docs
+            if str(doc.get("imageFileID") or "").strip()
+        } | {
+            str(story.get("imageFileID") or "")
+            for doc in digest_docs
+            for story in (doc.get("stories") or [])
+            if str(story.get("imageFileID") or "").strip()
+        })
+        _write_text_atomic(
+            out_dir / "story_images.json",
+            json.dumps(
+                {
+                    "syncVersion": current_version,
+                    "activeFileIDs": active_image_file_ids,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
         # ---------- insights.jsonl (self-contained, versioned) ----------
         insight_rows = repository.list_insight_rows(conn)
         insights_path = out_dir / "insights.jsonl"
@@ -446,6 +474,7 @@ def build_read_model(
             "topics": len(topics),
             "digests": len(digest_rows),
             "insights": insight_count,
+            "storyImages": len(active_image_file_ids),
             "feedCounts": meta["feedCounts"],
             "outputDir": str(out_dir),
         }

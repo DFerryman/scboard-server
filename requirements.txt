@@ -10,3 +10,4 @@
 # - <3 keeps the major version locked; pydantic 3 will be a breaking change
 #   when it lands and must be re-validated.
 pydantic>=2.10,<3
+Pillow>=10,<13

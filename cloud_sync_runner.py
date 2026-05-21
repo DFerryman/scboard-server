@@ -192,6 +192,20 @@ def run_business_once(
             )
             or int(time.time())
         )
+        image_cleanup = None
+        try:
+            from . import story_images
+
+            image_cleanup = story_images.cleanup_cloud_images_after_publish(
+                active_file_ids=story_images.active_image_file_ids_from_manifest(
+                    cloud_sync.default_output_dir()
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "[cloud_sync] image cleanup skipped after same-version publish: %s",
+                exc,
+            )
         log.info(
             "[cloud_sync] business already published run_id=%s v=%s; "
             "skipping writeBatch/switchMeta",
@@ -210,6 +224,7 @@ def run_business_once(
                 "digests": 0,
                 "insights": 0,
                 "businessSkipped": True,
+                "imageCleanup": image_cleanup,
             },
         )
 
@@ -230,6 +245,22 @@ def run_business_once(
             timeout_seconds=effective_timeout,
             deadline_at=deadline_at,
         )
+        try:
+            from . import story_images
+
+            push_stats["imageCleanup"] = (
+                story_images.cleanup_cloud_images_after_publish(
+                    active_file_ids=story_images.active_image_file_ids_from_manifest(
+                        cloud_sync.default_output_dir()
+                    )
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[cloud_sync] image cleanup failed after publish: %s", exc)
+            push_stats["imageCleanup"] = {
+                "skipped": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
     except Exception as exc:  # noqa: BLE001
         elapsed = time.time() - started
         log.exception(

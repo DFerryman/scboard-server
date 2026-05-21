@@ -350,6 +350,9 @@ def row_to_story(row: sqlite3.Row, feed: Optional[str] = None) -> Story:
         time=int(hn_time or 0),
         updatedAt=int(enriched_at) if enriched_at else None,
         topic=topic,
+        imageUrl=_row_optional(row, "image_url", "") or "",
+        imageFileID=_row_optional(row, "image_file_id", "") or "",
+        imageSourceUrl=_row_optional(row, "image_source_url", "") or "",
         aiSummary=row["ai_summary"] or "",
         discussionThemes=_coerce_discussion_themes(
             _json_loads(row["discussion_themes"], [])
@@ -1931,6 +1934,288 @@ def purge_old_ranking_candidates(
     return cursor.rowcount or 0
 
 
+# ---------- story images ----------
+
+
+def story_rows_for_image_processing(
+    conn: sqlite3.Connection,
+    story_ids: Sequence[int],
+) -> List[sqlite3.Row]:
+    ids = [int(i) for i in story_ids]
+    if not ids:
+        return []
+    with id_in_clause(conn, ids) as (clause, params):
+        return conn.execute(
+            f"""
+            SELECT
+                id, url, domain, image_url, image_file_id, image_source_url,
+                image_status, image_checked_at, image_error
+            FROM stories
+            WHERE id {clause}
+            ORDER BY id
+            """,
+            params,
+        ).fetchall()
+
+
+def record_story_image_missing(
+    conn: sqlite3.Connection,
+    story_id: int,
+    *,
+    status: str,
+    error: str = "",
+    checked_at: Optional[int] = None,
+) -> None:
+    now = int(checked_at or now_seconds())
+    conn.execute(
+        """
+        UPDATE stories
+        SET image_status=?,
+            image_checked_at=?,
+            image_error=?,
+            image_url='',
+            image_file_id='',
+            image_source_url=''
+        WHERE id=?
+        """,
+        (status, now, str(error or "")[:1000], int(story_id)),
+    )
+
+
+def record_story_image_upload(
+    conn: sqlite3.Connection,
+    *,
+    story_id: int,
+    image_url: str,
+    image_file_id: str,
+    image_source_url: str,
+    cloud_path: str,
+    sha256: str,
+    checked_at: Optional[int] = None,
+) -> None:
+    now = int(checked_at or now_seconds())
+    conn.execute(
+        """
+        UPDATE stories
+        SET image_url=?,
+            image_file_id=?,
+            image_source_url=?,
+            image_status='ready',
+            image_checked_at=?,
+            image_error=''
+        WHERE id=?
+        """,
+        (
+            image_url or "",
+            image_file_id or "",
+            image_source_url or "",
+            now,
+            int(story_id),
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO story_image_assets(
+            story_id, image_file_id, image_url, image_source_url, cloud_path,
+            sha256, status, uploaded_at, last_referenced_at, delete_after,
+            deleted_at, error
+        ) VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, 0, 0, '')
+        ON CONFLICT(story_id) DO UPDATE SET
+            image_file_id=excluded.image_file_id,
+            image_url=excluded.image_url,
+            image_source_url=excluded.image_source_url,
+            cloud_path=excluded.cloud_path,
+            sha256=excluded.sha256,
+            status='ready',
+            uploaded_at=excluded.uploaded_at,
+            last_referenced_at=excluded.last_referenced_at,
+            delete_after=0,
+            deleted_at=0,
+            error=''
+        """,
+        (
+            int(story_id),
+            image_file_id or "",
+            image_url or "",
+            image_source_url or "",
+            cloud_path or "",
+            sha256 or "",
+            now,
+            now,
+        ),
+    )
+
+
+def mark_story_images_referenced(
+    conn: sqlite3.Connection,
+    image_file_ids: Sequence[str],
+    *,
+    referenced_at: Optional[int] = None,
+) -> int:
+    ids = sorted({str(v).strip() for v in image_file_ids if str(v).strip()})
+    if not ids:
+        return 0
+    now = int(referenced_at or now_seconds())
+    placeholders = ",".join("?" * len(ids))
+    cursor = conn.execute(
+        f"""
+        UPDATE story_image_assets
+        SET last_referenced_at=?,
+            status=CASE
+                WHEN status IN ('pending_delete', 'delete_failed') THEN 'ready'
+                ELSE status
+            END,
+            delete_after=0,
+            error=CASE
+                WHEN status IN ('pending_delete', 'delete_failed') THEN ''
+                ELSE error
+            END
+        WHERE image_file_id IN ({placeholders})
+        """,
+        (now, *ids),
+    )
+    return cursor.rowcount or 0
+
+
+def mark_unreferenced_story_images_pending_delete(
+    conn: sqlite3.Connection,
+    active_image_file_ids: Sequence[str],
+    *,
+    delete_after: Optional[int] = None,
+) -> int:
+    active = sorted({str(v).strip() for v in active_image_file_ids if str(v).strip()})
+    due = int(delete_after if delete_after is not None else now_seconds())
+    if active:
+        placeholders = ",".join("?" * len(active))
+        cursor = conn.execute(
+            f"""
+            UPDATE story_image_assets
+            SET status='pending_delete',
+                delete_after=CASE
+                    WHEN delete_after > 0 AND delete_after < ? THEN delete_after
+                    ELSE ?
+                END,
+                error=''
+            WHERE status='ready'
+              AND image_file_id NOT IN ({placeholders})
+            """,
+            (due, due, *active),
+        )
+    else:
+        cursor = conn.execute(
+            """
+            UPDATE story_image_assets
+            SET status='pending_delete',
+                delete_after=CASE
+                    WHEN delete_after > 0 AND delete_after < ? THEN delete_after
+                    ELSE ?
+                END,
+                error=''
+            WHERE status='ready'
+            """,
+            (due, due),
+        )
+    return cursor.rowcount or 0
+
+
+def mark_story_images_pending_delete(
+    conn: sqlite3.Connection,
+    story_ids: Sequence[int],
+    *,
+    delete_after: Optional[int] = None,
+) -> int:
+    ids = [int(i) for i in story_ids]
+    if not ids:
+        return 0
+    due = int(delete_after if delete_after is not None else now_seconds())
+    with id_in_clause(conn, ids) as (clause, params):
+        cursor = conn.execute(
+            f"""
+            UPDATE story_image_assets
+            SET status='pending_delete',
+                delete_after=CASE
+                    WHEN delete_after > 0 AND delete_after < ? THEN delete_after
+                    ELSE ?
+                END,
+                error=''
+            WHERE story_id {clause}
+              AND status IN ('ready', 'delete_failed')
+            """,
+            (due, due, *params),
+        )
+    return cursor.rowcount or 0
+
+
+def pending_story_image_deletes(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    now: Optional[int] = None,
+) -> List[sqlite3.Row]:
+    due = int(now if now is not None else now_seconds())
+    return conn.execute(
+        """
+        SELECT story_id, image_file_id, cloud_path, status, delete_after
+        FROM story_image_assets
+        WHERE status IN ('pending_delete', 'delete_failed')
+          AND image_file_id != ''
+          AND delete_after <= ?
+        ORDER BY delete_after ASC, story_id ASC
+        LIMIT ?
+        """,
+        (due, max(1, int(limit))),
+    ).fetchall()
+
+
+def mark_story_images_deleted(
+    conn: sqlite3.Connection,
+    image_file_ids: Sequence[str],
+    *,
+    deleted_at: Optional[int] = None,
+) -> int:
+    ids = sorted({str(v).strip() for v in image_file_ids if str(v).strip()})
+    if not ids:
+        return 0
+    now = int(deleted_at or now_seconds())
+    placeholders = ",".join("?" * len(ids))
+    cursor = conn.execute(
+        f"""
+        UPDATE story_image_assets
+        SET status='deleted',
+            deleted_at=?,
+            error=''
+        WHERE image_file_id IN ({placeholders})
+        """,
+        (now, *ids),
+    )
+    return cursor.rowcount or 0
+
+
+def mark_story_image_delete_failed(
+    conn: sqlite3.Connection,
+    image_file_ids: Sequence[str],
+    *,
+    error: str,
+    retry_after: Optional[int] = None,
+) -> int:
+    ids = sorted({str(v).strip() for v in image_file_ids if str(v).strip()})
+    if not ids:
+        return 0
+    due = int(retry_after if retry_after is not None else now_seconds())
+    placeholders = ",".join("?" * len(ids))
+    cursor = conn.execute(
+        f"""
+        UPDATE story_image_assets
+        SET status='delete_failed',
+            delete_after=?,
+            error=?
+        WHERE image_file_id IN ({placeholders})
+        """,
+        (due, str(error or "")[:1000], *ids),
+    )
+    return cursor.rowcount or 0
+
+
 # ---------- comments ----------
 
 def replace_story_comments(
@@ -2632,12 +2917,22 @@ def delete_orphan_stories(
             protected_clause = f"AND id NOT {protected_part[0]} "
             params = (*protected_part[1], grace_cutoff)
         sql = f"""
-            DELETE FROM stories
+            SELECT id
+            FROM stories
             WHERE id NOT IN (SELECT story_id FROM rankings)
               {protected_clause}AND enrich_status != 'enriching'
               AND last_seen_at < ?
             """
-        cursor = conn.execute(sql, params)
+        ids = [int(r["id"]) for r in conn.execute(sql, params).fetchall()]
+    if not ids:
+        return 0
+    mark_story_images_pending_delete(
+        conn,
+        ids,
+        delete_after=now_seconds() + int(settings.STORY_IMAGE_DELETE_GRACE_SECONDS),
+    )
+    with id_in_clause(conn, ids) as (clause, params):
+        cursor = conn.execute(f"DELETE FROM stories WHERE id {clause}", params)
     return cursor.rowcount or 0
 
 
@@ -2672,8 +2967,6 @@ def evict_story_overflow(
             prot_params = tuple(protected_part[1])
 
         sql = f"""
-            DELETE FROM stories
-            WHERE id IN (
                 SELECT id
                 FROM stories
                 WHERE id NOT IN (SELECT story_id FROM rankings)
@@ -2692,9 +2985,20 @@ def evict_story_overflow(
                   hn_time ASC,
                   id ASC
                 LIMIT ?
-            )
         """
-        cursor = conn.execute(sql, (*prot_params, overflow))
+        ids = [
+            int(r["id"])
+            for r in conn.execute(sql, (*prot_params, overflow)).fetchall()
+        ]
+    if not ids:
+        return 0
+    mark_story_images_pending_delete(
+        conn,
+        ids,
+        delete_after=now_seconds() + int(settings.STORY_IMAGE_DELETE_GRACE_SECONDS),
+    )
+    with id_in_clause(conn, ids) as (clause, params):
+        cursor = conn.execute(f"DELETE FROM stories WHERE id {clause}", params)
     return cursor.rowcount or 0
 
 
@@ -2726,7 +3030,8 @@ def delete_run_pending_orphans(
             prot_params = tuple(protected_part[1])
 
         sql = f"""
-            DELETE FROM stories
+            SELECT id
+            FROM stories
             WHERE id {cand_clause}
               AND enrich_status IN ('pending', 'failed')
               AND id NOT IN (SELECT story_id FROM rankings)
@@ -2736,7 +3041,16 @@ def delete_run_pending_orphans(
               {protected_clause}
         """
         params: Tuple[Any, ...] = (*cand_params, run_id, *prot_params)
-        cursor = conn.execute(sql, params)
+        ids = [int(r["id"]) for r in conn.execute(sql, params).fetchall()]
+    if not ids:
+        return 0
+    mark_story_images_pending_delete(
+        conn,
+        ids,
+        delete_after=now_seconds() + int(settings.STORY_IMAGE_DELETE_GRACE_SECONDS),
+    )
+    with id_in_clause(conn, ids) as (clause, params):
+        cursor = conn.execute(f"DELETE FROM stories WHERE id {clause}", params)
     return cursor.rowcount or 0
 
 
@@ -2789,6 +3103,15 @@ __all__ = [
     "release_inflight_claims_for_ids",
     "write_enriched_story",
     "mark_enrich_failed",
+    "story_rows_for_image_processing",
+    "record_story_image_missing",
+    "record_story_image_upload",
+    "mark_story_images_referenced",
+    "mark_unreferenced_story_images_pending_delete",
+    "mark_story_images_pending_delete",
+    "pending_story_image_deletes",
+    "mark_story_images_deleted",
+    "mark_story_image_delete_failed",
     "mark_enrich_pending_retry",
     "increment_enrich_attempts",
     "increment_reenrich_attempts",

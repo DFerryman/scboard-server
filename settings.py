@@ -1692,6 +1692,109 @@ CLOUD_SYNC_TIMEOUT_SECONDS = _require_int_range(
     min_value=10,
     max_value=600,
 )
+
+# ---------- Story image extraction / cloud storage ----------
+
+STORY_IMAGES_ENABLED = _env_bool(
+    "HNREADER_STORY_IMAGES_ENABLED",
+    False,
+    fallback="HACKERMINI_STORY_IMAGES_ENABLED",
+)
+STORY_IMAGE_UPLOAD_URL = _env_str(
+    "HNREADER_STORY_IMAGE_UPLOAD_URL",
+    "",
+    fallback="HACKERMINI_STORY_IMAGE_UPLOAD_URL",
+)
+STORY_IMAGE_UPLOAD_SECRET = _env_str(
+    "HNREADER_STORY_IMAGE_UPLOAD_SECRET",
+    "",
+    fallback="HACKERMINI_STORY_IMAGE_UPLOAD_SECRET",
+)
+STORY_IMAGE_CLOUD_PATH_PREFIX = _env_str(
+    "HNREADER_STORY_IMAGE_CLOUD_PATH_PREFIX",
+    "hn/story-thumbs/v1",
+    fallback="HACKERMINI_STORY_IMAGE_CLOUD_PATH_PREFIX",
+).strip().strip("/")
+STORY_IMAGE_WORKERS = _require_int_range(
+    "HNREADER_STORY_IMAGE_WORKERS",
+    _env_int(
+        "HNREADER_STORY_IMAGE_WORKERS",
+        6,
+        fallback="HACKERMINI_STORY_IMAGE_WORKERS",
+    ),
+    min_value=1,
+    max_value=32,
+)
+STORY_IMAGE_UPLOAD_BATCH_SIZE = _require_int_range(
+    "HNREADER_STORY_IMAGE_UPLOAD_BATCH_SIZE",
+    _env_int(
+        "HNREADER_STORY_IMAGE_UPLOAD_BATCH_SIZE",
+        10,
+        fallback="HACKERMINI_STORY_IMAGE_UPLOAD_BATCH_SIZE",
+    ),
+    min_value=1,
+    max_value=50,
+)
+STORY_IMAGE_DELETE_BATCH_SIZE = _require_int_range(
+    "HNREADER_STORY_IMAGE_DELETE_BATCH_SIZE",
+    _env_int(
+        "HNREADER_STORY_IMAGE_DELETE_BATCH_SIZE",
+        50,
+        fallback="HACKERMINI_STORY_IMAGE_DELETE_BATCH_SIZE",
+    ),
+    min_value=1,
+    max_value=100,
+)
+STORY_IMAGE_DOWNLOAD_TIMEOUT_SECONDS = _require_float_range(
+    "HNREADER_STORY_IMAGE_DOWNLOAD_TIMEOUT_SECONDS",
+    _env_float(
+        "HNREADER_STORY_IMAGE_DOWNLOAD_TIMEOUT_SECONDS",
+        10.0,
+        fallback="HACKERMINI_STORY_IMAGE_DOWNLOAD_TIMEOUT_SECONDS",
+    ),
+    min_value=1.0,
+    max_value=60.0,
+)
+STORY_IMAGE_MAX_HTML_BYTES = _require_int_range(
+    "HNREADER_STORY_IMAGE_MAX_HTML_BYTES",
+    _env_int(
+        "HNREADER_STORY_IMAGE_MAX_HTML_BYTES",
+        512 * 1024,
+        fallback="HACKERMINI_STORY_IMAGE_MAX_HTML_BYTES",
+    ),
+    min_value=16 * 1024,
+    max_value=4 * 1024 * 1024,
+)
+STORY_IMAGE_MAX_BYTES = _require_int_range(
+    "HNREADER_STORY_IMAGE_MAX_BYTES",
+    _env_int(
+        "HNREADER_STORY_IMAGE_MAX_BYTES",
+        5 * 1024 * 1024,
+        fallback="HACKERMINI_STORY_IMAGE_MAX_BYTES",
+    ),
+    min_value=1024,
+    max_value=25 * 1024 * 1024,
+)
+STORY_IMAGE_MAX_PIXELS = _require_int_range(
+    "HNREADER_STORY_IMAGE_MAX_PIXELS",
+    _env_int(
+        "HNREADER_STORY_IMAGE_MAX_PIXELS",
+        40_000_000,
+        fallback="HACKERMINI_STORY_IMAGE_MAX_PIXELS",
+    ),
+    min_value=64 * 64,
+    max_value=200_000_000,
+)
+STORY_IMAGE_DELETE_GRACE_SECONDS = _require_int_range(
+    "HNREADER_STORY_IMAGE_DELETE_GRACE_SECONDS",
+    _env_int(
+        "HNREADER_STORY_IMAGE_DELETE_GRACE_SECONDS",
+        24 * 60 * 60,
+        fallback="HACKERMINI_STORY_IMAGE_DELETE_GRACE_SECONDS",
+    ),
+    min_value=0,
+    max_value=30 * 24 * 60 * 60,
+)
 DASHBOARD_INGEST_RUN_LIMIT = _require_int_range(
     "HNREADER_DASHBOARD_INGEST_RUN_LIMIT",
     _env_int(

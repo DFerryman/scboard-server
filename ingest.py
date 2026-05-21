@@ -31,7 +31,7 @@ import sys
 import time
 import uuid
 from collections.abc import Mapping as AbcMapping, Sequence as AbcSequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from threading import Lock
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -2842,6 +2842,7 @@ def run_ingest_round(
         "enrich": None,
         "digest": None,
         "digest_checkpoints": [],
+        "images": None,
         "insights": None,
         "publish": None,
         "cleanup": None,
@@ -2849,6 +2850,43 @@ def run_ingest_round(
     candidate_count = 0
     target_ids: List[int] = []
     digest_error_alerted = False
+    image_executor: Optional[ThreadPoolExecutor] = None
+    image_future = None
+    image_collected = False
+
+    def start_image_pipeline(ids: Sequence[int]) -> None:
+        nonlocal image_executor, image_future
+        if image_future is not None:
+            return
+        if not settings.STORY_IMAGES_ENABLED:
+            summary["images"] = {"skipped": True, "reason": "disabled"}
+            return
+        from . import story_images
+
+        image_executor = ThreadPoolExecutor(max_workers=1)
+        image_future = image_executor.submit(story_images.process_story_images_for_ids, list(ids))
+
+    def collect_image_pipeline(*, wait: bool) -> None:
+        nonlocal image_collected
+        if image_future is None or image_collected:
+            return
+        try:
+            summary["images"] = image_future.result(timeout=None if wait else 0)
+            image_collected = True
+        except FutureTimeoutError:
+            summary["images"] = {"skipped": True, "reason": "not_finished"}
+            image_collected = True
+        except Exception as exc:  # noqa: BLE001
+            log.exception("story image pipeline failed: %s", exc)
+            summary["images"] = {
+                "skipped": False,
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            image_collected = True
+        finally:
+            if image_collected and image_executor is not None:
+                image_executor.shutdown(wait=False, cancel_futures=True)
 
     conn = db.connect()
     try:
@@ -2920,6 +2958,8 @@ def run_ingest_round(
                 candidate_count = len(target_ids)
         finally:
             conn.close()
+        if target_ids:
+            start_image_pipeline(target_ids)
 
         if fetch_summary.get("timed_out"):
             error = "round deadline reached during fetch"
@@ -2942,6 +2982,7 @@ def run_ingest_round(
             )
             summary["status"] = "timeout"
             summary["error"] = error
+            collect_image_pipeline(wait=False)
             return summary
 
         if not fetch_summary.get("successful_round") or not target_ids:
@@ -2962,6 +3003,7 @@ def run_ingest_round(
             )
             summary["status"] = "failed"
             summary["error"] = error
+            collect_image_pipeline(wait=False)
             return summary
 
         enrich_deadline = None
@@ -3139,6 +3181,7 @@ def run_ingest_round(
             summary["status"] = final_status
             summary["error"] = partial_error
             if final_status != "partial":
+                collect_image_pipeline(wait=False)
                 _finish_run(run_id, final_status, error=partial_error)
                 return summary
         elif ready_count <= 0:
@@ -3164,6 +3207,7 @@ def run_ingest_round(
             )
             summary["status"] = "failed"
             summary["error"] = error
+            collect_image_pipeline(wait=False)
             return summary
         else:
             summary["status"] = "completed"
@@ -3222,6 +3266,7 @@ def run_ingest_round(
         if summary.get("status") in ("completed", "partial"):
             final_status = str(summary.get("status") or "completed")
             final_error = str(summary.get("error") or "")
+            collect_image_pipeline(wait=True)
             # The dashboard projection is built inside cloud sync. Finish the
             # ingest run before that projection so the cloud dashboard receives
             # the same terminal run state the server has locally, not a
@@ -3250,6 +3295,7 @@ def run_ingest_round(
         return summary
 
     except Exception as exc:  # noqa: BLE001
+        collect_image_pipeline(wait=False)
         error = f"{type(exc).__name__}: {exc}"
         _discard_run(
             run_id,

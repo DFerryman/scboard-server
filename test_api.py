@@ -10,6 +10,7 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import hashlib
 import os
 import signal
 import socket
@@ -15832,6 +15833,383 @@ class DbBackupRoundTrip(_SqliteCase):
                 )
         finally:
             conn.close()
+
+
+class StoryImagePipelineTests(_SqliteCase):
+    def _insert_story(
+        self,
+        conn,
+        story_id: int,
+        *,
+        url: str = "https://example.com/story",
+        last_seen_at: int = 1,
+        done: bool = True,
+    ) -> None:
+        now = int(time.time())
+        conn.execute(
+            """
+            INSERT INTO stories(
+                id, kind, title_en, title_zh, url, domain, by, score,
+                descendants, hn_time, topic, ai_summary, enrich_status,
+                enriched_at, fetched_at, last_seen_at
+            ) VALUES (?, 'story', ?, ?, ?, 'example.com', 'alice', 10,
+                1, ?, 'web', ?, ?, ?, ?, ?)
+            """,
+            (
+                story_id,
+                f"Story {story_id}",
+                f"中文标题 {story_id}",
+                url,
+                now,
+                "中文摘要",
+                "done" if done else "pending",
+                now if done else None,
+                now,
+                last_seen_at,
+            ),
+        )
+
+    def test_extract_candidates_prefers_social_images_and_keeps_fallbacks(self):
+        from . import story_images
+
+        html_text = """
+        <html><head>
+          <meta property="og:image" content="/og.png">
+          <meta name="twitter:image" content="https://cdn.example/t.png">
+          <link rel="apple-touch-icon" href="/touch.png">
+        </head><body><img src="/first.jpg"></body></html>
+        """
+        candidates = story_images.extract_image_candidates(
+            html_text, "https://news.example/post/1"
+        )
+        self.assertEqual(candidates[0].kind, "meta")
+        self.assertEqual(candidates[0].url, "https://news.example/og.png")
+        self.assertIn(
+            "https://news.example/apple-touch-icon.png",
+            [c.url for c in candidates],
+        )
+
+    def test_normalize_image_outputs_real_64_png(self):
+        from PIL import Image
+        from . import story_images
+
+        src = io.BytesIO()
+        Image.new("RGB", (160, 90), (200, 10, 10)).save(src, format="JPEG")
+        out = story_images._normalize_image(
+            src.getvalue(), fit="cover", max_pixels=1_000_000
+        )
+        with Image.open(io.BytesIO(out)) as im:
+            self.assertEqual(im.size, (64, 64))
+            self.assertEqual(im.format, "PNG")
+
+    def test_process_story_images_uploads_and_records_asset(self):
+        from . import story_images
+        from .story_images import ProcessedImage
+
+        png = b"\x89PNG\r\n\x1a\n" + b"x" * 32
+        digest = hashlib.sha256(png).hexdigest()
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                self._insert_story(conn, 101, done=False)
+        finally:
+            conn.close()
+
+        seen_payloads = []
+
+        def fake_fetch(row):
+            return ProcessedImage(
+                story_id=int(row["id"]),
+                source_url="https://cdn.example/og.png",
+                cloud_path=f"hn/story-thumbs/v1/{row['id']}-{digest[:16]}.png",
+                sha256=digest,
+                png_bytes=png,
+            )
+
+        def fake_upload(**kwargs):
+            seen_payloads.extend(kwargs["images"])
+            return {
+                101: {
+                    "storyId": 101,
+                    "fileID": "cloud://env/hn/story-thumbs/v1/101.png",
+                    "tempFileURL": "https://temp.example/101.png",
+                }
+            }
+
+        with patch.object(settings, "STORY_IMAGES_ENABLED", True), \
+             patch.object(settings, "STORY_IMAGE_UPLOAD_URL", "https://8.8.8.8/uploadStoryImages"), \
+             patch.object(settings, "STORY_IMAGE_UPLOAD_SECRET", "secret"), \
+             patch.object(story_images, "fetch_and_normalize_story_image", side_effect=fake_fetch), \
+             patch.object(story_images.cloud_image_upload, "upload_story_images", side_effect=fake_upload):
+            summary = story_images.process_story_images_for_ids([101])
+
+        self.assertEqual(summary["uploaded"], 1)
+        self.assertEqual(len(seen_payloads), 1)
+        self.assertEqual(seen_payloads[0]["sha256"], digest)
+        conn = db.connect()
+        try:
+            row = conn.execute("SELECT * FROM stories WHERE id=101").fetchone()
+            asset = conn.execute(
+                "SELECT * FROM story_image_assets WHERE story_id=101"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["image_url"], "https://temp.example/101.png")
+        self.assertEqual(row["image_file_id"], "cloud://env/hn/story-thumbs/v1/101.png")
+        self.assertEqual(asset["status"], "ready")
+        self.assertEqual(asset["sha256"], digest)
+
+    def test_cloud_sync_exports_story_image_fields_and_manifest(self):
+        from . import cloud_sync
+
+        out_dir = Path(self.tmpdir) / "cloud-out"
+        now = int(time.time())
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "catalog_version", "7")
+                self._insert_story(conn, 201, last_seen_at=now)
+                conn.execute(
+                    """
+                    UPDATE stories
+                    SET image_url='https://temp.example/201.png',
+                        image_file_id='cloud://env/hn/story-thumbs/v1/201.png',
+                        image_source_url='https://cdn.example/201.png',
+                        image_status='ready'
+                    WHERE id=201
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO rankings(feed, rank, story_id, refreshed_at) "
+                    "VALUES ('top', 1, 201, ?)",
+                    (now,),
+                )
+        finally:
+            conn.close()
+
+        stats = cloud_sync.build_read_model(out_dir, include_dashboard=False)
+        self.assertEqual(stats["storyImages"], 1)
+        story_doc = json.loads(
+            (out_dir / "stories.jsonl").read_text(encoding="utf-8").splitlines()[0]
+        )
+        manifest = json.loads((out_dir / "story_images.json").read_text(encoding="utf-8"))
+        self.assertEqual(story_doc["imageUrl"], "https://temp.example/201.png")
+        self.assertEqual(story_doc["imageFileID"], "cloud://env/hn/story-thumbs/v1/201.png")
+        self.assertEqual(manifest["activeFileIDs"], ["cloud://env/hn/story-thumbs/v1/201.png"])
+
+    def test_story_cleanup_marks_assets_pending_delete_before_row_delete(self):
+        now = int(time.time())
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                self._insert_story(conn, 301, last_seen_at=now - 10_000)
+                repository.record_story_image_upload(
+                    conn,
+                    story_id=301,
+                    image_url="https://temp.example/301.png",
+                    image_file_id="cloud://env/301.png",
+                    image_source_url="https://cdn.example/301.png",
+                    cloud_path="hn/story-thumbs/v1/301.png",
+                    sha256="a" * 64,
+                    checked_at=now,
+                )
+                deleted = repository.delete_orphan_stories(
+                    conn,
+                    grace_seconds=1,
+                    archive_cutoff_date="2099-01-01",
+                )
+        finally:
+            conn.close()
+
+        self.assertEqual(deleted, 1)
+        conn = db.connect()
+        try:
+            self.assertIsNone(conn.execute("SELECT id FROM stories WHERE id=301").fetchone())
+            asset = conn.execute(
+                "SELECT status, delete_after FROM story_image_assets WHERE story_id=301"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(asset["status"], "pending_delete")
+        self.assertGreaterEqual(asset["delete_after"], now)
+
+    def test_discarded_run_cleanup_marks_assets_pending_delete_before_row_delete(self):
+        now = int(time.time())
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                self._insert_story(conn, 302, last_seen_at=now - 10_000, done=False)
+                repository.replace_ranking_candidates(conn, "discard-run", "top", [302])
+                repository.record_story_image_upload(
+                    conn,
+                    story_id=302,
+                    image_url="https://temp.example/302.png",
+                    image_file_id="cloud://env/302.png",
+                    image_source_url="https://cdn.example/302.png",
+                    cloud_path="hn/story-thumbs/v1/302.png",
+                    sha256="b" * 64,
+                    checked_at=now,
+                )
+                deleted = repository.delete_run_pending_orphans(
+                    conn,
+                    "discard-run",
+                    archive_cutoff_date="2099-01-01",
+                )
+        finally:
+            conn.close()
+
+        self.assertEqual(deleted, 1)
+        conn = db.connect()
+        try:
+            self.assertIsNone(conn.execute("SELECT id FROM stories WHERE id=302").fetchone())
+            asset = conn.execute(
+                "SELECT status, delete_after FROM story_image_assets WHERE story_id=302"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(asset["status"], "pending_delete")
+        self.assertGreaterEqual(asset["delete_after"], now)
+
+    def test_cleanup_cloud_images_deletes_due_unreferenced_assets(self):
+        from . import story_images
+
+        now = int(time.time())
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                for sid, file_id in (
+                    (401, "cloud://env/active.png"),
+                    (402, "cloud://env/old.png"),
+                ):
+                    self._insert_story(conn, sid, last_seen_at=now)
+                    repository.record_story_image_upload(
+                        conn,
+                        story_id=sid,
+                        image_url=f"https://temp.example/{sid}.png",
+                        image_file_id=file_id,
+                        image_source_url=f"https://cdn.example/{sid}.png",
+                        cloud_path=f"hn/story-thumbs/v1/{sid}.png",
+                        sha256=(str(sid) * 16)[:64],
+                        checked_at=now,
+                    )
+        finally:
+            conn.close()
+
+        def fake_delete(**kwargs):
+            self.assertEqual(kwargs["file_ids"], ["cloud://env/old.png"])
+            return {"deleted": ["cloud://env/old.png"], "failed": []}
+
+        with patch.object(settings, "STORY_IMAGES_ENABLED", True), \
+             patch.object(settings, "STORY_IMAGE_UPLOAD_URL", "https://8.8.8.8/uploadStoryImages"), \
+             patch.object(settings, "STORY_IMAGE_UPLOAD_SECRET", "secret"), \
+             patch.object(settings, "STORY_IMAGE_DELETE_GRACE_SECONDS", 0), \
+             patch.object(story_images.cloud_image_upload, "delete_story_images", side_effect=fake_delete):
+            summary = story_images.cleanup_cloud_images_after_publish(
+                active_file_ids=["cloud://env/active.png"]
+            )
+
+        self.assertEqual(summary["deleted"], 1)
+        conn = db.connect()
+        try:
+            rows = {
+                r["image_file_id"]: r["status"]
+                for r in conn.execute(
+                    "SELECT image_file_id, status FROM story_image_assets"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        self.assertEqual(rows["cloud://env/active.png"], "ready")
+        self.assertEqual(rows["cloud://env/old.png"], "deleted")
+
+    def test_ingest_starts_images_during_enrich_and_waits_before_cloud_sync(self):
+        from . import insights as insights_module
+        from . import story_images
+
+        old_images = settings.STORY_IMAGES_ENABLED
+        old_cloud = settings.CLOUD_SYNC_ENABLED
+        settings.STORY_IMAGES_ENABLED = True  # type: ignore[assignment]
+        settings.CLOUD_SYNC_ENABLED = True  # type: ignore[assignment]
+        order = []
+        image_started = Event()
+
+        client = _FakeHn(
+            {"top": [501], "new": [], "best": [], "ask": [], "show": [], "job": []},
+            {
+                501: {
+                    "id": 501,
+                    "type": "story",
+                    "title": "Parallel image story",
+                    "url": "https://example.com/501",
+                    "by": "alice",
+                    "score": 10,
+                    "descendants": 1,
+                    "time": int(time.time()),
+                }
+            },
+        )
+
+        def fake_images(ids):
+            self.assertEqual(ids, [501])
+            order.append("image_start")
+            image_started.set()
+            time.sleep(0.05)
+            order.append("image_done")
+            return {"skipped": False, "uploaded": 0}
+
+        def fake_enricher(*, target_ids, **_kwargs):
+            self.assertTrue(image_started.wait(1.0), "image pipeline did not start before enrich")
+            order.append("enrich")
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    for sid in target_ids:
+                        repository.write_enriched_story(
+                            conn,
+                            int(sid),
+                            title_zh="中文标题",
+                            topic="web",
+                            topic_name="Web",
+                            ai_summary="中文摘要",
+                            insights=[],
+                            terms=[],
+                            discussion_themes=[],
+                        )
+            finally:
+                conn.close()
+            return {
+                "claimed": len(target_ids),
+                "done": len(target_ids),
+                "failed": 0,
+                "retried": 0,
+                "timed_out": False,
+            }
+
+        def fake_cloud_sync(*_args, **_kwargs):
+            self.assertIn("image_done", order)
+            order.append("cloud_sync")
+            return {"status": "ok", "sync_version": 12, "elapsed_seconds": 0.1}
+
+        try:
+            with patch.object(story_images, "process_story_images_for_ids", side_effect=fake_images), \
+                 patch.object(ingest_module, "run_enricher_once", side_effect=fake_enricher), \
+                 patch.object(ingest_module, "_commit_digest_checkpoint", return_value={"skipped": True}), \
+                 patch.object(insights_module, "run_insights_once", return_value={"status": "skipped"}), \
+                 patch.object(ingest_module, "_trigger_and_record_cloud_sync", side_effect=fake_cloud_sync):
+                summary = run_ingest_round(
+                    run_id="image-parallel-before-cloud",
+                    client=client,
+                    ai_agent=FallbackAiAgent(),
+                    run_cleanup=False,
+                )
+        finally:
+            settings.STORY_IMAGES_ENABLED = old_images  # type: ignore[assignment]
+            settings.CLOUD_SYNC_ENABLED = old_cloud  # type: ignore[assignment]
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["images"]["uploaded"], 0)
+        self.assertLess(order.index("image_start"), order.index("enrich"))
+        self.assertLess(order.index("image_done"), order.index("cloud_sync"))
 
 
 if __name__ == "__main__":
