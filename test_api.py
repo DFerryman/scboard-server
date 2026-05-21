@@ -1016,6 +1016,14 @@ class SettingsValidation(unittest.TestCase):
             launcher,
         )
         self.assertIn(
+            'HNREADER_STORY_IMAGE_UPLOAD_BATCH_SIZE="${HNREADER_STORY_IMAGE_UPLOAD_BATCH_SIZE:-20}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_STORY_IMAGE_UPLOAD_MAX_BODY_BYTES="${HNREADER_STORY_IMAGE_UPLOAD_MAX_BODY_BYTES:-80000}"',
+            launcher,
+        )
+        self.assertIn(
             'HNREADER_DASHBOARD_INGEST_RUN_LIMIT="${HNREADER_DASHBOARD_INGEST_RUN_LIMIT:-20}"',
             launcher,
         )
@@ -16521,6 +16529,129 @@ class StoryImagePipelineTests(_SqliteCase):
         self.assertEqual(row["image_file_id"], "cloud://env/hn/story-thumbs/v1/101.png")
         self.assertEqual(asset["status"], "ready")
         self.assertEqual(asset["sha256"], digest)
+
+    def test_upload_story_images_splits_payload_limited_batches(self):
+        from . import cloud_image_upload
+
+        calls = []
+
+        def fake_post(_url, _secret, body, timeout):
+            self.assertEqual(timeout, 7)
+            story_ids = [int(item["storyId"]) for item in body["images"]]
+            calls.append(story_ids)
+            if len(story_ids) > 1:
+                return {
+                    "ok": False,
+                    "code": "EXCEED_MAX_PAYLOAD_SIZE",
+                    "message": "Exceed max request payload size",
+                }
+            story_id = story_ids[0]
+            return {
+                "ok": True,
+                "results": [
+                    {
+                        "storyId": story_id,
+                        "fileID": f"cloud://env/{story_id}.png",
+                        "tempFileURL": f"https://temp.example/{story_id}.png",
+                    }
+                ],
+            }
+
+        images = [{"storyId": story_id, "pngBase64": "x"} for story_id in (1, 2, 3, 4)]
+        with patch.object(cloud_image_upload.cloud_push, "_post", side_effect=fake_post):
+            uploaded = cloud_image_upload.upload_story_images(
+                url="https://upload.example/uploadStoryImages",
+                secret="secret",
+                images=images,
+                batch_size=4,
+                timeout_seconds=7,
+            )
+
+        self.assertEqual(set(uploaded), {1, 2, 3, 4})
+        self.assertEqual(calls[0], [1, 2, 3, 4])
+        self.assertIn([1], calls)
+        self.assertIn([4], calls)
+
+    def test_upload_story_images_reports_single_payload_limit(self):
+        from . import cloud_image_upload
+
+        def fake_post(_url, _secret, body, timeout):
+            return {
+                "ok": False,
+                "code": "EXCEED_MAX_PAYLOAD_SIZE",
+                "message": "Exceed max request payload size",
+            }
+
+        with patch.object(cloud_image_upload.cloud_push, "_post", side_effect=fake_post):
+            uploaded = cloud_image_upload.upload_story_images(
+                url="https://upload.example/uploadStoryImages",
+                secret="secret",
+                images=[{"storyId": 9, "pngBase64": "x"}],
+                batch_size=1,
+                timeout_seconds=7,
+            )
+
+        self.assertIn("EXCEED_MAX_PAYLOAD_SIZE", uploaded[9]["error"])
+
+    def test_upload_story_images_splits_by_configured_body_size(self):
+        from . import cloud_image_upload
+
+        calls = []
+
+        def fake_post(_url, _secret, body, timeout):
+            story_ids = [int(item["storyId"]) for item in body["images"]]
+            calls.append(story_ids)
+            return {
+                "ok": True,
+                "results": [
+                    {
+                        "storyId": story_id,
+                        "fileID": f"cloud://env/{story_id}.png",
+                        "tempFileURL": f"https://temp.example/{story_id}.png",
+                    }
+                    for story_id in story_ids
+                ],
+            }
+
+        images = [
+            {"storyId": story_id, "pngBase64": "x" * 30_000}
+            for story_id in (11, 12, 13)
+        ]
+        with patch.object(cloud_image_upload.cloud_push, "_post", side_effect=fake_post):
+            uploaded = cloud_image_upload.upload_story_images(
+                url="https://upload.example/uploadStoryImages",
+                secret="secret",
+                images=images,
+                batch_size=3,
+                timeout_seconds=7,
+                max_body_bytes=70_000,
+            )
+
+        self.assertEqual(set(uploaded), {11, 12, 13})
+        self.assertNotIn([11, 12, 13], calls)
+        self.assertIn([11, 12], calls)
+        self.assertIn([13], calls)
+
+    def test_upload_story_images_preserves_cloud_failed_entries(self):
+        from . import cloud_image_upload
+
+        def fake_post(_url, _secret, body, timeout):
+            return {
+                "ok": True,
+                "results": [],
+                "failed": [{"storyId": 21, "error": "PNG exceeds 131072 bytes"}],
+            }
+
+        with patch.object(cloud_image_upload.cloud_push, "_post", side_effect=fake_post):
+            uploaded = cloud_image_upload.upload_story_images(
+                url="https://upload.example/uploadStoryImages",
+                secret="secret",
+                images=[{"storyId": 21, "pngBase64": "x"}],
+                batch_size=1,
+                timeout_seconds=7,
+            )
+
+        self.assertEqual(uploaded[21]["error"], "PNG exceeds 131072 bytes")
 
     def test_reuploading_story_image_marks_previous_file_pending_delete(self):
         now = int(time.time())

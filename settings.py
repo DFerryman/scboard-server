@@ -1741,11 +1741,21 @@ STORY_IMAGE_UPLOAD_BATCH_SIZE = _require_int_range(
     "HNREADER_STORY_IMAGE_UPLOAD_BATCH_SIZE",
     _env_int(
         "HNREADER_STORY_IMAGE_UPLOAD_BATCH_SIZE",
-        10,
+        20,
         fallback="HACKERMINI_STORY_IMAGE_UPLOAD_BATCH_SIZE",
     ),
     min_value=1,
     max_value=50,
+)
+STORY_IMAGE_UPLOAD_MAX_BODY_BYTES = _require_int_range(
+    "HNREADER_STORY_IMAGE_UPLOAD_MAX_BODY_BYTES",
+    _env_int(
+        "HNREADER_STORY_IMAGE_UPLOAD_MAX_BODY_BYTES",
+        80_000,
+        fallback="HACKERMINI_STORY_IMAGE_UPLOAD_MAX_BODY_BYTES",
+    ),
+    min_value=16 * 1024,
+    max_value=6 * 1024 * 1024,
 )
 STORY_IMAGE_DELETE_BATCH_SIZE = _require_int_range(
     "HNREADER_STORY_IMAGE_DELETE_BATCH_SIZE",

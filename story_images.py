@@ -220,7 +220,7 @@ def _normalize_image(raw: bytes, *, max_pixels: int) -> bytes:
                 ),
             )
             buf = BytesIO()
-            out.save(buf, format="PNG", optimize=True)
+            out.convert("RGB").save(buf, format="PNG", optimize=True)
             return buf.getvalue()
     finally:
         Image.MAX_IMAGE_PIXELS = old_limit
@@ -374,6 +374,7 @@ def process_story_images_for_ids(story_ids: Sequence[int]) -> Dict[str, Any]:
                 images=payloads,
                 batch_size=int(settings.STORY_IMAGE_UPLOAD_BATCH_SIZE),
                 timeout_seconds=max(1, int(settings.STORY_IMAGE_DOWNLOAD_TIMEOUT_SECONDS)),
+                max_body_bytes=int(settings.STORY_IMAGE_UPLOAD_MAX_BODY_BYTES),
             )
         except Exception as exc:  # noqa: BLE001
             uploaded = {}
@@ -416,7 +417,10 @@ def process_story_images_for_ids(story_ids: Sequence[int]) -> Dict[str, Any]:
                                 conn,
                                 story_id,
                                 status="failed",
-                                error="upload result missing fileID/tempFileURL",
+                                error=str(
+                                    result.get("error")
+                                    or "upload result missing fileID/tempFileURL"
+                                ),
                             )
                             summary["failed"] += 1
             finally:
