@@ -193,7 +193,7 @@ def extract_image_candidates(html_text: str, base_url: str) -> List[ImageCandida
     return parser.candidates
 
 
-def _normalize_image(raw: bytes, *, fit: str, max_pixels: int) -> bytes:
+def _normalize_image(raw: bytes, *, max_pixels: int) -> bytes:
     old_limit = Image.MAX_IMAGE_PIXELS
     Image.MAX_IMAGE_PIXELS = max_pixels
     try:
@@ -204,19 +204,13 @@ def _normalize_image(raw: bytes, *, fit: str, max_pixels: int) -> bytes:
                     f"image has {int(im.width) * int(im.height)} pixels > limit {max_pixels}"
                 )
             im = im.convert("RGBA")
-            if fit == "contain":
-                thumb = ImageOps.contain(
-                    im, (64, 64), method=Image.Resampling.LANCZOS
-                )
-                out = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-                out.alpha_composite(thumb, ((64 - thumb.width) // 2, (64 - thumb.height) // 2))
-            else:
-                out = ImageOps.fit(
-                    im,
-                    (64, 64),
-                    method=Image.Resampling.LANCZOS,
-                    centering=(0.5, 0.5),
-                )
+            thumb = ImageOps.contain(
+                im, (64, 64), method=Image.Resampling.LANCZOS
+            )
+            out = Image.new("RGBA", (64, 64), (0, 0, 0, 255))
+            out.alpha_composite(
+                thumb, ((64 - thumb.width) // 2, (64 - thumb.height) // 2)
+            )
             buf = BytesIO()
             out.save(buf, format="PNG", optimize=True)
             return buf.getvalue()
@@ -265,10 +259,8 @@ def fetch_and_normalize_story_image(row: Mapping[str, Any]) -> ProcessedImage:
             if "svg" in image_type.lower() or candidate.url.lower().endswith(".svg"):
                 last_error = "svg candidates are skipped"
                 continue
-            fit = "contain" if "icon" in candidate.kind else "cover"
             png = _normalize_image(
                 raw,
-                fit=fit,
                 max_pixels=int(settings.STORY_IMAGE_MAX_PIXELS),
             )
             digest = hashlib.sha256(png).hexdigest()
