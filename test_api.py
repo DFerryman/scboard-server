@@ -3992,6 +3992,187 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(third["evidence_cache"], "miss")
         self.assertEqual(agent.evidence_calls, 2)
 
+    def test_run_insights_once_reuses_unchanged_evidence_batches(self):
+        from . import insights
+
+        target = "2026-05-19"
+        target_start, _ = repository.digest_date_epoch_bounds(target)
+
+        class BatchCacheAgent:
+            def __init__(self):
+                self.evidence_calls = 0
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint):
+                return checkpoint, {}
+
+            def run_evidence(self, payload):
+                self.evidence_calls += 1
+                return {
+                    "evidenceCards": [
+                        {
+                            "topicKey": f"topic-{story['id']}",
+                            "topic": story["topicName"],
+                            "storyIds": [story["id"]],
+                            "synthesis": story["aiSummary"],
+                            "painPoints": ["pain"],
+                            "opportunityAngles": ["angle"],
+                            "debatePoints": ["debate"],
+                            "commentSignals": [
+                                item["text"] for item in story.get("comments", [])
+                            ],
+                        }
+                        for story in payload["stories"]
+                    ],
+                    "excludedStoryIds": [],
+                    "exclusionReasons": {},
+                    "coverage": {
+                        "inputStoryCount": len(payload["stories"]),
+                        "assignedStoryCount": len(payload["stories"]),
+                        "excludedStoryCount": 0,
+                    },
+                }
+
+            def run_topic_scout(self, payload):
+                return {
+                    "selectedTopics": [
+                        {
+                            "topicKey": card["topicKey"],
+                            "reason": "selected",
+                            "routes": ["signals", "opportunities", "debates"],
+                        }
+                        for card in payload["evidenceCards"]
+                    ],
+                    "excludedTopics": [],
+                }
+
+            def run_signals(self, _payload):
+                return {
+                    "headline": "headline",
+                    "summary": "summary",
+                    "signals": [
+                        {
+                            "id": f"s-{i}",
+                            "label": "模式",
+                            "title": f"signal {i}",
+                            "brief": "brief",
+                            "trend": "+0",
+                            "tone": "flat",
+                        }
+                        for i in range(3)
+                    ],
+                }
+
+            def run_opportunities(self, payload):
+                ids = [item["storyIds"][0] for item in payload["candidates"][:3]]
+                return {
+                    "opportunities": [
+                        {
+                            "rank": index + 1,
+                            "rankText": f"{index + 1:02d}",
+                            "title": f"opp {index}",
+                            "score": 80,
+                            "category": "tool",
+                            "audience": ["dev"],
+                            "thesis": "thesis",
+                            "whyNow": "now",
+                            "risk": "risk",
+                            "linkedStoryIds": [sid],
+                        }
+                        for index, sid in enumerate(ids)
+                    ]
+                }
+
+            def run_debates(self, _payload):
+                return {
+                    "debates": [
+                        {
+                            "topic": f"debate {index}",
+                            "verdict": "观察",
+                            "intensity": 50,
+                            "supportWidth": 50,
+                            "opposeWidth": 50,
+                            "support": "support",
+                            "oppose": "oppose",
+                            "watch": "watch",
+                        }
+                        for index in range(2)
+                    ]
+                }
+
+        old_caps = (
+            settings.INSIGHTS_EVIDENCE_MAX_STORIES,
+            settings.INSIGHTS_EVIDENCE_BATCH_STORIES,
+        )
+        try:
+            settings.INSIGHTS_EVIDENCE_MAX_STORIES = 10  # type: ignore[assignment]
+            settings.INSIGHTS_EVIDENCE_BATCH_STORIES = 2  # type: ignore[assignment]
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    for offset in range(10):
+                        self._insert_done_story(
+                            conn,
+                            1700 + offset,
+                            target_start + offset * 60,
+                            topic=self._fixed_topic(offset),
+                            score=140 + offset,
+                            descendants=70 + offset,
+                        )
+                    conn.execute(
+                        """
+                        INSERT INTO comments(id, story_id, text, rank, fetched_at)
+                        VALUES(?, ?, ?, ?, ?)
+                        """,
+                        (
+                            19700,
+                            1700,
+                            "stable comment evidence",
+                            0,
+                            repository.now_seconds(),
+                        ),
+                    )
+            finally:
+                conn.close()
+
+            agent = BatchCacheAgent()
+            first = insights.run_insights_once(date=target, force=True, ai_agent=agent)
+            first_calls = agent.evidence_calls
+            second = insights.run_insights_once(date=target, force=True, ai_agent=agent)
+
+            self.assertEqual(first["status"], "ok")
+            self.assertEqual(second["status"], "ok")
+            self.assertEqual(first["evidence_cache"], "miss")
+            self.assertEqual(second["evidence_cache"], "hit")
+            self.assertGreater(first_calls, 1)
+            self.assertEqual(agent.evidence_calls, first_calls)
+
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    conn.execute(
+                        "UPDATE comments SET text=? WHERE id=?",
+                        ("changed comment evidence", 19700),
+                    )
+            finally:
+                conn.close()
+
+            third = insights.run_insights_once(date=target, force=True, ai_agent=agent)
+            delta = agent.evidence_calls - first_calls
+            self.assertEqual(third["status"], "ok")
+            self.assertEqual(third["evidence_cache"], "partial")
+            self.assertGreater(delta, 0)
+            self.assertLess(delta, first_calls)
+            self.assertGreater(third["run_summary"]["evidence_cache_hits"], 0)
+            self.assertGreater(third["run_summary"]["evidence_cache_misses"], 0)
+        finally:
+            (
+                settings.INSIGHTS_EVIDENCE_MAX_STORIES,
+                settings.INSIGHTS_EVIDENCE_BATCH_STORIES,
+            ) = old_caps  # type: ignore[assignment]
+
     def test_run_insights_once_skips_when_material_fingerprint_is_unchanged(self):
         from . import insights
 
@@ -4157,6 +4338,184 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(second["run_summary"]["skip_reason"], "material_unchanged")
         self.assertEqual(agent.calls["evidence"], 1)
         self.assertEqual(agent.calls["topic_scout"], 1)
+        self.assertEqual(agent.calls["signals"], 1)
+        self.assertEqual(agent.calls["opportunities"], 1)
+        self.assertEqual(agent.calls["debates"], 1)
+
+    def test_run_insights_once_skips_final_agents_when_analysis_input_unchanged(self):
+        from . import insights
+
+        target = "2026-05-19"
+        target_start, _ = repository.digest_date_epoch_bounds(target)
+
+        class StableAnalysisAgent:
+            def __init__(self):
+                self.calls = {
+                    "evidence": 0,
+                    "topic_scout": 0,
+                    "signals": 0,
+                    "opportunities": 0,
+                    "debates": 0,
+                }
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint):
+                return checkpoint, {}
+
+            def run_evidence(self, payload):
+                self.calls["evidence"] += 1
+                return {
+                    "evidenceCards": [
+                        {
+                            "topicKey": f"topic-{story['id']}",
+                            "topic": story["topicName"],
+                            "storyIds": [story["id"]],
+                            "synthesis": story["aiSummary"],
+                            "painPoints": ["pain"],
+                            "opportunityAngles": ["angle"],
+                            "debatePoints": ["debate"],
+                            "commentSignals": [],
+                            "storySignals": [
+                                {
+                                    "storyId": story["id"],
+                                    "whyItMatters": "stable",
+                                    "distinctSignals": ["signal"],
+                                    "buyerSignals": ["buyer"],
+                                    "riskSignals": ["risk"],
+                                    "disagreementSignals": ["disagreement"],
+                                }
+                            ],
+                        }
+                        for story in payload["stories"]
+                    ],
+                    "excludedStoryIds": [],
+                    "exclusionReasons": {},
+                    "coverage": {
+                        "inputStoryCount": len(payload["stories"]),
+                        "assignedStoryCount": len(payload["stories"]),
+                        "excludedStoryCount": 0,
+                    },
+                }
+
+            def run_topic_scout(self, payload):
+                self.calls["topic_scout"] += 1
+                return {
+                    "selectedTopics": [
+                        {
+                            "topicKey": card["topicKey"],
+                            "reason": f"selected wording {self.calls['topic_scout']}",
+                            "routes": ["signals", "opportunities", "debates"],
+                        }
+                        for card in payload["evidenceCards"]
+                    ],
+                    "excludedTopics": [],
+                }
+
+            def run_signals(self, _payload):
+                self.calls["signals"] += 1
+                return {
+                    "headline": "headline",
+                    "summary": "summary",
+                    "signals": [
+                        {
+                            "id": f"s-{i}",
+                            "label": "模式",
+                            "title": f"signal {i}",
+                            "brief": "brief",
+                            "trend": "+0",
+                            "tone": "flat",
+                        }
+                        for i in range(3)
+                    ],
+                }
+
+            def run_opportunities(self, payload):
+                self.calls["opportunities"] += 1
+                ids = [item["storyIds"][0] for item in payload["candidates"][:3]]
+                return {
+                    "opportunities": [
+                        {
+                            "rank": index + 1,
+                            "rankText": f"{index + 1:02d}",
+                            "title": f"opp {index}",
+                            "score": 80,
+                            "category": "tool",
+                            "audience": ["dev"],
+                            "thesis": "thesis",
+                            "whyNow": "now",
+                            "risk": "risk",
+                            "linkedStoryIds": [sid],
+                        }
+                        for index, sid in enumerate(ids)
+                    ]
+                }
+
+            def run_debates(self, _payload):
+                self.calls["debates"] += 1
+                return {
+                    "debates": [
+                        {
+                            "topic": f"debate {index}",
+                            "verdict": "观察",
+                            "intensity": 50,
+                            "supportWidth": 50,
+                            "opposeWidth": 50,
+                            "support": "support",
+                            "oppose": "oppose",
+                            "watch": "watch",
+                        }
+                        for index in range(2)
+                    ]
+                }
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                for offset in range(10):
+                    self._insert_done_story(
+                        conn,
+                        1760 + offset,
+                        target_start + offset * 60,
+                        topic=self._fixed_topic(offset),
+                        score=120 + offset,
+                        descendants=60 + offset,
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO comments(id, story_id, text, rank, fetched_at)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (19760, 1760, "stable comment evidence", 0, repository.now_seconds()),
+                )
+        finally:
+            conn.close()
+
+        old_interval = settings.INSIGHTS_UPDATE_INTERVAL_SECONDS
+        try:
+            settings.INSIGHTS_UPDATE_INTERVAL_SECONDS = 0  # type: ignore[assignment]
+            agent = StableAnalysisAgent()
+            first = insights.run_insights_once(date=target, ai_agent=agent)
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    conn.execute(
+                        "UPDATE comments SET text=? WHERE id=?",
+                        ("changed but analysis-stable comment", 19760),
+                    )
+            finally:
+                conn.close()
+            second = insights.run_insights_once(date=target, ai_agent=agent)
+        finally:
+            settings.INSIGHTS_UPDATE_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
+
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(second["status"], "skipped")
+        self.assertEqual(second["reason"], "analysis_unchanged")
+        self.assertEqual(second["run_summary"]["skip_reason"], "analysis_unchanged")
+        self.assertGreaterEqual(agent.calls["evidence"], 2)
+        self.assertEqual(agent.calls["topic_scout"], 2)
         self.assertEqual(agent.calls["signals"], 1)
         self.assertEqual(agent.calls["opportunities"], 1)
         self.assertEqual(agent.calls["debates"], 1)
@@ -10505,6 +10864,53 @@ class CleanupBehavior(_SqliteCase):
         finally:
             conn.close()
         self.assertEqual(keys, ["fresh-cache"])
+
+    def test_cleanup_enforces_insight_evidence_cache_max_entries(self):
+        from .cleanup import run_cleanup_once
+
+        old_max_entries = settings.INSIGHTS_EVIDENCE_CACHE_MAX_ENTRIES
+        now = repository.now_seconds()
+        try:
+            settings.INSIGHTS_EVIDENCE_CACHE_MAX_ENTRIES = 2  # type: ignore[assignment]
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    repository.set_meta(
+                        conn,
+                        "last_full_fetch_at",
+                        str(now - settings.CLEANUP_STALE_GUARD_SECONDS - 10),
+                    )
+                    for index, key in enumerate(("cache-a", "cache-b", "cache-c")):
+                        ts = now + index
+                        conn.execute(
+                            """
+                            INSERT INTO insight_evidence_cache(
+                                cache_key, payload, story_count, created_at, updated_at
+                            ) VALUES(?, ?, ?, ?, ?)
+                            """,
+                            (key, "{}", 1, ts, ts),
+                        )
+            finally:
+                conn.close()
+
+            summary = run_cleanup_once()
+        finally:
+            settings.INSIGHTS_EVIDENCE_CACHE_MAX_ENTRIES = old_max_entries  # type: ignore[assignment]
+
+        self.assertTrue(summary["skipped"], summary)
+        self.assertEqual(summary["reason"], "fetcher_stale")
+        self.assertEqual(summary["insight_evidence_cache_deleted"], 1)
+        conn = db.connect()
+        try:
+            keys = [
+                row["cache_key"]
+                for row in conn.execute(
+                    "SELECT cache_key FROM insight_evidence_cache ORDER BY cache_key"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+        self.assertEqual(keys, ["cache-b", "cache-c"])
 
     def test_cleanup_respects_grace_and_protection(self):
         from .cleanup import run_cleanup_once

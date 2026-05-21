@@ -515,9 +515,18 @@ INSIGHTS_EVIDENCE_BATCH_STORIES = _require_int_range(
 )
 INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS = _require_int_range(
     "HNREADER_INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS",
-    _env_int("HNREADER_INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS", 14),
+    _env_int(
+        "HNREADER_INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS",
+        INSIGHTS_WINDOW_DAYS + 1,
+    ),
     min_value=0,
     max_value=3650,
+)
+INSIGHTS_EVIDENCE_CACHE_MAX_ENTRIES = _require_int_range(
+    "HNREADER_INSIGHTS_EVIDENCE_CACHE_MAX_ENTRIES",
+    _env_int("HNREADER_INSIGHTS_EVIDENCE_CACHE_MAX_ENTRIES", 512),
+    min_value=0,
+    max_value=100000,
 )
 
 # Keep the dynamic classification taxonomy broad enough to cover the product

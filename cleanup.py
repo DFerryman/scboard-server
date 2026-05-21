@@ -74,6 +74,11 @@ def run_cleanup_once() -> Dict[str, Any]:
                     conn, settings.INSIGHTS_EVIDENCE_CACHE_RETENTION_DAYS
                 )
             )
+            summary["insight_evidence_cache_deleted"] += (
+                repository.purge_insight_evidence_cache_over_limit(
+                    conn, settings.INSIGHTS_EVIDENCE_CACHE_MAX_ENTRIES
+                )
+            )
 
         last_full = repository.get_meta_int(conn, "last_full_fetch_at")
         now = repository.now_seconds()

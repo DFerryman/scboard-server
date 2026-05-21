@@ -2201,6 +2201,21 @@ def get_insight_evidence_cache(
     ).fetchone()
 
 
+def touch_insight_evidence_cache(
+    conn: sqlite3.Connection,
+    cache_key: str,
+    now: int,
+) -> None:
+    conn.execute(
+        """
+        UPDATE insight_evidence_cache
+        SET updated_at=?
+        WHERE cache_key=?
+        """,
+        (int(now), str(cache_key)),
+    )
+
+
 def upsert_insight_evidence_cache(
     conn: sqlite3.Connection,
     cache_key: str,
@@ -2237,6 +2252,31 @@ def purge_old_insight_evidence_cache(
     cursor = conn.execute(
         "DELETE FROM insight_evidence_cache WHERE updated_at < ?",
         (cutoff,),
+    )
+    return cursor.rowcount or 0
+
+
+def purge_insight_evidence_cache_over_limit(
+    conn: sqlite3.Connection,
+    max_entries: int,
+) -> int:
+    limit = int(max_entries)
+    if limit < 0:
+        limit = 0
+    if limit == 0:
+        cursor = conn.execute("DELETE FROM insight_evidence_cache")
+        return cursor.rowcount or 0
+    cursor = conn.execute(
+        """
+        DELETE FROM insight_evidence_cache
+        WHERE cache_key IN (
+            SELECT cache_key
+            FROM insight_evidence_cache
+            ORDER BY updated_at DESC, cache_key DESC
+            LIMIT -1 OFFSET ?
+        )
+        """,
+        (limit,),
     )
     return cursor.rowcount or 0
 
@@ -2777,8 +2817,10 @@ __all__ = [
     "upsert_insight",
     "insight_needs_update",
     "get_insight_evidence_cache",
+    "touch_insight_evidence_cache",
     "upsert_insight_evidence_cache",
     "purge_old_insight_evidence_cache",
+    "purge_insight_evidence_cache_over_limit",
     "candidate_rows_for_insights",
     "insight_feed_ranks_for_story_ids",
     "insight_comment_rows_for_story_ids",

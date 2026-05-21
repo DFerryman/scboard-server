@@ -639,6 +639,12 @@ def _load_cached_evidence(cache_key: str) -> Optional[Dict[str, Any]]:
     conn = db.connect()
     try:
         row = repository.get_insight_evidence_cache(conn, cache_key)
+        if row is not None:
+            repository.touch_insight_evidence_cache(
+                conn,
+                cache_key,
+                repository.now_seconds(),
+            )
     finally:
         conn.close()
     if row is None:
@@ -662,6 +668,10 @@ def _store_cached_evidence(
                 story_count,
                 repository.now_seconds(),
             )
+            repository.purge_insight_evidence_cache_over_limit(
+                conn,
+                settings.INSIGHTS_EVIDENCE_CACHE_MAX_ENTRIES,
+            )
     finally:
         conn.close()
 
@@ -669,6 +679,69 @@ def _store_cached_evidence(
 def _row_batches(rows: Sequence[Any], batch_size: int) -> List[Sequence[Any]]:
     size = max(1, int(batch_size))
     return [rows[index:index + size] for index in range(0, len(rows), size)]
+
+
+def _evidence_cache_bucket_count(row_count: int, batch_size: int) -> int:
+    count = max(0, int(row_count))
+    if count <= 0:
+        return 0
+    size = max(1, int(batch_size))
+    natural = max(1, (count + size - 1) // size)
+    configured = max(
+        1,
+        (int(settings.INSIGHTS_EVIDENCE_MAX_STORIES) + size - 1) // size,
+    )
+    # Small backfills should not fan out into many tiny AI calls, but once the
+    # evidence set is near production size keep bucket count stable across runs.
+    if count < configured * size // 2:
+        return natural
+    return min(count, configured)
+
+
+def _stable_story_bucket(story_id: int, bucket_count: int) -> int:
+    if bucket_count <= 1:
+        return 0
+    digest = hashlib.sha256(f"insights-evidence:{int(story_id)}".encode("utf-8"))
+    return int(digest.hexdigest()[:12], 16) % bucket_count
+
+
+def _stable_evidence_batches(
+    rows: Sequence[Any],
+    batch_size: int,
+) -> List[Sequence[Any]]:
+    bucket_count = _evidence_cache_bucket_count(len(rows), batch_size)
+    if bucket_count <= 0:
+        return []
+    buckets: List[List[Any]] = [[] for _ in range(bucket_count)]
+    for row in rows:
+        sid = int(row["id"])
+        buckets[_stable_story_bucket(sid, bucket_count)].append(row)
+
+    batches: List[Sequence[Any]] = []
+    for bucket in buckets:
+        if not bucket:
+            continue
+        ordered = sorted(bucket, key=lambda row: int(row["id"]))
+        batches.extend(_row_batches(ordered, batch_size))
+    return batches
+
+
+def _evidence_batch_cache_key(
+    *,
+    target_date: str,
+    start_date: str,
+    batch_rows: Sequence[Any],
+    feed_ranks: Mapping[int, Mapping[str, int]],
+    comments_by_story: Mapping[int, Sequence[Any]],
+) -> str:
+    fingerprint = _insights_material_fingerprint(
+        target_date=target_date,
+        start_date=start_date,
+        window_rows=batch_rows,
+        feed_ranks=feed_ranks,
+        comments_by_story=comments_by_story,
+    )
+    return f"insights:evidence-batch:v1:{target_date}:{fingerprint}"
 
 
 def _unique_topic_key(raw_key: Any, seen: set[str], fallback: str) -> str:
@@ -745,24 +818,45 @@ def _run_evidence_batches(
     start_date: str,
     feed_ranks: Mapping[int, Mapping[str, int]],
     comments_by_story: Mapping[int, Sequence[Any]],
-) -> Dict[str, Any]:
-    batches = _row_batches(
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    batches = _stable_evidence_batches(
         list(evidence_rows),
         settings.INSIGHTS_EVIDENCE_BATCH_STORIES,
     )
+    stats = {
+        "batches": len(batches),
+        "hits": 0,
+        "misses": 0,
+    }
     if not batches:
-        return {
-            "evidenceCards": [],
-            "excludedStoryIds": [],
-            "exclusionReasons": {},
-            "coverage": {
-                "inputStoryCount": 0,
-                "assignedStoryCount": 0,
-                "excludedStoryCount": 0,
+        return (
+            {
+                "evidenceCards": [],
+                "excludedStoryIds": [],
+                "exclusionReasons": {},
+                "coverage": {
+                    "inputStoryCount": 0,
+                    "assignedStoryCount": 0,
+                    "excludedStoryCount": 0,
+                },
             },
-        }
+            stats,
+        )
     outputs: List[Mapping[str, Any]] = []
     for batch_rows in batches:
+        cache_key = _evidence_batch_cache_key(
+            target_date=target_date,
+            start_date=start_date,
+            batch_rows=batch_rows,
+            feed_ranks=feed_ranks,
+            comments_by_story=comments_by_story,
+        )
+        cached = _load_cached_evidence(cache_key)
+        if cached is not None:
+            stats["hits"] += 1
+            outputs.append(cached)
+            continue
+
         payload = build_evidence_input(
             batch_rows,
             target_date=target_date,
@@ -770,10 +864,26 @@ def _run_evidence_batches(
             feed_ranks=feed_ranks,
             comments_by_story=comments_by_story,
         )
-        outputs.append(agent.run_evidence(payload))
+        output = agent.run_evidence(payload)
+        _store_cached_evidence(cache_key, output, len(batch_rows))
+        stats["misses"] += 1
+        outputs.append(output)
     if len(outputs) == 1:
-        return dict(outputs[0])
-    return _merge_evidence_outputs(outputs)
+        return dict(outputs[0]), stats
+    return _merge_evidence_outputs(outputs), stats
+
+
+def _evidence_cache_status(stats: Mapping[str, int]) -> str:
+    batches = int(stats.get("batches") or 0)
+    hits = int(stats.get("hits") or 0)
+    misses = int(stats.get("misses") or 0)
+    if batches <= 0:
+        return "empty"
+    if hits >= batches and misses == 0:
+        return "hit"
+    if hits == 0 and misses >= batches:
+        return "miss"
+    return "partial"
 
 
 def build_topic_scout_input(
@@ -1164,13 +1274,53 @@ def _comment_count(comments_by_story: Mapping[int, Sequence[Any]]) -> int:
     return sum(len(items) for items in comments_by_story.values())
 
 
+def _analysis_meta_key(target_date: str) -> str:
+    return f"insights:analysis_fingerprint:{target_date}"
+
+
+def _analysis_fingerprint_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _analysis_fingerprint_value(child)
+            for key, child in sorted(value.items(), key=lambda item: str(item[0]))
+            if str(key) not in ("previousInsight", "reason")
+        }
+    if isinstance(value, list):
+        return [_analysis_fingerprint_value(item) for item in value]
+    return value
+
+
+def _insights_analysis_fingerprint(
+    *,
+    target_date: str,
+    signals_input: Mapping[str, Any],
+    opportunities_input: Mapping[str, Any],
+    debates_input: Mapping[str, Any],
+) -> str:
+    hasher = hashlib.sha256()
+    _hash_update_json(
+        hasher,
+        {
+            "stage": "insights-analysis",
+            "schema": 1,
+            "date": target_date,
+            "signals": _analysis_fingerprint_value(signals_input),
+            "opportunities": _analysis_fingerprint_value(opportunities_input),
+            "debates": _analysis_fingerprint_value(debates_input),
+        },
+    )
+    return hasher.hexdigest()
+
+
 def _insights_run_summary(
     *,
     today_rows: Sequence[Any],
     evidence_rows: Sequence[Any],
     comments_by_story: Mapping[int, Sequence[Any]],
     material_fingerprint: str = "",
+    analysis_fingerprint: str = "",
     evidence_cache: str = "",
+    evidence_cache_stats: Optional[Mapping[str, int]] = None,
     topic_scout: Optional[Mapping[str, Any]] = None,
     skip_reason: str = "",
 ) -> Dict[str, Any]:
@@ -1181,8 +1331,14 @@ def _insights_run_summary(
     }
     if material_fingerprint:
         out["material_fingerprint"] = material_fingerprint
+    if analysis_fingerprint:
+        out["analysis_fingerprint"] = analysis_fingerprint
     if evidence_cache:
         out["evidence_cache"] = evidence_cache
+    if evidence_cache_stats:
+        out["evidence_cache_batches"] = int(evidence_cache_stats.get("batches") or 0)
+        out["evidence_cache_hits"] = int(evidence_cache_stats.get("hits") or 0)
+        out["evidence_cache_misses"] = int(evidence_cache_stats.get("misses") or 0)
     if topic_scout is not None:
         out["topic_scout_selected_count"] = len(topic_scout.get("selectedTopics") or [])
         out["topic_scout_excluded_count"] = len(topic_scout.get("excludedTopics") or [])
@@ -1401,28 +1557,18 @@ def run_insights_once(
                 "run_summary": summary,
             }
 
-        evidence_cache_key = f"insights:evidence:v4:{target_date}:{material_fingerprint}"
-
         agent = ai_agent or InsightsAgentRunner()
         usage_checkpoint = _usage_checkpoint(agent)
 
-        evidence_cache_status = "hit"
-        evidence_out = _load_cached_evidence(evidence_cache_key)
-        if evidence_out is None:
-            evidence_cache_status = "miss"
-            evidence_out = _run_evidence_batches(
-                agent,
-                evidence_rows,
-                target_date=target_date,
-                start_date=start_date,
-                feed_ranks=feed_ranks,
-                comments_by_story=comments_by_story,
-            )
-            _store_cached_evidence(
-                evidence_cache_key,
-                evidence_out,
-                len(evidence_rows),
-            )
+        evidence_out, evidence_cache_stats = _run_evidence_batches(
+            agent,
+            evidence_rows,
+            target_date=target_date,
+            start_date=start_date,
+            feed_ranks=feed_ranks,
+            comments_by_story=comments_by_story,
+        )
+        evidence_cache_status = _evidence_cache_status(evidence_cache_stats)
         story_refs = _story_refs_by_id(window_rows, feed_ranks)
         topic_scout_input = build_topic_scout_input(
             evidence_out,
@@ -1446,6 +1592,7 @@ def run_insights_once(
             comments_by_story=comments_by_story,
             material_fingerprint=material_fingerprint,
             evidence_cache=evidence_cache_status,
+            evidence_cache_stats=evidence_cache_stats,
             topic_scout=topic_scout_out,
         )
 
@@ -1476,6 +1623,44 @@ def run_insights_once(
                 "input_gaps": input_gaps,
                 "run_summary": skip_summary,
             }
+
+        analysis_fingerprint = _insights_analysis_fingerprint(
+            target_date=target_date,
+            signals_input=signals_input,
+            opportunities_input=opportunities_input,
+            debates_input=debates_input,
+        )
+        run_summary["analysis_fingerprint"] = analysis_fingerprint
+        if not force:
+            conn = db.connect()
+            try:
+                previous_analysis_fingerprint = repository.get_meta(
+                    conn,
+                    _analysis_meta_key(target_date),
+                )
+            finally:
+                conn.close()
+            if previous_analysis_fingerprint == analysis_fingerprint:
+                reason = "analysis_unchanged"
+                skip_summary = dict(run_summary)
+                skip_summary["skip_reason"] = reason
+                _finish_run_record(
+                    run_id=run_id,
+                    date=target_date,
+                    started_at=started_at,
+                    status="skipped",
+                    model_usage=_usage_since(agent, usage_checkpoint),
+                    summary=skip_summary,
+                    error=reason,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": reason,
+                    "date": target_date,
+                    "material_fingerprint": material_fingerprint,
+                    "analysis_fingerprint": analysis_fingerprint,
+                    "run_summary": skip_summary,
+                }
 
         signals_out = agent.run_signals(signals_input)
         opportunities_out = agent.run_opportunities(opportunities_input)
@@ -1523,6 +1708,11 @@ def run_insights_once(
                     model_usage=model_usage,
                     material_fingerprint=material_fingerprint,
                 )
+                repository.set_meta(
+                    conn,
+                    _analysis_meta_key(target_date),
+                    analysis_fingerprint,
+                )
                 if changed:
                     repository.bump_catalog_version(conn)
                 repository.record_insight_run(
@@ -1545,6 +1735,7 @@ def run_insights_once(
             "source_story_ids_count": len(set(source_story_ids)),
             "evidence_cache": evidence_cache_status,
             "material_fingerprint": material_fingerprint,
+            "analysis_fingerprint": analysis_fingerprint,
             "run_summary": run_summary or {},
             "agent_usage": model_usage or {},
         }

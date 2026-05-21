@@ -2752,6 +2752,7 @@ def _compact_insights_for_log(
             "source_story_ids_count",
             "evidence_cache",
             "material_fingerprint",
+            "analysis_fingerprint",
             "reason",
             "error",
         )
