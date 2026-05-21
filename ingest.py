@@ -2738,6 +2738,40 @@ def _compact_publish_for_log(
     return out
 
 
+def _compact_insights_for_log(
+    insights_summary: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(insights_summary, Mapping):
+        return None
+    out = {
+        key: insights_summary.get(key)
+        for key in (
+            "status",
+            "changed",
+            "date",
+            "source_story_ids_count",
+            "evidence_cache",
+            "material_fingerprint",
+            "reason",
+            "error",
+        )
+        if key in insights_summary
+    }
+    run_summary = insights_summary.get("run_summary")
+    if isinstance(run_summary, Mapping):
+        out["run_summary"] = dict(run_summary)
+    input_counts = insights_summary.get("input_counts")
+    if isinstance(input_counts, Mapping):
+        out["input_counts"] = dict(input_counts)
+    input_gaps = insights_summary.get("input_gaps")
+    if isinstance(input_gaps, Sequence) and not isinstance(input_gaps, (str, bytes)):
+        out["input_gaps"] = list(input_gaps)
+    agent_usage = insights_summary.get("agent_usage")
+    if isinstance(agent_usage, Mapping):
+        out["agent_usage"] = dict(agent_usage)
+    return out
+
+
 def _compact_round_summary_for_log(summary: Mapping[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "run_id": summary.get("run_id"),
@@ -2746,6 +2780,7 @@ def _compact_round_summary_for_log(summary: Mapping[str, Any]) -> Dict[str, Any]
         "fetch": summary.get("fetch"),
         "enrich": _compact_enrich_for_log(summary.get("enrich")),
         "digest": _compact_digest_for_log(summary.get("digest")),
+        "insights": _compact_insights_for_log(summary.get("insights")),
         "publish": _compact_publish_for_log(summary.get("publish")),
         "cleanup": summary.get("cleanup"),
         "discard": summary.get("discard"),
@@ -3077,7 +3112,6 @@ def run_ingest_round(
                 if ready_count > 0
                 else ("timeout" if timed_out else "failed")
             )
-            _finish_run(run_id, final_status, error=partial_error)
             _alert(
                 "enrich_timeout" if timed_out else "enrich_incomplete",
                 "HN ingest enrich timed out" if timed_out else "HN ingest enrich incomplete",
@@ -3104,6 +3138,7 @@ def run_ingest_round(
             summary["status"] = final_status
             summary["error"] = partial_error
             if final_status != "partial":
+                _finish_run(run_id, final_status, error=partial_error)
                 return summary
         elif ready_count <= 0:
             error = "publish produced no visible stories"
@@ -3130,7 +3165,6 @@ def run_ingest_round(
             summary["error"] = error
             return summary
         else:
-            _finish_run(run_id, "completed")
             summary["status"] = "completed"
 
         try:
@@ -3189,8 +3223,21 @@ def run_ingest_round(
         # stories (completed / partial). Failures are already swallowed and
         # recorded in the helper, so they do not affect the main ingest flow's status.
         if settings.CLOUD_SYNC_ENABLED and summary.get("status") in ("completed", "partial"):
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    repository.update_ingest_run(conn, run_id, phase="cloud_sync")
+            finally:
+                conn.close()
             summary["cloud_sync"] = _trigger_and_record_cloud_sync(
                 run_id, deadline_at=deadline_at
+            )
+
+        if summary.get("status") in ("completed", "partial"):
+            _finish_run(
+                run_id,
+                str(summary.get("status") or "completed"),
+                error=str(summary.get("error") or ""),
             )
 
         return summary

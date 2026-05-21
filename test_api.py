@@ -2009,6 +2009,89 @@ class FetcherBehavior(_SqliteCase):
 # ---------- Full ingest publish behavior ----------
 
 class IngestRoundBehavior(_SqliteCase):
+    def test_compact_round_summary_includes_insights(self):
+        compact = ingest_module._compact_round_summary_for_log(
+            {
+                "run_id": "round-with-insights",
+                "status": "completed",
+                "error": None,
+                "insights": {
+                    "status": "ok",
+                    "changed": True,
+                    "date": "2026-05-21",
+                    "source_story_ids_count": 21,
+                    "evidence_cache": "miss",
+                    "material_fingerprint": "abc",
+                    "run_summary": {"today_story_count": 120},
+                    "agent_usage": {"requests": 3, "total_tokens": 1234},
+                },
+            }
+        )
+
+        self.assertEqual(compact["insights"]["status"], "ok")
+        self.assertEqual(compact["insights"]["run_summary"]["today_story_count"], 120)
+        self.assertEqual(compact["insights"]["agent_usage"]["requests"], 3)
+
+    def test_successful_round_finishes_after_cloud_sync_phase(self):
+        from . import insights as insights_module
+
+        old_enabled = settings.CLOUD_SYNC_ENABLED
+        settings.CLOUD_SYNC_ENABLED = True  # type: ignore[assignment]
+        try:
+            client = _FakeHn(
+                {"top": [101], "new": [], "best": [], "ask": [], "show": [], "job": []},
+                {
+                    101: {
+                        "id": 101,
+                        "type": "story",
+                        "title": "Published",
+                        "url": "https://x/101",
+                        "by": "x",
+                        "score": 1,
+                        "descendants": 0,
+                        "time": int(time.time()),
+                    }
+                },
+            )
+            with patch.object(
+                insights_module,
+                "run_insights_once",
+                return_value={"status": "skipped", "reason": "test"},
+            ), patch.object(
+                ingest_module,
+                "_trigger_and_record_cloud_sync",
+                return_value={
+                    "status": "ok",
+                    "sync_version": 9,
+                    "elapsed_seconds": 1.0,
+                    "error": None,
+                },
+            ):
+                summary = run_ingest_round(
+                    run_id="finish-after-cloud-sync",
+                    client=client,
+                    ai_agent=FallbackAiAgent(),
+                    run_cleanup=False,
+                )
+        finally:
+            settings.CLOUD_SYNC_ENABLED = old_enabled  # type: ignore[assignment]
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["insights"]["status"], "skipped")
+        self.assertEqual(summary["cloud_sync"]["sync_version"], 9)
+
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT status, phase, finished_at FROM ingest_runs WHERE run_id=?",
+                ("finish-after-cloud-sync",),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["phase"], "cloud_sync")
+        self.assertIsNotNone(row["finished_at"])
+
     def test_cloud_sync_defers_when_round_deadline_is_close(self):
         from .ingest import _trigger_and_record_cloud_sync
 
@@ -7177,6 +7260,9 @@ class AiValidation(unittest.TestCase):
         prompt = ai_agent_module._SYSTEM_PROMPT
         self.assertIn("discussionThemes", prompt)
         self.assertIn("request-specific output budget guidance", prompt)
+        self.assertIn("Source coverage policy", prompt)
+        self.assertIn("Do not tell readers that input/source material was missing", prompt)
+        self.assertIn("输入未提供正文", prompt)
         self.assertNotIn("up to 4 discussion themes", prompt)
         self.assertNotIn("up to 3 representative comments", prompt)
         self.assertNotIn("~80-120 Chinese characters", prompt)
