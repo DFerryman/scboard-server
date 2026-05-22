@@ -4104,6 +4104,21 @@ class CloudSyncReadModel(_SqliteCase):
                     "UPDATE stories SET enriched_at=enriched_at + 60 WHERE id=?",
                     (700,),
                 )
+                conn.execute(
+                    """
+                    UPDATE stories
+                    SET score=score + 25, descendants=descendants + 5
+                    WHERE id=?
+                    """,
+                    (700,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO rankings(feed, rank, story_id, refreshed_at)
+                    VALUES(?, ?, ?, ?)
+                    """,
+                    ("top", 1, 700, repository.now_seconds()),
+                )
         finally:
             conn.close()
         second = insights.run_insights_once(date=target, force=True, ai_agent=agent)
@@ -4114,7 +4129,7 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(agent.evidence_calls, 1)
         self.assertEqual(
             first["run_summary"]["evidence_cache_key_version"],
-            "v2",
+            "v3",
         )
         self.assertIn("evidence_story_ids_hash", first["run_summary"])
         self.assertIn("evidence_payload_fingerprint", first["run_summary"])
@@ -4134,6 +4149,91 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(third["status"], "ok")
         self.assertEqual(third["evidence_cache"], "miss")
         self.assertEqual(agent.evidence_calls, 2)
+
+    def test_evidence_cache_fingerprint_tracks_semantic_input_not_rank_churn(self):
+        from . import insights
+
+        payload = {
+            "date": "2026-05-19",
+            "window": {"startDate": "2026-05-12", "endDate": "2026-05-19"},
+            "storyCount": 2,
+            "stories": [
+                {
+                    "id": 701,
+                    "kind": "story",
+                    "topic": "devtools",
+                    "topicName": "Developer Tools",
+                    "titleZh": "工具链更新",
+                    "titleEn": "Toolchain update",
+                    "domain": "example.com",
+                    "score": 180,
+                    "descendants": 72,
+                    "feedRanks": {"top": 4},
+                    "aiSummary": "A stable semantic summary.",
+                    "discussionThemes": ["release velocity"],
+                    "insights": ["teams are standardizing workflows"],
+                    "rawTextSnippet": "Full source material.",
+                    "comments": [
+                        {
+                            "by": "alice",
+                            "text": "The migration risk is mostly plugin compatibility.",
+                            "score": 3,
+                        }
+                    ],
+                },
+                {
+                    "id": 700,
+                    "kind": "story",
+                    "topic": "ai",
+                    "topicName": "AI",
+                    "titleZh": "模型更新",
+                    "titleEn": "Model update",
+                    "domain": "example.org",
+                    "score": 220,
+                    "descendants": 90,
+                    "feedRanks": {"best": 2},
+                    "aiSummary": "Another stable semantic summary.",
+                    "discussionThemes": ["latency"],
+                    "insights": ["teams care about cost controls"],
+                    "rawTextSnippet": "Another full source.",
+                    "comments": [
+                        {
+                            "by": "bob",
+                            "text": "The useful part is predictable batching.",
+                            "score": 5,
+                        }
+                    ],
+                },
+            ],
+        }
+
+        base = insights._insights_evidence_payload_fingerprint(payload)
+        rank_churn = json.loads(json.dumps(payload))
+        rank_churn["stories"] = list(reversed(rank_churn["stories"]))
+        rank_churn["stories"][0]["score"] += 100
+        rank_churn["stories"][0]["descendants"] += 20
+        rank_churn["stories"][0]["feedRanks"] = {"top": 1, "best": 1}
+        rank_churn["stories"][0]["comments"][0]["score"] += 10
+        self.assertEqual(
+            base,
+            insights._insights_evidence_payload_fingerprint(rank_churn),
+        )
+
+        changed_summary = json.loads(json.dumps(payload))
+        changed_summary["stories"][0]["aiSummary"] = "Changed semantic summary."
+        self.assertNotEqual(
+            base,
+            insights._insights_evidence_payload_fingerprint(changed_summary),
+        )
+
+        changed_comment = json.loads(json.dumps(payload))
+        changed_comment["stories"][0]["comments"][0]["text"] = (
+            "Changed comment evidence."
+        )
+        self.assertNotEqual(
+            base,
+            insights._insights_evidence_payload_fingerprint(changed_comment),
+        )
 
     def test_run_insights_once_reuses_unchanged_evidence_batches(self):
         from . import insights

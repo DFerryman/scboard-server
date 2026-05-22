@@ -42,7 +42,7 @@ SIGNALS_MIN_STORIES = 3
 OPPORTUNITY_MIN_CANDIDATES = 3
 DEBATE_MIN_CANDIDATES = 2
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_EVIDENCE_BATCH_CACHE_KEY_VERSION = "v2"
+_EVIDENCE_BATCH_CACHE_KEY_VERSION = "v3"
 _ACTIVE_INGEST_SKIP_REASON = "active_ingest"
 _NOVELTY_POLICY = {
     "previousInsightIsEvidence": False,
@@ -598,15 +598,57 @@ def _insights_evidence_cache_key(
     return f"insights:evidence:v4:{target_date}:{fingerprint}"
 
 
+def _evidence_cache_key_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return the stable semantic subset used for evidence batch cache keys.
+
+    The evidence prompt carries operational ranking signals so agents can weigh
+    current importance, but score/rank churn should not invalidate semantic
+    evidence extraction for an otherwise unchanged story batch.
+    """
+    stories: List[Dict[str, Any]] = []
+    for raw_story in payload.get("stories") or []:
+        if not isinstance(raw_story, Mapping):
+            continue
+        story: Dict[str, Any] = {
+            "id": raw_story.get("id"),
+            "kind": raw_story.get("kind") or "story",
+            "topic": raw_story.get("topic") or "",
+            "topicName": raw_story.get("topicName") or "",
+            "titleZh": raw_story.get("titleZh") or "",
+            "titleEn": raw_story.get("titleEn") or "",
+            "domain": raw_story.get("domain") or "",
+            "aiSummary": raw_story.get("aiSummary") or "",
+            "discussionThemes": raw_story.get("discussionThemes") or [],
+            "insights": raw_story.get("insights") or [],
+            "rawTextSnippet": raw_story.get("rawTextSnippet") or "",
+            "comments": [
+                {
+                    "by": comment.get("by") or "",
+                    "text": comment.get("text") or "",
+                }
+                for comment in raw_story.get("comments") or []
+                if isinstance(comment, Mapping)
+            ],
+        }
+        stories.append(story)
+
+    stories.sort(key=lambda story: int(story.get("id") or 0))
+    return {
+        "date": payload.get("date") or "",
+        "window": payload.get("window") or {},
+        "stories": stories,
+    }
+
+
 def _insights_evidence_payload_fingerprint(payload: Mapping[str, Any]) -> str:
     hasher = hashlib.sha256()
     _hash_update_json(
         hasher,
         {
-            "stage": "insights-evidence-payload",
-            "schema": 1,
+            "stage": "insights-evidence-cache-payload",
+            "schema": 2,
             "cacheKeyVersion": _EVIDENCE_BATCH_CACHE_KEY_VERSION,
-            "payload": payload,
+            "payload": _evidence_cache_key_payload(payload),
         },
     )
     return hasher.hexdigest()
