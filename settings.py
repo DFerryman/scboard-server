@@ -248,7 +248,7 @@ def _require_timezone(name: str, value: str) -> str:
 FEED_WINDOW_SIZE = _require_int_range(
     "HNREADER_FEED_WINDOW_SIZE",
     _env_int(
-        "HNREADER_FEED_WINDOW_SIZE", 100, fallback="HACKERMINI_FEED_WINDOW_SIZE"
+        "HNREADER_FEED_WINDOW_SIZE", 200, fallback="HACKERMINI_FEED_WINDOW_SIZE"
     ),
     min_value=1,
     max_value=500,
@@ -261,7 +261,7 @@ STORY_STORE_MAX_ROWS = _require_int_range(
     "HNREADER_STORY_STORE_MAX_ROWS",
     _env_int(
         "HNREADER_STORY_STORE_MAX_ROWS",
-        1000,
+        2000,
         fallback="HACKERMINI_STORY_STORE_MAX_ROWS",
     ),
     min_value=1,
@@ -465,7 +465,7 @@ def _default_insights_update_interval_seconds() -> int:
 INSIGHTS_ENABLED = _env_bool("HNREADER_INSIGHTS_ENABLED", True)
 INSIGHTS_WINDOW_DAYS = _require_int_range(
     "HNREADER_INSIGHTS_WINDOW_DAYS",
-    _env_int("HNREADER_INSIGHTS_WINDOW_DAYS", 7),
+    _env_int("HNREADER_INSIGHTS_WINDOW_DAYS", 3),
     min_value=1,
     max_value=14,
 )
@@ -486,7 +486,7 @@ INSIGHTS_MIN_TODAY_STORIES = _require_int_range(
 )
 INSIGHTS_MAX_TODAY_STORIES = _require_int_range(
     "HNREADER_INSIGHTS_MAX_TODAY_STORIES",
-    _env_int("HNREADER_INSIGHTS_MAX_TODAY_STORIES", 120),
+    _env_int("HNREADER_INSIGHTS_MAX_TODAY_STORIES", 160),
     min_value=1,
     max_value=1000,
 )

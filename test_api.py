@@ -987,7 +987,19 @@ class SettingsValidation(unittest.TestCase):
             launcher,
         )
         self.assertIn(
-            'HNREADER_INSIGHTS_MAX_TODAY_STORIES="${HNREADER_INSIGHTS_MAX_TODAY_STORIES:-120}"',
+            'HNREADER_INSIGHTS_MAX_TODAY_STORIES="${HNREADER_INSIGHTS_MAX_TODAY_STORIES:-160}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_INSIGHTS_WINDOW_DAYS="${HNREADER_INSIGHTS_WINDOW_DAYS:-3}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_FEED_WINDOW_SIZE="${HNREADER_FEED_WINDOW_SIZE:-200}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_STORY_STORE_MAX_ROWS="${HNREADER_STORY_STORE_MAX_ROWS:-2000}"',
             launcher,
         )
 
@@ -3398,6 +3410,12 @@ class CloudSyncReadModel(_SqliteCase):
             debates_input["previousInsight"]["items"][0]["topic"],
             "old debate",
         )
+        for payload in (signals_input, opportunities_input, debates_input):
+            self.assertEqual(
+                payload["noveltyPolicy"]["previousInsightIsEvidence"],
+                False,
+            )
+            self.assertEqual(payload["noveltyPolicy"]["preferTodayEvidence"], True)
 
     def test_insights_system_prompts_encode_product_brief_shape(self):
         from . import insights_agents
@@ -3419,9 +3437,10 @@ class CloudSyncReadModel(_SqliteCase):
             insights_agents.DEBATE_SYSTEM_PROMPT,
         )
         self.assertIn(
-            "paraphrase-only update",
+            "anti-duplication context",
             insights_agents.TODAY_SIGNALS_SYSTEM_PROMPT,
         )
+        self.assertIn("novelty", insights_agents.TOPIC_SCOUT_SYSTEM_PROMPT)
         self.assertIn("storySignals", insights_agents.EVIDENCE_SYSTEM_PROMPT)
         self.assertIn("compact metrics", insights_agents.TOPIC_SCOUT_SYSTEM_PROMPT)
         self.assertIn(
@@ -5291,7 +5310,7 @@ class CloudSyncReadModel(_SqliteCase):
 
         summary = insights.run_insights_once(date=target, force=True, ai_agent=OldIdAgent())
         self.assertEqual(summary["status"], "failed")
-        self.assertIn("outside 7-day window", summary["error"])
+        self.assertIn("outside insights window", summary["error"])
         conn = db.connect()
         try:
             self.assertIsNone(repository.get_insight_row(conn, target))

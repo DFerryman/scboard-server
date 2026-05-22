@@ -44,6 +44,11 @@ DEBATE_MIN_CANDIDATES = 2
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _EVIDENCE_BATCH_CACHE_KEY_VERSION = "v2"
 _ACTIVE_INGEST_SKIP_REASON = "active_ingest"
+_NOVELTY_POLICY = {
+    "previousInsightIsEvidence": False,
+    "preferTodayEvidence": True,
+    "repeatOnlyWithFreshStorySignals": True,
+}
 
 
 def _elapsed_seconds(started: float) -> float:
@@ -932,6 +937,7 @@ def build_topic_scout_input(
     *,
     target_date: str,
     story_refs: Optional[Mapping[int, Mapping[str, Any]]] = None,
+    previous_insight: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     _target_start, target_end_ts = repository.digest_date_epoch_bounds(target_date)
     refs = story_refs or {}
@@ -946,12 +952,16 @@ def build_topic_scout_input(
             target_end_ts=target_end_ts,
         )
         cards.append(card)
-    return {
+    payload: Dict[str, Any] = {
         "date": target_date,
+        "noveltyPolicy": dict(_NOVELTY_POLICY),
         "evidenceCoverage": evidence.get("coverage") or {},
         "evidenceCards": cards,
         "excludedStoryIds": evidence.get("excludedStoryIds") or [],
     }
+    if previous_insight:
+        payload["previousInsight"] = previous_insight
+    return payload
 
 
 def _selected_routes(scout: Mapping[str, Any]) -> Dict[str, List[str]]:
@@ -1074,6 +1084,7 @@ def build_routed_insights_inputs(
     compact_scout = _scout_summary(scout)
     signals_input = {
         "date": target_date,
+        "noveltyPolicy": dict(_NOVELTY_POLICY),
         "topicSummary": _build_today_topic_summary(today_rows),
         "topicScout": compact_scout,
         "evidenceCards": _cards_for_route(
@@ -1086,6 +1097,7 @@ def build_routed_insights_inputs(
     if previous_insight:
         signals_input["previousInsight"] = previous_insight.get("signals") or {}
     opportunities_input = {
+        "noveltyPolicy": dict(_NOVELTY_POLICY),
         "topicScout": compact_scout,
         "candidates": _cards_for_route(
             cards,
@@ -1099,6 +1111,7 @@ def build_routed_insights_inputs(
             previous_insight.get("opportunities") or {}
         )
     debates_input = {
+        "noveltyPolicy": dict(_NOVELTY_POLICY),
         "topicScout": compact_scout,
         "candidates": _cards_for_route(
             cards,
@@ -1296,7 +1309,7 @@ def _validate_final_payload(payload: Mapping[str, Any], allowed_story_ids: Seque
     allowed = {int(sid) for sid in allowed_story_ids}
     for sid in _collect_story_reference_ids(payload):
         if int(sid) not in allowed:
-            raise InsightsValidationError(f"linkedStoryId {sid} outside 7-day window")
+            raise InsightsValidationError(f"linkedStoryId {sid} outside insights window")
     if contains_forbidden_words(payload):
         raise InsightsValidationError("insights payload contains forbidden words")
 
@@ -1804,6 +1817,7 @@ def run_insights_once(
             evidence_out,
             target_date=target_date,
             story_refs=story_refs,
+            previous_insight=previous_insight,
         )
         stage_timings["topic_scout_input_seconds"] = _elapsed_seconds(routing_started)
         topic_scout_started = time.monotonic()
