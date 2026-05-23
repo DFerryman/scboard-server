@@ -2696,6 +2696,48 @@ class CloudSyncReadModel(_SqliteCase):
         finally:
             conn.close()
 
+    def test_fresh_material_reason_detects_new_high_signal_today_rows(self):
+        from . import insights
+
+        target = "2026-05-19"
+        start, _ = repository.digest_date_epoch_bounds(target)
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.upsert_insight(
+                    conn,
+                    target,
+                    {"headline": "existing"},
+                    [101],
+                    1_000,
+                    3,
+                )
+                for offset in range(settings.INSIGHTS_FRESH_MATERIAL_MIN_STORIES):
+                    self._insert_done_story(
+                        conn,
+                        5000 + offset,
+                        start + offset * 60,
+                        score=settings.INSIGHTS_FRESH_MATERIAL_MIN_SCORE,
+                        descendants=0,
+                    )
+                    conn.execute(
+                        "UPDATE stories SET last_seen_at=? WHERE id=?",
+                        (1_100 + offset, 5000 + offset),
+                    )
+                row = repository.get_insight_row(conn, target)
+                today_rows = repository.candidate_rows_for_insights(
+                    conn,
+                    start_ts=start,
+                    end_ts=start + 86400,
+                )
+        finally:
+            conn.close()
+
+        self.assertIn(
+            "fresh_high_signal_stories",
+            insights._fresh_material_update_reason(row, today_rows),
+        )
+
     def test_opportunity_and_debate_inputs_do_not_backfill_low_signal_windows(self):
         from . import insights
 
@@ -3072,19 +3114,30 @@ class CloudSyncReadModel(_SqliteCase):
             {
                 "version",
                 "date",
+                "dateKey",
                 "asOf",
                 "asOfLabel",
                 "generatedAt",
                 "window",
+                "windowDays",
                 "access",
                 "headline",
                 "summary",
+                "todaySourceStoryIdsCount",
+                "priorWindowStoryIdsCount",
+                "topicDistribution",
                 "stats",
                 "signals",
                 "opportunities",
                 "debates",
+                "noveltyScore",
+                "repeatedFrames",
+                "newEvidenceReason",
+                "contentChangedReason",
             },
         )
+        self.assertEqual(payload["window"], "72h")
+        self.assertEqual(payload["windowDays"], 3)
 
     def test_insights_agent_inputs_are_minimal_by_section(self):
         from . import insights
@@ -3395,6 +3448,15 @@ class CloudSyncReadModel(_SqliteCase):
                     "opportunities": {"items": [{"title": "old opportunity"}]},
                     "debates": {"items": [{"topic": "old debate"}]},
                 },
+                recent_insights=[
+                    {
+                        "date": "2026-05-18",
+                        "headline": "recent headline",
+                        "signals": {"items": [{"title": "recent signal"}]},
+                        "opportunities": {"items": [{"title": "recent opportunity"}]},
+                        "debates": {"items": [{"topic": "recent debate"}]},
+                    }
+                ],
             )
         )
 
@@ -3410,12 +3472,98 @@ class CloudSyncReadModel(_SqliteCase):
             debates_input["previousInsight"]["items"][0]["topic"],
             "old debate",
         )
+        self.assertEqual(
+            signals_input["recentInsights"][0]["headline"],
+            "recent headline",
+        )
+        self.assertEqual(
+            opportunities_input["recentInsights"][0]["opportunities"]["items"][0]["title"],
+            "recent opportunity",
+        )
+        self.assertEqual(
+            debates_input["recentInsights"][0]["debates"]["items"][0]["topic"],
+            "recent debate",
+        )
         for payload in (signals_input, opportunities_input, debates_input):
             self.assertEqual(
                 payload["noveltyPolicy"]["previousInsightIsEvidence"],
                 False,
             )
             self.assertEqual(payload["noveltyPolicy"]["preferTodayEvidence"], True)
+            self.assertEqual(payload["noveltyPolicy"]["recentInsightsAreEvidence"], False)
+
+    def test_topic_scout_input_includes_recent_insights_context(self):
+        from . import insights
+
+        payload = insights.build_topic_scout_input(
+            {
+                "coverage": {},
+                "evidenceCards": [
+                    {"topicKey": "ai", "topic": "AI", "storyIds": [101]},
+                ],
+            },
+            target_date="2026-05-19",
+            story_refs={
+                101: {
+                    "id": 101,
+                    "score": 10,
+                    "descendants": 2,
+                    "time": repository.digest_date_epoch_bounds("2026-05-19")[0],
+                    "isToday": True,
+                    "feedRanks": {},
+                }
+            },
+            recent_insights=[{"date": "2026-05-18", "headline": "old"}],
+        )
+
+        self.assertEqual(payload["recentInsights"][0]["date"], "2026-05-18")
+
+    def test_prior_window_links_prefer_today_story_from_same_evidence_card(self):
+        from . import insights
+
+        opportunities = insights._prefer_today_linked_story_ids(
+            [
+                {
+                    "title": "old linked",
+                    "linkedStoryIds": [101],
+                }
+            ],
+            [
+                {
+                    "storyIds": [101, 201],
+                    "todayStoryIds": [201],
+                }
+            ],
+        )
+
+        self.assertEqual(opportunities[0]["linkedStoryIds"], [201])
+
+    def test_novelty_gate_marks_repeated_recent_frames(self):
+        from . import insights
+
+        novelty = insights._evaluate_novelty(
+            {
+                "headline": "AI search trust is becoming a procurement issue",
+                "summary": "AI search trust is becoming a procurement issue",
+                "signals": [],
+                "opportunities": [],
+                "debates": [],
+            },
+            [
+                {
+                    "date": "2026-05-18",
+                    "headline": "AI search trust is becoming a procurement issue",
+                    "summary": "AI search trust is becoming a procurement issue",
+                    "signals": {"items": []},
+                    "opportunities": {"items": []},
+                    "debates": {"items": []},
+                }
+            ],
+        )
+
+        self.assertFalse(novelty["contentChanged"])
+        self.assertLess(novelty["noveltyScore"], settings.INSIGHTS_NOVELTY_MIN_SCORE)
+        self.assertEqual(novelty["repeatedFrames"][0]["matchedDate"], "2026-05-18")
 
     def test_insights_system_prompts_encode_product_brief_shape(self):
         from . import insights_agents
@@ -5746,11 +5894,27 @@ class CloudSyncReadModel(_SqliteCase):
                 if changed_again:
                     repository.bump_catalog_version(conn)
                 v2 = repository.get_catalog_version(conn)
+                changed_source_only = repository.upsert_insight(
+                    conn,
+                    "2026-05-19",
+                    payload_with_new_generated_at,
+                    [101, 102],
+                    3,
+                    7,
+                )
+                if changed_source_only:
+                    repository.bump_catalog_version(conn)
+                v3 = repository.get_catalog_version(conn)
+                row = repository.get_insight_row(conn, "2026-05-19")
         finally:
             conn.close()
         self.assertNotEqual(v0, v1)
         self.assertFalse(changed_again)
         self.assertEqual(v1, v2)
+        self.assertFalse(changed_source_only)
+        self.assertEqual(v2, v3)
+        self.assertEqual(json.loads(row["source_story_ids"]), [101, 102])
+        self.assertEqual(row["content_changed_at"], 1)
 
     def test_build_read_model_writes_versioned_insights(self):
         from . import cloud_sync
@@ -5786,9 +5950,69 @@ class CloudSyncReadModel(_SqliteCase):
             if line.strip()
         ]
         self.assertEqual(stats["insights"], 1)
+        self.assertEqual(stats["insightsContentChanged"], 1)
         self.assertEqual(docs[0]["_id"], "7:2026-05-19")
         self.assertEqual(docs[0]["syncVersion"], 7)
+        self.assertEqual(docs[0]["dateKey"], "2026-05-19")
         self.assertEqual(docs[0]["headline"], "判断")
+
+    def test_build_read_model_counts_insight_content_changes_since_last_push(self):
+        from . import cloud_sync
+
+        payload = {
+            "version": 1,
+            "date": "2026-05-19",
+            "headline": "判断一",
+            "summary": "摘要",
+            "signals": [],
+            "opportunities": [],
+            "debates": [],
+        }
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "catalog_version", "7")
+                repository.upsert_insight(conn, "2026-05-19", payload, [101], 100, 3)
+                conn.execute(
+                    """
+                    INSERT INTO cloud_sync_runs(
+                        run_id, started_at, finished_at, status, sync_version
+                    ) VALUES('pushed', 190, 200, 'ok', 6)
+                    """
+                )
+        finally:
+            conn.close()
+
+        out_dir = Path(self.tmpdir) / "insights-content-count"
+        stats = cloud_sync.build_read_model(out_dir, include_dashboard=False)
+        meta = json.loads((out_dir / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(stats["insights"], 1)
+        self.assertEqual(stats["insightsContentChanged"], 0)
+        self.assertEqual(meta["insightsUploaded"], 1)
+        self.assertEqual(meta["insightsContentChanged"], 0)
+
+        changed_payload = dict(payload)
+        changed_payload["headline"] = "判断二"
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "catalog_version", "8")
+                self.assertTrue(
+                    repository.upsert_insight(
+                        conn,
+                        "2026-05-19",
+                        changed_payload,
+                        [101],
+                        250,
+                        3,
+                    )
+                )
+        finally:
+            conn.close()
+
+        out_dir2 = Path(self.tmpdir) / "insights-content-count-2"
+        stats2 = cloud_sync.build_read_model(out_dir2, include_dashboard=False)
+        self.assertEqual(stats2["insightsContentChanged"], 1)
 
     def test_build_read_model_excludes_raw_or_placeholder_ai_output(self):
         from . import cloud_sync
@@ -15821,6 +16045,7 @@ class CloudSyncCleanupStatusObservability(_SqliteCase):
             status="ok",
             sync_version=12,
             push_stats={"stories": 4, "topics": 1, "digests": 1,
+                        "insights": 5, "insightsContentChanged": 1,
                         "cleanup": {"ok": True, "removed": 0}},
             elapsed_seconds=10.0,
             error=None,
@@ -15828,6 +16053,8 @@ class CloudSyncCleanupStatusObservability(_SqliteCase):
         row = self._read_row()
         self.assertEqual(row["status"], "ok")
         self.assertEqual(row["cleanup_status"], "ok")
+        self.assertEqual(row["insights"], 5)
+        self.assertEqual(row["insights_content_changed"], 1)
 
     def test_write_cloud_sync_run_persists_cleanup_failed_reason(self):
         ingest_module._write_cloud_sync_run(
@@ -16262,10 +16489,10 @@ class CloudSyncCleanupStatusObservability(_SqliteCase):
                 r[1] for r in conn.execute("PRAGMA table_info(insights_runs)")
             ]
             row = conn.execute(
-                "SELECT cleanup_status FROM cloud_sync_runs WHERE run_id='legacy'"
+                "SELECT cleanup_status, insights_content_changed FROM cloud_sync_runs WHERE run_id='legacy'"
             ).fetchone()
             insight_row = conn.execute(
-                "SELECT material_fingerprint FROM insights WHERE date='2026-05-19'"
+                "SELECT material_fingerprint, content_changed_at FROM insights WHERE date='2026-05-19'"
             ).fetchone()
             insight_run_row = conn.execute(
                 "SELECT summary FROM insights_runs WHERE run_id='legacy-insights'"
@@ -16273,12 +16500,16 @@ class CloudSyncCleanupStatusObservability(_SqliteCase):
         finally:
             conn.close()
         self.assertIn("cleanup_status", cols)
+        self.assertIn("insights_content_changed", cols)
+        self.assertIn("content_changed_at", insight_cols)
         self.assertIn("material_fingerprint", insight_cols)
         self.assertIn("summary", insight_run_cols)
         # Existing rows must keep cleanup_status NULL — the migration must
         # not back-fill anything for runs that predate the column.
         self.assertIsNone(row["cleanup_status"])
+        self.assertIsNone(row["insights_content_changed"])
         self.assertEqual(insight_row["material_fingerprint"], "")
+        self.assertEqual(insight_row["content_changed_at"], 0)
         self.assertIsNone(insight_run_row["summary"])
 
 

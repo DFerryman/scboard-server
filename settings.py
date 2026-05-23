@@ -540,6 +540,36 @@ INSIGHTS_EVIDENCE_CACHE_MAX_ENTRIES = _require_int_range(
     min_value=0,
     max_value=100000,
 )
+INSIGHTS_RECENT_CONTEXT_DAYS = _require_int_range(
+    "HNREADER_INSIGHTS_RECENT_CONTEXT_DAYS",
+    _env_int("HNREADER_INSIGHTS_RECENT_CONTEXT_DAYS", 7),
+    min_value=0,
+    max_value=30,
+)
+INSIGHTS_NOVELTY_MIN_SCORE = _require_int_range(
+    "HNREADER_INSIGHTS_NOVELTY_MIN_SCORE",
+    _env_int("HNREADER_INSIGHTS_NOVELTY_MIN_SCORE", 25),
+    min_value=0,
+    max_value=100,
+)
+INSIGHTS_FRESH_MATERIAL_MIN_STORIES = _require_int_range(
+    "HNREADER_INSIGHTS_FRESH_MATERIAL_MIN_STORIES",
+    _env_int("HNREADER_INSIGHTS_FRESH_MATERIAL_MIN_STORIES", 8),
+    min_value=1,
+    max_value=500,
+)
+INSIGHTS_FRESH_MATERIAL_MIN_SCORE = _require_int_range(
+    "HNREADER_INSIGHTS_FRESH_MATERIAL_MIN_SCORE",
+    _env_int("HNREADER_INSIGHTS_FRESH_MATERIAL_MIN_SCORE", 100),
+    min_value=0,
+    max_value=100000,
+)
+INSIGHTS_FRESH_MATERIAL_MIN_DESCENDANTS = _require_int_range(
+    "HNREADER_INSIGHTS_FRESH_MATERIAL_MIN_DESCENDANTS",
+    _env_int("HNREADER_INSIGHTS_FRESH_MATERIAL_MIN_DESCENDANTS", 40),
+    min_value=0,
+    max_value=100000,
+)
 
 # Keep the dynamic classification taxonomy broad enough to cover the product
 # surface without letting one-off story topics proliferate.

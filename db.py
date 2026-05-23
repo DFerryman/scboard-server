@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS insights (
   payload TEXT NOT NULL DEFAULT '{}',
   source_story_ids TEXT NOT NULL DEFAULT '[]',
   generated_at INTEGER NOT NULL,
+  content_changed_at INTEGER NOT NULL DEFAULT 0,
   window_days INTEGER NOT NULL DEFAULT 7,
   material_fingerprint TEXT NOT NULL DEFAULT '',
   model_usage TEXT
@@ -216,6 +217,7 @@ CREATE TABLE IF NOT EXISTS cloud_sync_runs (
   topics INTEGER,
   digests INTEGER,
   insights INTEGER,
+  insights_content_changed INTEGER,
   elapsed_seconds REAL,
   error TEXT,
   -- cleanupOld is the best-effort stage at the end of push_read_model; when it
@@ -345,12 +347,19 @@ INGEST_RUN_COLUMN_MIGRATIONS = {
 
 CLOUD_SYNC_RUN_COLUMN_MIGRATIONS = {
     "insights": "ALTER TABLE cloud_sync_runs ADD COLUMN insights INTEGER",
+    "insights_content_changed": (
+        "ALTER TABLE cloud_sync_runs ADD COLUMN insights_content_changed INTEGER"
+    ),
     "cleanup_status": (
         "ALTER TABLE cloud_sync_runs ADD COLUMN cleanup_status TEXT"
     ),
 }
 
 INSIGHT_COLUMN_MIGRATIONS = {
+    "content_changed_at": (
+        "ALTER TABLE insights ADD COLUMN "
+        "content_changed_at INTEGER NOT NULL DEFAULT 0"
+    ),
     "material_fingerprint": (
         "ALTER TABLE insights ADD COLUMN "
         "material_fingerprint TEXT NOT NULL DEFAULT ''"

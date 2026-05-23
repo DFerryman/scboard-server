@@ -2386,9 +2386,30 @@ def _stable_json_dumps(value: Any) -> str:
 def _publishable_payload_for_change(value: Any) -> dict:
     if not isinstance(value, dict):
         return {}
-    out = dict(value)
-    out.pop("generatedAt", None)
-    return out
+    return {
+        "headline": value.get("headline") or "",
+        "summary": value.get("summary") or "",
+        "signals": value.get("signals") or [],
+        "opportunities": [
+            {
+                key: item.get(key)
+                for key in (
+                    "rank",
+                    "rankText",
+                    "title",
+                    "score",
+                    "category",
+                    "audience",
+                    "thesis",
+                    "whyNow",
+                    "risk",
+                )
+            }
+            for item in value.get("opportunities") or []
+            if isinstance(item, dict)
+        ],
+        "debates": value.get("debates") or [],
+    }
 
 
 def _decode_payload_for_change(value: Any) -> dict:
@@ -2444,7 +2465,7 @@ def upsert_insight(
     )
     existing = conn.execute(
         """
-        SELECT payload, source_story_ids, window_days
+        SELECT payload, source_story_ids, generated_at, content_changed_at, window_days
         FROM insights
         WHERE date=?
         """,
@@ -2455,19 +2476,26 @@ def upsert_insight(
         and _stable_json_dumps(
             _decode_payload_for_change(existing["payload"])
         ) == encoded_payload_for_change
-        and (existing["source_story_ids"] or "[]") == encoded_source_ids
         and int(existing["window_days"] or 0) == int(window_days)
     )
+    existing_changed_at = 0
+    if existing is not None:
+        try:
+            existing_changed_at = int(existing["content_changed_at"] or 0)
+        except (IndexError, KeyError, TypeError, ValueError):
+            existing_changed_at = int(existing["generated_at"] or 0)
+    content_changed_at = int(generated_at) if changed else existing_changed_at
     conn.execute(
         """
         INSERT INTO insights(
-            date, payload, source_story_ids, generated_at, window_days,
+            date, payload, source_story_ids, generated_at, content_changed_at, window_days,
             material_fingerprint, model_usage
-        ) VALUES(?, ?, ?, ?, ?, ?, ?)
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(date) DO UPDATE SET
             payload=excluded.payload,
             source_story_ids=excluded.source_story_ids,
             generated_at=excluded.generated_at,
+            content_changed_at=excluded.content_changed_at,
             window_days=excluded.window_days,
             material_fingerprint=excluded.material_fingerprint,
             model_usage=excluded.model_usage
@@ -2477,12 +2505,32 @@ def upsert_insight(
             encoded_payload,
             encoded_source_ids,
             int(generated_at),
+            int(content_changed_at),
             int(window_days),
             str(material_fingerprint or ""),
             encoded_usage,
         ),
     )
     return changed
+
+
+def recent_insight_rows_before(
+    conn: sqlite3.Connection,
+    date: str,
+    *,
+    limit: int,
+) -> List[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM insights
+        WHERE date < ?
+        ORDER BY date DESC
+        LIMIT ?
+        """,
+        (date, max(1, int(limit))),
+    ).fetchall()
+    return list(rows)
 
 
 def insight_needs_update(
@@ -3171,6 +3219,7 @@ __all__ = [
     "upsert_digest",
     "get_insight_row",
     "list_insight_rows",
+    "recent_insight_rows_before",
     "upsert_insight",
     "insight_needs_update",
     "get_insight_evidence_cache",

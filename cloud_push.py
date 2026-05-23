@@ -961,6 +961,7 @@ def push_read_model(
     insights = _load_required_jsonl(out_dir / "insights.jsonl")
     current_version = int(meta["currentVersion"])
     previous_version = meta.get("previousVersion")
+    insights_content_changed = int(meta.get("insightsContentChanged") or 0)
     _validate_versioned_docs("stories", stories, current_version)
     _validate_versioned_docs("topics", topics, current_version)
     _validate_versioned_docs("digests", digests, current_version)
@@ -986,9 +987,10 @@ def push_read_model(
     }
 
     log.info(
-        "[push] target version=%d previous=%s stories=%d topics=%d digests=%d insights=%d url=%s",
+        "[push] target version=%d previous=%s stories=%d topics=%d digests=%d insights=%d insightsContentChanged=%d url=%s",
         current_version, previous_version,
-        len(stories), len(topics), len(digests), len(insights), _redacted_url_for_log(url),
+        len(stories), len(topics), len(digests), len(insights),
+        insights_content_changed, _redacted_url_for_log(url),
     )
 
     # ---------- 1. ping ----------
@@ -1104,6 +1106,7 @@ def push_read_model(
         "topics": sent["topics"],
         "digests": sent["digests"],
         "insights": sent["insights"],
+        "insightsContentChanged": insights_content_changed,
         "cleanup": cleanup_result,
     }
 

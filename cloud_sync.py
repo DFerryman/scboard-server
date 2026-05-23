@@ -92,6 +92,28 @@ def default_output_dir() -> Path:
     return settings.get_cloud_sync_output_dir()
 
 
+def _last_successful_cloud_sync_finished_at(conn) -> Optional[int]:
+    try:
+        row = conn.execute(
+            """
+            SELECT finished_at
+            FROM cloud_sync_runs
+            WHERE status = 'ok'
+              AND finished_at IS NOT NULL
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    except Exception:  # noqa: BLE001 - old databases may not have the table yet
+        return None
+    if row is None or row["finished_at"] is None:
+        return None
+    try:
+        return int(row["finished_at"])
+    except (TypeError, ValueError):
+        return None
+
+
 def _story_default_type(kind: str) -> str:
     """Mirror repository._story_type_from when no feed context is given."""
     if kind in ("ask", "show", "job"):
@@ -415,6 +437,8 @@ def build_read_model(
         insight_rows = repository.list_insight_rows(conn)
         insights_path = out_dir / "insights.jsonl"
         insight_docs = []
+        last_pushed_finished_at = _last_successful_cloud_sync_finished_at(conn)
+        insights_content_changed = 0
         for r in insight_rows:
             try:
                 payload = json.loads(r["payload"] or "{}")
@@ -429,9 +453,18 @@ def build_read_model(
             doc["_id"] = f"{current_version}:{date}"
             doc["syncVersion"] = current_version
             doc["date"] = payload.get("date") or date
+            doc["dateKey"] = date
             doc["version"] = int(payload.get("version") or 1)
             doc.setdefault("access", {"unlocked": True, "tier": "pro"})
             insight_docs.append(doc)
+            try:
+                changed_at = int(r["content_changed_at"] or 0)
+            except (IndexError, KeyError, TypeError, ValueError):
+                changed_at = 0
+            if changed_at <= 0:
+                changed_at = int(r["generated_at"] or 0)
+            if last_pushed_finished_at is None or changed_at > last_pushed_finished_at:
+                insights_content_changed += 1
         insight_count = _write_jsonl_atomic(insights_path, insight_docs)
 
         # ---------- meta.json ----------
@@ -461,6 +494,8 @@ def build_read_model(
             "previousVersion": previous_version,
             "feedCounts": _build_feed_counts(conn, visible_ids),
             "publishedAt": published_at,
+            "insightsUploaded": insight_count,
+            "insightsContentChanged": insights_content_changed,
         }
         _write_text_atomic(
             out_dir / "meta.json",
@@ -474,6 +509,7 @@ def build_read_model(
             "topics": len(topics),
             "digests": len(digest_rows),
             "insights": insight_count,
+            "insightsContentChanged": insights_content_changed,
             "storyImages": len(active_image_file_ids),
             "feedCounts": meta["feedCounts"],
             "outputDir": str(out_dir),

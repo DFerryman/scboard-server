@@ -279,10 +279,10 @@ def run_business_once(
         cloud_sync.default_output_dir(), expected_version=sync_version
     )
     log.info(
-        "[cloud_sync] business OK run_id=%s v=%s took=%.1fs stories=%s topics=%s digests=%s insights=%s",
+        "[cloud_sync] business OK run_id=%s v=%s took=%.1fs stories=%s topics=%s digests=%s insights_uploaded=%s insights_content_changed=%s",
         run_id, sync_version, elapsed,
         push_stats.get("stories"), push_stats.get("topics"), push_stats.get("digests"),
-        push_stats.get("insights"),
+        push_stats.get("insights"), push_stats.get("insightsContentChanged"),
     )
     return CloudBusinessResult(
         ok=True,

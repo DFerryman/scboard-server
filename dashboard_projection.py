@@ -151,6 +151,10 @@ def _cloud_sync_row_summary(row: sqlite3.Row) -> Dict[str, Any]:
         insights = row["insights"]
     except (IndexError, KeyError):
         insights = None
+    try:
+        insights_content_changed = row["insights_content_changed"]
+    except (IndexError, KeyError):
+        insights_content_changed = None
     return {
         "run_id": row["run_id"],
         "started_at": int(row["started_at"]) if row["started_at"] is not None else None,
@@ -165,6 +169,11 @@ def _cloud_sync_row_summary(row: sqlite3.Row) -> Dict[str, Any]:
         "topics": int(row["topics"]) if row["topics"] is not None else None,
         "digests": int(row["digests"]) if row["digests"] is not None else None,
         "insights": int(insights) if insights is not None else None,
+        "insights_content_changed": (
+            int(insights_content_changed)
+            if insights_content_changed is not None
+            else None
+        ),
         "elapsed_seconds": (
             float(row["elapsed_seconds"])
             if row["elapsed_seconds"] is not None
@@ -303,6 +312,11 @@ def _latest_insight_summary(
     out: Dict[str, Any] = {
         "date": row["date"],
         "generated_at": generated_at,
+        "content_changed_at": (
+            int(row["content_changed_at"] or 0)
+            if "content_changed_at" in row.keys()
+            else generated_at
+        ),
         "window_days": int(row["window_days"] or 0),
         "source_story_count": len(source_story_ids),
         "age_seconds": max(0, int(now) - generated_at) if generated_at else None,

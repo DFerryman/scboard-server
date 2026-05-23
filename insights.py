@@ -37,7 +37,6 @@ from .topics import (
 log = logging.getLogger(__name__)
 
 INSIGHTS_VERSION = 1
-INSIGHTS_WINDOW_LABEL = "24h"
 SIGNALS_MIN_STORIES = 3
 OPPORTUNITY_MIN_CANDIDATES = 3
 DEBATE_MIN_CANDIDATES = 2
@@ -48,7 +47,13 @@ _NOVELTY_POLICY = {
     "previousInsightIsEvidence": False,
     "preferTodayEvidence": True,
     "repeatOnlyWithFreshStorySignals": True,
+    "recentInsightsAreEvidence": False,
 }
+
+
+def _insights_window_label(window_days: int) -> str:
+    days = max(1, int(window_days))
+    return "24h" if days == 1 else f"{days * 24}h"
 
 
 def _elapsed_seconds(started: float) -> float:
@@ -361,8 +366,14 @@ def build_debate_input(
     }
 
 
-def _story_ref(row: Any, feed_ranks: Mapping[int, Mapping[str, int]]) -> Dict[str, Any]:
+def _story_ref(
+    row: Any,
+    feed_ranks: Mapping[int, Mapping[str, int]],
+    *,
+    target_date: str,
+) -> Dict[str, Any]:
     sid = int(row["id"])
+    story_date = repository.date_in_digest_tz(int(row["hn_time"] or 0))
     return {
         "id": sid,
         "topic": _row_topic_id(row),
@@ -372,6 +383,8 @@ def _story_ref(row: Any, feed_ranks: Mapping[int, Mapping[str, int]]) -> Dict[st
         "score": int(row["score"] or 0),
         "descendants": int(row["descendants"] or 0),
         "time": int(row["hn_time"] or 0),
+        "date": story_date,
+        "isToday": story_date == target_date,
         "feedRanks": dict(feed_ranks.get(sid, {})),
     }
 
@@ -379,8 +392,13 @@ def _story_ref(row: Any, feed_ranks: Mapping[int, Mapping[str, int]]) -> Dict[st
 def _story_refs_by_id(
     rows: Sequence[Any],
     feed_ranks: Mapping[int, Mapping[str, int]],
+    *,
+    target_date: str,
 ) -> Dict[int, Dict[str, Any]]:
-    return {int(row["id"]): _story_ref(row, feed_ranks) for row in rows}
+    return {
+        int(row["id"]): _story_ref(row, feed_ranks, target_date=target_date)
+        for row in rows
+    }
 
 
 def _card_story_ids(item: Mapping[str, Any]) -> List[int]:
@@ -395,6 +413,21 @@ def _card_story_ids(item: Mapping[str, Any]) -> List[int]:
             continue
         seen.add(sid)
         out.append(sid)
+    return out
+
+
+def _stable_ints(values: Sequence[Any]) -> List[int]:
+    out: List[int] = []
+    seen: set[int] = set()
+    for raw in values:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
     return out
 
 
@@ -417,10 +450,14 @@ def _evidence_card_metrics(
         for ref in refs
         if isinstance(ref.get("feedRanks"), Mapping)
     ]
+    today_refs = [ref for ref in refs if bool(ref.get("isToday"))]
+    prior_refs = [ref for ref in refs if not bool(ref.get("isToday"))]
     best_feed_rank = min(feed_ranks) if feed_ranks else 999
     newest_time = max(times) if times else 0
     return {
         "storyCount": len(refs),
+        "todayStoryCount": len(today_refs),
+        "priorWindowStoryCount": len(prior_refs),
         "totalScore": sum(scores),
         "maxScore": max(scores) if scores else 0,
         "totalDescendants": sum(descendants),
@@ -980,6 +1017,7 @@ def build_topic_scout_input(
     target_date: str,
     story_refs: Optional[Mapping[int, Mapping[str, Any]]] = None,
     previous_insight: Optional[Mapping[str, Any]] = None,
+    recent_insights: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     _target_start, target_end_ts = repository.digest_date_epoch_bounds(target_date)
     refs = story_refs or {}
@@ -1003,6 +1041,8 @@ def build_topic_scout_input(
     }
     if previous_insight:
         payload["previousInsight"] = previous_insight
+    if recent_insights:
+        payload["recentInsights"] = list(recent_insights)
     return payload
 
 
@@ -1049,12 +1089,22 @@ def _enrich_evidence_cards(
         if not isinstance(item, Mapping):
             continue
         story_ids = _card_story_ids(item)
+        today_story_ids = [
+            sid for sid in story_ids
+            if sid in story_refs and bool(story_refs[sid].get("isToday"))
+        ]
+        prior_story_ids = [
+            sid for sid in story_ids
+            if sid in story_refs and not bool(story_refs[sid].get("isToday"))
+        ]
         topic = str(item.get("topic") or "")
         cards.append(
             {
                 "topicKey": str(item.get("topicKey") or ""),
                 "topic": topic,
                 "storyIds": story_ids,
+                "todayStoryIds": today_story_ids,
+                "priorWindowStoryIds": prior_story_ids,
                 "storyRefs": [
                     dict(story_refs[sid])
                     for sid in story_ids
@@ -1117,6 +1167,7 @@ def build_routed_insights_inputs(
     scout: Mapping[str, Any],
     story_refs: Mapping[int, Mapping[str, Any]],
     previous_insight: Optional[Mapping[str, Any]] = None,
+    recent_insights: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     cards = _enrich_evidence_cards(
         evidence,
@@ -1138,6 +1189,8 @@ def build_routed_insights_inputs(
     }
     if previous_insight:
         signals_input["previousInsight"] = previous_insight.get("signals") or {}
+    if recent_insights:
+        signals_input["recentInsights"] = list(recent_insights)
     opportunities_input = {
         "noveltyPolicy": dict(_NOVELTY_POLICY),
         "topicScout": compact_scout,
@@ -1152,6 +1205,8 @@ def build_routed_insights_inputs(
         opportunities_input["previousInsight"] = (
             previous_insight.get("opportunities") or {}
         )
+    if recent_insights:
+        opportunities_input["recentInsights"] = list(recent_insights)
     debates_input = {
         "noveltyPolicy": dict(_NOVELTY_POLICY),
         "topicScout": compact_scout,
@@ -1164,6 +1219,8 @@ def build_routed_insights_inputs(
     }
     if previous_insight:
         debates_input["previousInsight"] = previous_insight.get("debates") or {}
+    if recent_insights:
+        debates_input["recentInsights"] = list(recent_insights)
     return signals_input, opportunities_input, debates_input
 
 
@@ -1377,9 +1434,22 @@ def _previous_insight_context(row: Any) -> Optional[Dict[str, Any]]:
     payload = _json_loads(row["payload"], {})
     if not isinstance(payload, Mapping):
         return None
+    return _insight_context_from_payload(str(row["date"] or ""), payload, row)
+
+
+def _insight_context_from_payload(
+    date: str,
+    payload: Mapping[str, Any],
+    row: Any = None,
+) -> Dict[str, Any]:
+    source_ids: List[int] = []
+    if row is not None:
+        source_ids = _stable_ints(_json_loads(_row_value(row, "source_story_ids", "[]"), []))
     return {
+        "date": date,
         "headline": payload.get("headline") or "",
         "summary": payload.get("summary") or "",
+        "sourceStoryIds": source_ids,
         "signals": {
             "headline": payload.get("headline") or "",
             "summary": payload.get("summary") or "",
@@ -1422,6 +1492,247 @@ def _previous_insight_context(row: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _recent_insights_context(rows: Sequence[Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        payload = _json_loads(row["payload"], {})
+        if isinstance(payload, Mapping):
+            out.append(_insight_context_from_payload(str(row["date"] or ""), payload, row))
+    return out
+
+
+def _context_source_ids(contexts: Sequence[Mapping[str, Any]]) -> set[int]:
+    out: set[int] = set()
+    for context in contexts:
+        for raw_id in context.get("sourceStoryIds") or []:
+            try:
+                out.add(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def _payload_frame_texts(payload: Mapping[str, Any]) -> List[Dict[str, str]]:
+    frames: List[Dict[str, str]] = []
+    frames.append(
+        {
+            "kind": "headline",
+            "title": str(payload.get("headline") or ""),
+            "text": " ".join(
+                str(payload.get(key) or "")
+                for key in ("headline", "summary")
+            ),
+        }
+    )
+    for item in payload.get("signals") or []:
+        if isinstance(item, Mapping):
+            frames.append(
+                {
+                    "kind": "signal",
+                    "title": str(item.get("title") or ""),
+                    "text": " ".join(str(item.get(key) or "") for key in ("title", "brief")),
+                }
+            )
+    for item in payload.get("opportunities") or []:
+        if isinstance(item, Mapping):
+            frames.append(
+                {
+                    "kind": "opportunity",
+                    "title": str(item.get("title") or ""),
+                    "text": " ".join(
+                        str(item.get(key) or "")
+                        for key in ("title", "thesis", "whyNow", "risk")
+                    ),
+                }
+            )
+    for item in payload.get("debates") or []:
+        if isinstance(item, Mapping):
+            frames.append(
+                {
+                    "kind": "debate",
+                    "title": str(item.get("topic") or ""),
+                    "text": " ".join(
+                        str(item.get(key) or "")
+                        for key in ("topic", "verdict", "support", "oppose", "watch")
+                    ),
+                }
+            )
+    return [frame for frame in frames if frame["text"].strip()]
+
+
+def _context_payload_from_summary(context: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "headline": context.get("headline") or "",
+        "summary": context.get("summary") or "",
+        "signals": (context.get("signals") or {}).get("items") or [],
+        "opportunities": (context.get("opportunities") or {}).get("items") or [],
+        "debates": (context.get("debates") or {}).get("items") or [],
+    }
+
+
+def _semantic_grams(text: str) -> set[str]:
+    clean = re.sub(r"\s+", "", str(text or "").lower())
+    clean = re.sub(r"[^\w\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+", "", clean)
+    if not clean:
+        return set()
+    if len(clean) <= 2:
+        return {clean}
+    return {clean[index:index + 2] for index in range(len(clean) - 1)}
+
+
+def _semantic_similarity(left: str, right: str) -> float:
+    left_grams = _semantic_grams(left)
+    right_grams = _semantic_grams(right)
+    if not left_grams or not right_grams:
+        return 0.0
+    return len(left_grams & right_grams) / len(left_grams | right_grams)
+
+
+def _evaluate_novelty(
+    payload: Mapping[str, Any],
+    recent_insights: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    current_frames = _payload_frame_texts(payload)
+    recent_frames: List[Dict[str, str]] = []
+    for context in recent_insights:
+        context_payload = _context_payload_from_summary(context)
+        for frame in _payload_frame_texts(context_payload):
+            frame = dict(frame)
+            frame["date"] = str(context.get("date") or "")
+            recent_frames.append(frame)
+    if not current_frames or not recent_frames:
+        return {
+            "noveltyScore": 100,
+            "repeatedFrames": [],
+            "newEvidenceReason": "no_recent_comparison",
+            "contentChanged": True,
+            "contentChangedReason": "no recent comparable insight",
+        }
+
+    repeated: List[Dict[str, Any]] = []
+    max_similarity = 0.0
+    for frame in current_frames:
+        best: Optional[Dict[str, str]] = None
+        best_similarity = 0.0
+        for old in recent_frames:
+            similarity = _semantic_similarity(frame["text"], old["text"])
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best = old
+        max_similarity = max(max_similarity, best_similarity)
+        if best is not None and best_similarity >= 0.72:
+            repeated.append(
+                {
+                    "kind": frame["kind"],
+                    "title": frame["title"],
+                    "matchedDate": best.get("date") or "",
+                    "matchedTitle": best.get("title") or "",
+                    "similarity": round(best_similarity, 3),
+                }
+            )
+    score = max(0, min(100, int(round((1.0 - max_similarity) * 100))))
+    threshold = int(settings.INSIGHTS_NOVELTY_MIN_SCORE)
+    content_changed = score >= threshold
+    return {
+        "noveltyScore": score,
+        "repeatedFrames": repeated,
+        "newEvidenceReason": (
+            "new framing passed semantic novelty gate"
+            if content_changed
+            else "semantic frame overlaps recent insights"
+        ),
+        "contentChanged": content_changed,
+        "contentChangedReason": (
+            f"novelty_score {score} >= {threshold}"
+            if content_changed
+            else f"novelty_score {score} < {threshold}"
+        ),
+    }
+
+
+def _prefer_today_linked_story_ids(
+    opportunities: Sequence[Mapping[str, Any]],
+    candidates: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    today_ids: set[int] = set()
+    same_card_today_ids: Dict[int, List[int]] = {}
+    for candidate in candidates:
+        story_ids = _stable_ints(candidate.get("storyIds") or [])
+        candidate_today_ids = _stable_ints(candidate.get("todayStoryIds") or [])
+        today_ids.update(candidate_today_ids)
+        if not candidate_today_ids:
+            continue
+        for sid in story_ids:
+            same_card_today_ids[int(sid)] = list(candidate_today_ids)
+
+    filtered: List[Dict[str, Any]] = []
+    for item in opportunities:
+        out = dict(item)
+        linked = _stable_ints(item.get("linkedStoryIds") or [])
+        preferred: List[int] = []
+        for sid in linked:
+            if sid in today_ids:
+                preferred.append(sid)
+                continue
+            for today_sid in same_card_today_ids.get(sid, []):
+                preferred.append(today_sid)
+        if preferred:
+            out["linkedStoryIds"] = _stable_ints(preferred)
+        else:
+            out["linkedStoryIds"] = linked
+        filtered.append(out)
+    return filtered
+
+
+def _fresh_material_update_reason(existing_row: Any, today_rows: Sequence[Any]) -> str:
+    if existing_row is None:
+        return "no_existing_insight"
+    try:
+        generated_at = int(existing_row["generated_at"] or 0)
+    except (TypeError, ValueError):
+        generated_at = 0
+    if generated_at <= 0:
+        return "missing_generated_at"
+    high_signal_new = []
+    for row in today_rows:
+        last_material_ts = max(
+            int(_row_value(row, "last_seen_at", 0) or 0),
+            int(_row_value(row, "enriched_at", 0) or 0),
+            int(row["hn_time"] or 0),
+        )
+        if last_material_ts <= generated_at:
+            continue
+        if (
+            int(row["score"] or 0) >= int(settings.INSIGHTS_FRESH_MATERIAL_MIN_SCORE)
+            or int(row["descendants"] or 0)
+            >= int(settings.INSIGHTS_FRESH_MATERIAL_MIN_DESCENDANTS)
+        ):
+            high_signal_new.append(int(row["id"]))
+    minimum = int(settings.INSIGHTS_FRESH_MATERIAL_MIN_STORIES)
+    if len(high_signal_new) >= minimum:
+        return f"fresh_high_signal_stories {len(high_signal_new)}/{minimum}"
+
+    payload = _json_loads(existing_row["payload"], {})
+    previous_topics = set()
+    if isinstance(payload, Mapping):
+        for item in payload.get("topicDistribution") or []:
+            if isinstance(item, Mapping) and item.get("topic"):
+                previous_topics.add(str(item.get("topic")))
+    current_topics = {
+        str(item.get("topic"))
+        for item in _build_today_topic_summary(today_rows)[:5]
+        if item.get("topic")
+    }
+    if previous_topics and current_topics:
+        overlap = len(previous_topics & current_topics) / max(
+            1,
+            len(previous_topics | current_topics),
+        )
+        if overlap < 0.5:
+            return f"topic_distribution_changed overlap={overlap:.2f}"
+    return ""
+
+
 def _comment_count(comments_by_story: Mapping[int, Sequence[Any]]) -> int:
     return sum(len(items) for items in comments_by_story.values())
 
@@ -1435,7 +1746,7 @@ def _analysis_fingerprint_value(value: Any) -> Any:
         return {
             str(key): _analysis_fingerprint_value(child)
             for key, child in sorted(value.items(), key=lambda item: str(item[0]))
-            if str(key) not in ("previousInsight", "reason")
+            if str(key) not in ("previousInsight", "recentInsights", "reason")
         }
     if isinstance(value, list):
         return [_analysis_fingerprint_value(item) for item in value]
@@ -1485,6 +1796,9 @@ def _insights_run_summary(
     today_rows: Sequence[Any],
     evidence_rows: Sequence[Any],
     comments_by_story: Mapping[int, Sequence[Any]],
+    source_story_ids: Optional[Sequence[int]] = None,
+    recent_insights: Optional[Sequence[Mapping[str, Any]]] = None,
+    novelty: Optional[Mapping[str, Any]] = None,
     material_fingerprint: str = "",
     analysis_fingerprint: str = "",
     evidence_cache: str = "",
@@ -1493,10 +1807,29 @@ def _insights_run_summary(
     stage_timings: Optional[Mapping[str, float]] = None,
     skip_reason: str = "",
 ) -> Dict[str, Any]:
+    today_ids = {int(row["id"]) for row in today_rows}
+    evidence_today_count = sum(1 for row in evidence_rows if int(row["id"]) in today_ids)
+    evidence_count = len(evidence_rows)
+    source_ids = _stable_ints(source_story_ids or [])
+    recent_source_ids = _context_source_ids(recent_insights or [])
+    source_today_count = sum(1 for sid in source_ids if sid in today_ids)
+    source_prior_count = len(set(source_ids)) - source_today_count
     out: Dict[str, Any] = {
         "today_story_count": len(today_rows),
         "evidence_story_count": len(evidence_rows),
         "comment_count": _comment_count(comments_by_story),
+        "today_story_ratio": round(evidence_today_count / evidence_count, 3)
+        if evidence_count
+        else 0.0,
+        "prior_window_story_ratio": round(
+            max(0, evidence_count - evidence_today_count) / evidence_count,
+            3,
+        )
+        if evidence_count
+        else 0.0,
+        "today_source_story_count": source_today_count,
+        "prior_window_source_story_count": max(0, source_prior_count),
+        "recent_overlap_count": len(set(source_ids) & recent_source_ids),
     }
     if material_fingerprint:
         out["material_fingerprint"] = material_fingerprint
@@ -1527,9 +1860,15 @@ def _insights_run_summary(
     if topic_scout is not None:
         out["topic_scout_selected_count"] = len(topic_scout.get("selectedTopics") or [])
         out["topic_scout_excluded_count"] = len(topic_scout.get("excludedTopics") or [])
+    if novelty is not None:
+        out["novelty_score"] = int(novelty.get("noveltyScore") or 0)
+        out["repeated_frames"] = novelty.get("repeatedFrames") or []
+        out["new_evidence_reason"] = str(novelty.get("newEvidenceReason") or "")
+        out["content_changed_reason"] = str(novelty.get("contentChangedReason") or "")
     _attach_stage_timings(out, stage_timings)
     if skip_reason:
         out["skip_reason"] = skip_reason
+        out["skipped_reason_detail"] = skip_reason
     return out
 
 
@@ -1664,11 +2003,17 @@ def run_insights_once(
         ]
         candidate_story_ids = [int(row["id"]) for row in window_rows]
         existing_insight_row = repository.get_insight_row(conn, target_date)
+        recent_insight_rows = repository.recent_insight_rows_before(
+            conn,
+            target_date,
+            limit=max(1, int(settings.INSIGHTS_RECENT_CONTEXT_DAYS)),
+        ) if int(settings.INSIGHTS_RECENT_CONTEXT_DAYS) > 0 else []
         if len(today_rows) < int(settings.INSIGHTS_MIN_TODAY_STORIES):
             reason = "insufficient_today_stories"
             summary = {
                 "today_story_count": len(today_rows),
                 "skip_reason": reason,
+                "skipped_reason_detail": reason,
             }
             stage_timings["input_seconds"] = _elapsed_seconds(input_started)
             stage_timings["total_seconds"] = _elapsed_seconds(total_started)
@@ -1688,14 +2033,24 @@ def run_insights_once(
                 "today_story_count": len(today_rows),
                 "run_summary": summary,
             }
-        if not force and not repository.insight_needs_update(
+        interval_due = repository.insight_needs_update(
             conn,
             target_date,
             settings.INSIGHTS_UPDATE_INTERVAL_SECONDS,
             candidate_story_ids,
-        ):
+        )
+        fresh_material_reason = ""
+        if not interval_due:
+            fresh_material_reason = _fresh_material_update_reason(
+                existing_insight_row,
+                today_rows,
+            )
+        if not force and not interval_due and not fresh_material_reason:
             reason = "not_due"
-            summary = {"skip_reason": reason}
+            summary = {
+                "skip_reason": reason,
+                "skipped_reason_detail": "interval gate and no fresh material trigger",
+            }
             stage_timings["input_seconds"] = _elapsed_seconds(input_started)
             stage_timings["total_seconds"] = _elapsed_seconds(total_started)
             _attach_stage_timings(summary, stage_timings)
@@ -1742,6 +2097,7 @@ def run_insights_once(
             comments_by_story=comments_by_story,
         )
         previous_insight = _previous_insight_context(existing_insight_row)
+        recent_insights = _recent_insights_context(recent_insight_rows)
     finally:
         conn.close()
     stage_timings["input_seconds"] = _elapsed_seconds(input_started)
@@ -1779,6 +2135,7 @@ def run_insights_once(
                 today_rows=today_rows,
                 evidence_rows=evidence_rows,
                 comments_by_story=comments_by_story,
+                recent_insights=recent_insights,
                 material_fingerprint=material_fingerprint,
                 stage_timings=stage_timings,
                 skip_reason=reason,
@@ -1813,6 +2170,7 @@ def run_insights_once(
                 today_rows=today_rows,
                 evidence_rows=evidence_rows,
                 comments_by_story=comments_by_story,
+                recent_insights=recent_insights,
                 material_fingerprint=material_fingerprint,
                 stage_timings=stage_timings,
                 skip_reason=reason,
@@ -1854,12 +2212,17 @@ def run_insights_once(
             stage_timings["evidence_seconds"] = _elapsed_seconds(evidence_started)
         evidence_cache_status = _evidence_cache_status(evidence_cache_stats)
         routing_started = time.monotonic()
-        story_refs = _story_refs_by_id(window_rows, feed_ranks)
+        story_refs = _story_refs_by_id(
+            window_rows,
+            feed_ranks,
+            target_date=target_date,
+        )
         topic_scout_input = build_topic_scout_input(
             evidence_out,
             target_date=target_date,
             story_refs=story_refs,
             previous_insight=previous_insight,
+            recent_insights=recent_insights,
         )
         stage_timings["topic_scout_input_seconds"] = _elapsed_seconds(routing_started)
         topic_scout_started = time.monotonic()
@@ -1876,6 +2239,7 @@ def run_insights_once(
                 scout=topic_scout_out,
                 story_refs=story_refs,
                 previous_insight=previous_insight,
+                recent_insights=recent_insights,
             )
         )
         stage_timings["routing_seconds"] = _elapsed_seconds(routing_started)
@@ -1883,12 +2247,15 @@ def run_insights_once(
             today_rows=today_rows,
             evidence_rows=evidence_rows,
             comments_by_story=comments_by_story,
+            recent_insights=recent_insights,
             material_fingerprint=material_fingerprint,
             evidence_cache=evidence_cache_status,
             evidence_cache_stats=evidence_cache_stats,
             topic_scout=topic_scout_out,
             stage_timings=stage_timings,
         )
+        if fresh_material_reason:
+            run_summary["fresh_material_reason"] = fresh_material_reason
 
         input_counts = _insights_input_counts(
             signals_input=signals_input,
@@ -1988,52 +2355,87 @@ def run_insights_once(
 
         payload_started = time.monotonic()
         try:
+            opportunities = _prefer_today_linked_story_ids(
+                opportunities_out["opportunities"],
+                opportunities_input.get("candidates") or [],
+            )
             source_story_ids = _collect_story_reference_ids(
                 signals_out,
-                opportunities_out,
+                {"opportunities": opportunities},
                 debates_out,
             )
+            today_source_count = sum(
+                1
+                for sid in set(int(raw_id) for raw_id in source_story_ids)
+                if sid in {int(row["id"]) for row in today_rows}
+            )
+            prior_source_count = len(set(int(raw_id) for raw_id in source_story_ids)) - today_source_count
             debates = debates_out["debates"]
             payload = {
                 "version": INSIGHTS_VERSION,
                 "date": target_date,
+                "dateKey": target_date,
                 "asOf": target_date,
                 "asOfLabel": _as_of_label(target_date),
                 "generatedAt": _now_iso_in_digest_tz(),
-                "window": INSIGHTS_WINDOW_LABEL,
+                "window": _insights_window_label(window_days),
+                "windowDays": window_days,
                 "access": {"unlocked": True, "tier": "pro"},
                 "headline": signals_out["headline"],
                 "summary": signals_out["summary"],
+                "todaySourceStoryIdsCount": today_source_count,
+                "priorWindowStoryIdsCount": max(0, prior_source_count),
+                "topicDistribution": _build_today_topic_summary(today_rows),
                 "stats": _build_stats(
                     window_rows=window_rows,
                     source_story_ids=source_story_ids,
                     debates=debates,
                 ),
                 "signals": signals_out["signals"],
-                "opportunities": opportunities_out["opportunities"],
+                "opportunities": opportunities,
                 "debates": debates,
             }
+            novelty = _evaluate_novelty(
+                payload,
+                ([previous_insight] if previous_insight else []) + list(recent_insights),
+            )
+            payload["noveltyScore"] = novelty["noveltyScore"]
+            payload["repeatedFrames"] = novelty["repeatedFrames"]
+            payload["newEvidenceReason"] = novelty["newEvidenceReason"]
+            payload["contentChangedReason"] = novelty["contentChangedReason"]
             payload = sanitize_forbidden_words(payload)
             _validate_final_payload(payload, candidate_story_ids)
         finally:
             stage_timings["payload_seconds"] = _elapsed_seconds(payload_started)
         stage_timings["total_seconds"] = _elapsed_seconds(total_started)
+        run_summary.update(
+            _insights_run_summary(
+                today_rows=today_rows,
+                evidence_rows=evidence_rows,
+                comments_by_story=comments_by_story,
+                source_story_ids=source_story_ids,
+                recent_insights=recent_insights,
+                novelty=novelty,
+            )
+        )
         _attach_stage_timings(run_summary, stage_timings)
 
         model_usage = _usage_since(agent, usage_checkpoint)
         conn = db.connect()
         try:
             with db.transaction(conn):
-                changed = repository.upsert_insight(
-                    conn,
-                    target_date,
-                    payload,
-                    source_story_ids,
-                    repository.now_seconds(),
-                    window_days,
-                    model_usage=model_usage,
-                    material_fingerprint=material_fingerprint,
-                )
+                changed = False
+                if bool(novelty.get("contentChanged")) or existing_insight_row is None:
+                    changed = repository.upsert_insight(
+                        conn,
+                        target_date,
+                        payload,
+                        source_story_ids,
+                        repository.now_seconds(),
+                        window_days,
+                        model_usage=model_usage,
+                        material_fingerprint=material_fingerprint,
+                    )
                 repository.set_meta(
                     conn,
                     _analysis_meta_key(target_date),

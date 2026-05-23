@@ -2496,6 +2496,7 @@ def _write_cloud_sync_run(
                         UPDATE cloud_sync_runs
                         SET finished_at=?, status=?, sync_version=?,
                             stories=?, topics=?, digests=?, insights=?,
+                            insights_content_changed=?,
                             elapsed_seconds=?, error=?, cleanup_status=?
                         WHERE run_id=? AND started_at=?
                         """,
@@ -2507,6 +2508,7 @@ def _write_cloud_sync_run(
                             push_stats.get("topics"),
                             push_stats.get("digests"),
                             push_stats.get("insights"),
+                            push_stats.get("insightsContentChanged"),
                             elapsed_seconds,
                             (error or None),
                             cleanup_status,
@@ -2520,9 +2522,9 @@ def _write_cloud_sync_run(
                     """
                     INSERT INTO cloud_sync_runs
                         (run_id, started_at, finished_at, status, sync_version,
-                         stories, topics, digests, insights, elapsed_seconds, error,
-                         cleanup_status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         stories, topics, digests, insights, insights_content_changed,
+                         elapsed_seconds, error, cleanup_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -2534,6 +2536,7 @@ def _write_cloud_sync_run(
                         push_stats.get("topics"),
                         push_stats.get("digests"),
                         push_stats.get("insights"),
+                        push_stats.get("insightsContentChanged"),
                         elapsed_seconds,
                         (error or None),
                         cleanup_status,
