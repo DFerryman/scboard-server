@@ -987,6 +987,18 @@ class SettingsValidation(unittest.TestCase):
             launcher,
         )
         self.assertIn(
+            "DEFAULT_INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS=$((HNREADER_INSIGHTS_UPDATE_INTERVAL_SECONDS * 3 / 4))",
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS="${HNREADER_INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS:-$DEFAULT_INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_INSIGHTS_UPDATE_INTERVAL_MAX_SECONDS="${HNREADER_INSIGHTS_UPDATE_INTERVAL_MAX_SECONDS:-$DEFAULT_INSIGHTS_UPDATE_INTERVAL_MAX_SECONDS}"',
+            launcher,
+        )
+        self.assertIn(
             'HNREADER_INSIGHTS_MAX_TODAY_STORIES="${HNREADER_INSIGHTS_MAX_TODAY_STORIES:-160}"',
             launcher,
         )
@@ -1023,8 +1035,13 @@ class SettingsValidation(unittest.TestCase):
             .default,
             50,
         )
+        self.assertNotIn("HNREADER_INGEST_INTERVAL_SECONDS=", launcher)
         self.assertIn(
-            'HNREADER_INGEST_INTERVAL_SECONDS="${HNREADER_INGEST_INTERVAL_SECONDS:-3600}"',
+            'HNREADER_INGEST_INTERVAL_MIN_SECONDS="${HNREADER_INGEST_INTERVAL_MIN_SECONDS:-900}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_INGEST_INTERVAL_MAX_SECONDS="${HNREADER_INGEST_INTERVAL_MAX_SECONDS:-2700}"',
             launcher,
         )
         self.assertIn(
@@ -2699,6 +2716,216 @@ class CloudSyncReadModel(_SqliteCase):
                 )
         finally:
             conn.close()
+
+    def test_insights_random_gate_persists_next_update_time(self):
+        from . import insights
+
+        target = "2026-05-19"
+        old_interval = settings.INSIGHTS_UPDATE_INTERVAL_SECONDS
+        old_min = settings.INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS
+        old_max = settings.INSIGHTS_UPDATE_INTERVAL_MAX_SECONDS
+        try:
+            settings.INSIGHTS_UPDATE_INTERVAL_SECONDS = 3600  # type: ignore[assignment]
+            settings.INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS = 10  # type: ignore[assignment]
+            settings.INSIGHTS_UPDATE_INTERVAL_MAX_SECONDS = 20  # type: ignore[assignment]
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    repository.upsert_insight(
+                        conn,
+                        target,
+                        {"headline": "existing"},
+                        [101, 102],
+                        1_000,
+                        7,
+                    )
+                row = repository.get_insight_row(conn, target)
+                self.assertIsNotNone(row)
+                with patch.object(
+                    insights.random, "randint", return_value=17
+                ), patch.object(repository, "now_seconds", return_value=1_016):
+                    due, schedule = insights._insights_interval_due(
+                        conn,
+                        target,
+                        row,
+                    )
+                self.assertFalse(due)
+                self.assertEqual(
+                    schedule,
+                    {
+                        "next_update_interval_seconds": 17,
+                        "next_update_after": 1_017,
+                    },
+                )
+                with patch.object(
+                    insights.random,
+                    "randint",
+                    side_effect=AssertionError("must reuse persisted schedule"),
+                ), patch.object(repository, "now_seconds", return_value=1_017):
+                    due, schedule = insights._insights_interval_due(
+                        conn,
+                        target,
+                        row,
+                    )
+                self.assertTrue(due)
+                self.assertEqual(schedule["next_update_after"], 1_017)
+            finally:
+                conn.close()
+        finally:
+            settings.INSIGHTS_UPDATE_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
+            settings.INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS = old_min  # type: ignore[assignment]
+            settings.INSIGHTS_UPDATE_INTERVAL_MAX_SECONDS = old_max  # type: ignore[assignment]
+
+    def test_run_insights_once_keeps_fresh_material_bypass(self):
+        from . import insights
+
+        target = "2026-05-19"
+        start, _ = repository.digest_date_epoch_bounds(target)
+
+        class FreshMaterialAgent:
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint):
+                return checkpoint, {}
+
+            def run_evidence(self, payload):
+                return {
+                    "evidenceCards": [
+                        {
+                            "topicKey": f"topic-{index}",
+                            "topic": story["topicName"],
+                            "storyIds": [story["id"]],
+                            "synthesis": story["aiSummary"],
+                            "painPoints": ["pain"],
+                            "opportunityAngles": ["angle"],
+                            "debatePoints": ["debate"],
+                            "commentSignals": [],
+                        }
+                        for index, story in enumerate(payload["stories"])
+                    ],
+                    "excludedStoryIds": [],
+                    "exclusionReasons": {},
+                    "coverage": {
+                        "inputStoryCount": len(payload["stories"]),
+                        "assignedStoryCount": len(payload["stories"]),
+                        "excludedStoryCount": 0,
+                    },
+                }
+
+            def run_topic_scout(self, payload):
+                return {
+                    "selectedTopics": [
+                        {
+                            "topicKey": card["topicKey"],
+                            "reason": "selected",
+                            "routes": ["signals", "opportunities", "debates"],
+                        }
+                        for card in payload["evidenceCards"]
+                    ],
+                    "excludedTopics": [],
+                }
+
+            def run_signals(self, _payload):
+                return {
+                    "headline": "headline",
+                    "summary": "summary",
+                    "signals": [
+                        {
+                            "id": f"s-{i}",
+                            "label": "模式",
+                            "title": f"signal {i}",
+                            "brief": "brief",
+                            "trend": "+0",
+                            "tone": "flat",
+                        }
+                        for i in range(3)
+                    ],
+                }
+
+            def run_opportunities(self, payload):
+                ids = [item["storyIds"][0] for item in payload["candidates"][:3]]
+                return {
+                    "opportunities": [
+                        {
+                            "rank": index + 1,
+                            "rankText": f"{index + 1:02d}",
+                            "title": f"opp {index}",
+                            "score": 80,
+                            "category": "tool",
+                            "audience": ["dev"],
+                            "thesis": "thesis",
+                            "whyNow": "now",
+                            "risk": "risk",
+                            "linkedStoryIds": [sid],
+                        }
+                        for index, sid in enumerate(ids)
+                    ]
+                }
+
+            def run_debates(self, _payload):
+                return {
+                    "debates": [
+                        {
+                            "topic": f"debate {index}",
+                            "verdict": "观察",
+                            "intensity": 50,
+                            "supportWidth": 50,
+                            "opposeWidth": 50,
+                            "support": "support",
+                            "oppose": "oppose",
+                            "watch": "watch",
+                        }
+                        for index in range(2)
+                    ]
+                }
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.upsert_insight(
+                    conn,
+                    target,
+                    {"headline": "existing"},
+                    [101],
+                    1_000,
+                    3,
+                )
+                fresh_story_count = max(
+                    settings.INSIGHTS_FRESH_MATERIAL_MIN_STORIES,
+                    settings.INSIGHTS_MIN_TODAY_STORIES,
+                )
+                for offset in range(fresh_story_count):
+                    self._insert_done_story(
+                        conn,
+                        5100 + offset,
+                        start + offset * 60,
+                        topic=self._fixed_topic(offset),
+                        score=settings.INSIGHTS_FRESH_MATERIAL_MIN_SCORE,
+                        descendants=0,
+                    )
+                    conn.execute(
+                        "UPDATE stories SET last_seen_at=? WHERE id=?",
+                        (start + offset * 60 + 1, 5100 + offset),
+                    )
+        finally:
+            conn.close()
+
+        with patch.object(
+            insights,
+            "_insights_interval_due",
+            return_value=(False, {"next_update_after": start + 3600}),
+        ):
+            summary = insights.run_insights_once(
+                date=target,
+                ai_agent=FreshMaterialAgent(),
+            )
+
+        self.assertEqual(summary["status"], "ok")
+        self.assertIn(
+            "fresh_high_signal_stories",
+            summary["run_summary"]["fresh_material_reason"],
+        )
 
     def test_fresh_material_reason_detects_new_high_signal_today_rows(self):
         from . import insights
@@ -12531,22 +12758,28 @@ class SupervisorChildFailureCleanup(_SqliteCase):
             def __init__(self, args, env=None):
                 self.args = args
                 self.env = env
+                self.done = False
 
             def wait(self, timeout=None):
+                order.append("wait")
+                self.done = True
                 return 0
 
             def poll(self):
-                return 0
+                return 0 if self.done else None
 
         lock = DummyLock()
         popen_calls = []
         sleep_durations = []
+        order = []
 
         def fake_popen(cmd, env=None):
+            order.append("popen")
             popen_calls.append((cmd, env))
             return FakeProc(cmd, env=env)
 
         def stop_while_idle(duration):
+            order.append("sleep")
             sleep_durations.append(duration)
             raise ingest_module._SupervisorShutdown(
                 getattr(signal, "SIGTERM", 15)
@@ -12569,10 +12802,14 @@ class SupervisorChildFailureCleanup(_SqliteCase):
         ), patch.object(
             ingest_module.subprocess, "Popen", side_effect=fake_popen
         ), patch.object(
+            ingest_module.random, "randint", return_value=6
+        ), patch.object(
             ingest_module, "_sleep_or_stop", side_effect=stop_while_idle
         ):
             rc = ingest_module.run_supervisor_loop(
-                interval_seconds=5,
+                interval_seconds=None,
+                interval_min_seconds=4,
+                interval_max_seconds=9,
                 round_timeout_seconds=3,
                 digest_reserved_seconds=1,
                 verbose=True,
@@ -12588,7 +12825,8 @@ class SupervisorChildFailureCleanup(_SqliteCase):
         self.assertIn("--child", cmd)
         self.assertIn("--verbose", cmd)
         self.assertIn("loop-run", cmd)
-        self.assertTrue(sleep_durations)
+        self.assertEqual(sleep_durations, [6.0])
+        self.assertEqual(order, ["popen", "wait", "sleep"])
 
     def test_supervisor_child_module_follows_current_package_name(self):
         class DummyLock:
@@ -16366,10 +16604,12 @@ class CloudSyncCleanupStatusObservability(_SqliteCase):
         from . import ops
 
         old_interval = settings.INGEST_INTERVAL_SECONDS
+        old_interval_max = settings.INGEST_INTERVAL_MAX_SECONDS
         old_timeout = settings.INGEST_ROUND_TIMEOUT_SECONDS
         old_grace = settings.INGEST_CHILD_KILL_GRACE_SECONDS
         try:
             settings.INGEST_INTERVAL_SECONDS = 30  # type: ignore[assignment]
+            settings.INGEST_INTERVAL_MAX_SECONDS = 30  # type: ignore[assignment]
             settings.INGEST_ROUND_TIMEOUT_SECONDS = 40  # type: ignore[assignment]
             settings.INGEST_CHILD_KILL_GRACE_SECONDS = 5  # type: ignore[assignment]
 
@@ -16397,6 +16637,7 @@ class CloudSyncCleanupStatusObservability(_SqliteCase):
                 status = ops.collect_doctor(probe_ai=False)
         finally:
             settings.INGEST_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
+            settings.INGEST_INTERVAL_MAX_SECONDS = old_interval_max  # type: ignore[assignment]
             settings.INGEST_ROUND_TIMEOUT_SECONDS = old_timeout  # type: ignore[assignment]
             settings.INGEST_CHILD_KILL_GRACE_SECONDS = old_grace  # type: ignore[assignment]
 

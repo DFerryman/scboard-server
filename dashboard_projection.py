@@ -308,6 +308,14 @@ def _latest_insight_summary(
 
     generated_at = int(row["generated_at"] or 0)
     interval = max(0, int(settings.INSIGHTS_UPDATE_INTERVAL_SECONDS))
+    next_update_after = repository.get_meta_int(
+        conn,
+        f"insights:next_update_after:{row['date']}",
+    )
+    if next_update_after is None:
+        next_update_after = (
+            generated_at + interval if generated_at and interval > 0 else generated_at
+        )
     source_story_ids = _decode_json_list(row["source_story_ids"])
     out: Dict[str, Any] = {
         "date": row["date"],
@@ -320,13 +328,11 @@ def _latest_insight_summary(
         "window_days": int(row["window_days"] or 0),
         "source_story_count": len(source_story_ids),
         "age_seconds": max(0, int(now) - generated_at) if generated_at else None,
-        "next_update_after": (
-            generated_at + interval if generated_at and interval > 0 else generated_at
-        ),
+        "next_update_after": next_update_after,
         "due": (
             True
             if not generated_at or interval <= 0
-            else int(now) - generated_at >= interval
+            else int(now) >= int(next_update_after)
         ),
     }
     material_fingerprint = row["material_fingerprint"] or ""
@@ -383,6 +389,12 @@ def insights_status_for_dashboard(
     return {
         "enabled": bool(settings.INSIGHTS_ENABLED),
         "update_interval_seconds": int(settings.INSIGHTS_UPDATE_INTERVAL_SECONDS),
+        "update_interval_min_seconds": int(
+            settings.INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS
+        ),
+        "update_interval_max_seconds": int(
+            settings.INSIGHTS_UPDATE_INTERVAL_MAX_SECONDS
+        ),
         "window_days": int(settings.INSIGHTS_WINDOW_DAYS),
         "count": count,
         "latest": _latest_insight_summary(conn, now=now),

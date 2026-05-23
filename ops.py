@@ -316,7 +316,7 @@ def _ingest_attention_reason(
             reference_s = None
         if reference_s is not None:
             max_age = (
-                int(settings.INGEST_INTERVAL_SECONDS)
+                int(settings.INGEST_INTERVAL_MAX_SECONDS)
                 + int(settings.INGEST_ROUND_TIMEOUT_SECONDS)
                 + int(settings.INGEST_CHILD_KILL_GRACE_SECONDS)
             )

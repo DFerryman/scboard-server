@@ -6,6 +6,7 @@ import html
 import hashlib
 import json
 import logging
+import random
 import re
 import time
 import uuid
@@ -1752,6 +1753,99 @@ def _analysis_meta_key(target_date: str) -> str:
     return f"insights:analysis_fingerprint:{target_date}"
 
 
+def _next_update_meta_key(target_date: str) -> str:
+    return f"insights:next_update_after:{target_date}"
+
+
+def _insights_random_interval_enabled() -> bool:
+    return int(settings.INSIGHTS_UPDATE_INTERVAL_SECONDS) > 0
+
+
+def _sample_insights_update_interval_seconds() -> int:
+    if not _insights_random_interval_enabled():
+        return 0
+    interval_min = max(0, int(settings.INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS))
+    interval_max = max(interval_min, int(settings.INSIGHTS_UPDATE_INTERVAL_MAX_SECONDS))
+    if interval_max <= 0:
+        return 0
+    if interval_max == interval_min:
+        return interval_min
+    return int(random.randint(interval_min, interval_max))
+
+
+def _plan_next_insights_update(
+    conn,
+    target_date: str,
+    *,
+    base_at: Optional[int] = None,
+) -> Dict[str, int]:
+    interval = _sample_insights_update_interval_seconds()
+    base = int(base_at if base_at is not None else repository.now_seconds())
+    next_update_after = base if interval <= 0 else base + interval
+    if interval > 0:
+        repository.set_meta(
+            conn,
+            _next_update_meta_key(target_date),
+            str(next_update_after),
+        )
+    return {
+        "next_update_interval_seconds": interval,
+        "next_update_after": next_update_after,
+    }
+
+
+def _reschedule_next_insights_update(
+    target_date: str,
+    summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, int]:
+    if not _insights_random_interval_enabled():
+        return {}
+    conn = db.connect()
+    try:
+        with db.transaction(conn):
+            planned = _plan_next_insights_update(conn, target_date)
+    finally:
+        conn.close()
+    if summary is not None:
+        summary.update(planned)
+    return planned
+
+
+def _insights_interval_due(
+    conn,
+    target_date: str,
+    existing_insight_row: Optional[Mapping[str, Any]],
+) -> tuple[bool, Dict[str, int]]:
+    if existing_insight_row is None:
+        return True, {}
+    if not _insights_random_interval_enabled():
+        return True, {}
+
+    planned = repository.get_meta_int(conn, _next_update_meta_key(target_date))
+    generated_at = int(existing_insight_row["generated_at"] or 0)
+    if planned is None:
+        with db.transaction(conn):
+            planned = repository.get_meta_int(conn, _next_update_meta_key(target_date))
+            if planned is None:
+                schedule = _plan_next_insights_update(
+                    conn,
+                    target_date,
+                    base_at=generated_at,
+                )
+                planned = schedule["next_update_after"]
+            else:
+                schedule = {
+                    "next_update_interval_seconds": max(0, planned - generated_at),
+                    "next_update_after": planned,
+                }
+    else:
+        schedule = {
+            "next_update_interval_seconds": max(0, planned - generated_at),
+            "next_update_after": planned,
+        }
+    return repository.now_seconds() >= int(planned), schedule
+
+
 def _analysis_fingerprint_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -2044,11 +2138,10 @@ def run_insights_once(
                 "today_story_count": len(today_rows),
                 "run_summary": summary,
             }
-        interval_due = repository.insight_needs_update(
+        interval_due, interval_schedule = _insights_interval_due(
             conn,
             target_date,
-            settings.INSIGHTS_UPDATE_INTERVAL_SECONDS,
-            candidate_story_ids,
+            existing_insight_row,
         )
         fresh_material_reason = ""
         if not interval_due:
@@ -2062,6 +2155,7 @@ def run_insights_once(
                 "skip_reason": reason,
                 "skipped_reason_detail": "interval gate and no fresh material trigger",
             }
+            summary.update(interval_schedule)
             stage_timings["input_seconds"] = _elapsed_seconds(input_started)
             stage_timings["total_seconds"] = _elapsed_seconds(total_started)
             _attach_stage_timings(summary, stage_timings)
@@ -2152,6 +2246,7 @@ def run_insights_once(
                 stage_timings=stage_timings,
                 skip_reason=reason,
             )
+            _reschedule_next_insights_update(target_date, summary)
             _finish_run_record(
                 run_id=run_id,
                 date=target_date,
@@ -2187,6 +2282,7 @@ def run_insights_once(
                 stage_timings=stage_timings,
                 skip_reason=reason,
             )
+            _reschedule_next_insights_update(target_date, summary)
             _finish_run_record(
                 run_id=run_id,
                 date=target_date,
@@ -2281,6 +2377,7 @@ def run_insights_once(
             skip_summary = dict(run_summary)
             skip_summary["skip_reason"] = reason
             _attach_stage_timings(skip_summary, stage_timings)
+            _reschedule_next_insights_update(target_date, skip_summary)
             _finish_run_record(
                 run_id=run_id,
                 date=target_date,
@@ -2333,6 +2430,7 @@ def run_insights_once(
                 skip_summary = dict(run_summary)
                 skip_summary["skip_reason"] = reason
                 _attach_stage_timings(skip_summary, stage_timings)
+                _reschedule_next_insights_update(target_date, skip_summary)
                 _finish_run_record(
                     run_id=run_id,
                     date=target_date,
@@ -2436,6 +2534,7 @@ def run_insights_once(
         conn = db.connect()
         try:
             with db.transaction(conn):
+                finished_now = repository.now_seconds()
                 changed = False
                 if bool(novelty.get("contentChanged")) or existing_insight_row is None:
                     changed = repository.upsert_insight(
@@ -2443,10 +2542,18 @@ def run_insights_once(
                         target_date,
                         payload,
                         source_story_ids,
-                        repository.now_seconds(),
+                        finished_now,
                         window_days,
                         model_usage=model_usage,
                         material_fingerprint=material_fingerprint,
+                    )
+                if _insights_random_interval_enabled():
+                    run_summary.update(
+                        _plan_next_insights_update(
+                            conn,
+                            target_date,
+                            base_at=finished_now,
+                        )
                     )
                 repository.set_meta(
                     conn,
@@ -2460,7 +2567,7 @@ def run_insights_once(
                     run_id=run_id,
                     date=target_date,
                     started_at=started_at,
-                    finished_at=repository.now_seconds(),
+                    finished_at=finished_now,
                     status="ok",
                     model_usage=model_usage,
                     summary=run_summary,

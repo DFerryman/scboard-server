@@ -2127,7 +2127,8 @@ def _alert_cloud_sync_result(run_id: str, result: Dict[str, Any]) -> None:
             "cloud_sync_version": result.get("sync_version"),
             "cloud_sync_elapsed_seconds": result.get("elapsed_seconds"),
             "cloud_sync_timeout_seconds": settings.CLOUD_SYNC_TIMEOUT_SECONDS,
-            "ingest_interval_seconds": settings.INGEST_INTERVAL_SECONDS,
+            "ingest_interval_min_seconds": settings.INGEST_INTERVAL_MIN_SECONDS,
+            "ingest_interval_max_seconds": settings.INGEST_INTERVAL_MAX_SECONDS,
             "ingest_round_timeout_seconds": settings.INGEST_ROUND_TIMEOUT_SECONDS,
             "cloud_sync_error": message,
         },
@@ -3708,6 +3709,42 @@ def _supervisor_failure_sleep_seconds(consecutive_failures: int) -> float:
     return float(min(300, base * (2 ** exponent)))
 
 
+def _normalize_ingest_interval_bounds(
+    interval_seconds: Optional[int],
+    interval_min_seconds: Optional[int],
+    interval_max_seconds: Optional[int],
+) -> tuple[int, int]:
+    if interval_min_seconds is None and interval_max_seconds is None:
+        if interval_seconds is None:
+            interval_min_seconds = settings.INGEST_INTERVAL_MIN_SECONDS
+            interval_max_seconds = settings.INGEST_INTERVAL_MAX_SECONDS
+        else:
+            interval_min_seconds = interval_seconds
+            interval_max_seconds = interval_seconds
+    elif interval_min_seconds is None:
+        interval_min_seconds = interval_max_seconds
+    elif interval_max_seconds is None:
+        interval_max_seconds = interval_min_seconds
+
+    assert interval_min_seconds is not None
+    assert interval_max_seconds is not None
+    interval_min = max(1, int(interval_min_seconds))
+    interval_max = max(1, int(interval_max_seconds))
+    if interval_max < interval_min:
+        raise ValueError(
+            "ingest interval max seconds must be >= ingest interval min seconds"
+        )
+    return interval_min, interval_max
+
+
+def _sample_ingest_interval_seconds(interval_min: int, interval_max: int) -> float:
+    interval_min = max(1, int(interval_min))
+    interval_max = max(interval_min, int(interval_max))
+    if interval_max == interval_min:
+        return float(interval_min)
+    return float(random.randint(interval_min, interval_max))
+
+
 def _current_ingest_module_name() -> str:
     package = (__package__ or "").strip()
     if package:
@@ -3717,13 +3754,23 @@ def _current_ingest_module_name() -> str:
 
 def run_supervisor_loop(
     *,
-    interval_seconds: int,
+    interval_seconds: Optional[int],
     round_timeout_seconds: int,
     digest_reserved_seconds: int,
     verbose: bool,
+    interval_min_seconds: Optional[int] = None,
+    interval_max_seconds: Optional[int] = None,
 ) -> int:
     """Run ingest rounds in child processes and hard-kill overrun rounds."""
-    interval = max(1, int(interval_seconds))
+    try:
+        interval_min, interval_max = _normalize_ingest_interval_bounds(
+            interval_seconds,
+            interval_min_seconds,
+            interval_max_seconds,
+        )
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 1
     timeout = max(1, int(round_timeout_seconds))
     kill_grace = max(1, int(settings.INGEST_CHILD_KILL_GRACE_SECONDS))
 
@@ -3836,16 +3883,23 @@ def run_supervisor_loop(
                         )
 
             elapsed = time.time() - started
+            idle_delay = _sample_ingest_interval_seconds(interval_min, interval_max)
             if failed_round:
                 consecutive_failures += 1
                 sleep_for = max(
-                    max(0.0, float(interval) - elapsed),
+                    idle_delay,
                     _supervisor_failure_sleep_seconds(consecutive_failures),
                 )
             else:
                 consecutive_failures = 0
-                sleep_for = max(0.0, float(interval) - elapsed)
-            log.info("loop sleeping %.1fs", sleep_for)
+                sleep_for = idle_delay
+            log.info(
+                "loop sleeping %.1fs interval_range=%s-%ss elapsed=%.1fs",
+                sleep_for,
+                interval_min,
+                interval_max,
+                elapsed,
+            )
             try:
                 _sleep_or_stop(sleep_for)
             except _SupervisorShutdown as exc:
@@ -3901,8 +3955,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--interval-seconds",
         type=int,
-        default=settings.INGEST_INTERVAL_SECONDS,
-        help="Sleep between iterations when --loop is set (default 1800)",
+        default=None,
+        help=(
+            "Legacy fixed idle delay between completed loop iterations. "
+            "If omitted, the configured min/max interval range is used."
+        ),
+    )
+    parser.add_argument(
+        "--interval-min-seconds",
+        type=int,
+        default=None,
+        help="Minimum idle delay after a completed loop iteration",
+    )
+    parser.add_argument(
+        "--interval-max-seconds",
+        type=int,
+        default=None,
+        help="Maximum idle delay after a completed loop iteration",
     )
     parser.add_argument(
         "--round-timeout-seconds",
@@ -3999,6 +4068,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.loop:
         return run_supervisor_loop(
             interval_seconds=args.interval_seconds,
+            interval_min_seconds=args.interval_min_seconds,
+            interval_max_seconds=args.interval_max_seconds,
             round_timeout_seconds=args.round_timeout_seconds,
             digest_reserved_seconds=args.digest_reserved_seconds,
             verbose=args.verbose,

@@ -224,6 +224,30 @@ def _require_less(
         raise RuntimeError(f"{left_name} must be smaller than {right_name}")
 
 
+def _require_at_least(
+    name: str,
+    value: int,
+    minimum_name: str,
+    minimum_value: int,
+) -> None:
+    if value < minimum_value:
+        raise RuntimeError(f"{name} must be >= {minimum_name}")
+
+
+def _default_interval_min_seconds(base_seconds: int) -> int:
+    base = max(0, int(base_seconds))
+    if base <= 0:
+        return 0
+    return max(1, (base * 3) // 4)
+
+
+def _default_interval_max_seconds(base_seconds: int) -> int:
+    base = max(0, int(base_seconds))
+    if base <= 0:
+        return 0
+    return max(_default_interval_min_seconds(base), (base * 5) // 4)
+
+
 def _require_choice(name: str, value: str, choices: Tuple[str, ...]) -> str:
     normalized = str(value or "").strip().lower()
     if normalized not in choices:
@@ -477,6 +501,38 @@ INSIGHTS_UPDATE_INTERVAL_SECONDS = _require_int_range(
     ),
     min_value=0,
     max_value=4 * 24 * 60 * 60,
+)
+_insights_update_interval_min_env = _env_optional_int(
+    "HNREADER_INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS"
+)
+INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS = _require_int_range(
+    "HNREADER_INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS",
+    (
+        _insights_update_interval_min_env
+        if _insights_update_interval_min_env is not None
+        else _default_interval_min_seconds(INSIGHTS_UPDATE_INTERVAL_SECONDS)
+    ),
+    min_value=0,
+    max_value=4 * 24 * 60 * 60,
+)
+_insights_update_interval_max_env = _env_optional_int(
+    "HNREADER_INSIGHTS_UPDATE_INTERVAL_MAX_SECONDS"
+)
+INSIGHTS_UPDATE_INTERVAL_MAX_SECONDS = _require_int_range(
+    "HNREADER_INSIGHTS_UPDATE_INTERVAL_MAX_SECONDS",
+    (
+        _insights_update_interval_max_env
+        if _insights_update_interval_max_env is not None
+        else _default_interval_max_seconds(INSIGHTS_UPDATE_INTERVAL_SECONDS)
+    ),
+    min_value=0,
+    max_value=4 * 24 * 60 * 60,
+)
+_require_at_least(
+    "HNREADER_INSIGHTS_UPDATE_INTERVAL_MAX_SECONDS",
+    INSIGHTS_UPDATE_INTERVAL_MAX_SECONDS,
+    "HNREADER_INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS",
+    INSIGHTS_UPDATE_INTERVAL_MIN_SECONDS,
 )
 INSIGHTS_MIN_TODAY_STORIES = _require_int_range(
     "HNREADER_INSIGHTS_MIN_TODAY_STORIES",
@@ -1642,6 +1698,40 @@ INGEST_INTERVAL_SECONDS = _require_int_range(
     ),
     min_value=1,
     max_value=24 * 60 * 60,
+)
+_ingest_interval_min_env = _env_optional_int(
+    "HNREADER_INGEST_INTERVAL_MIN_SECONDS",
+    fallback="HACKERMINI_INGEST_INTERVAL_MIN_SECONDS",
+)
+INGEST_INTERVAL_MIN_SECONDS = _require_int_range(
+    "HNREADER_INGEST_INTERVAL_MIN_SECONDS",
+    (
+        _ingest_interval_min_env
+        if _ingest_interval_min_env is not None
+        else 15 * 60
+    ),
+    min_value=1,
+    max_value=24 * 60 * 60,
+)
+_ingest_interval_max_env = _env_optional_int(
+    "HNREADER_INGEST_INTERVAL_MAX_SECONDS",
+    fallback="HACKERMINI_INGEST_INTERVAL_MAX_SECONDS",
+)
+INGEST_INTERVAL_MAX_SECONDS = _require_int_range(
+    "HNREADER_INGEST_INTERVAL_MAX_SECONDS",
+    (
+        _ingest_interval_max_env
+        if _ingest_interval_max_env is not None
+        else 45 * 60
+    ),
+    min_value=1,
+    max_value=24 * 60 * 60,
+)
+_require_at_least(
+    "HNREADER_INGEST_INTERVAL_MAX_SECONDS",
+    INGEST_INTERVAL_MAX_SECONDS,
+    "HNREADER_INGEST_INTERVAL_MIN_SECONDS",
+    INGEST_INTERVAL_MIN_SECONDS,
 )
 INGEST_ROUND_TIMEOUT_SECONDS = _require_int_range(
     "HNREADER_INGEST_ROUND_TIMEOUT_SECONDS",
