@@ -510,6 +510,7 @@ def _select_evidence_rows(
     window_rows: Sequence[Any],
     *,
     today_rows: Sequence[Any],
+    target_date: str,
     feed_ranks: Mapping[int, Mapping[str, int]],
     max_rows: int,
 ) -> List[Any]:
@@ -531,10 +532,20 @@ def _select_evidence_rows(
 
     add_rows(today_rows)
     if len(selected) < cap:
+        today_count = len(selected)
+        ratio = float(settings.INSIGHTS_PRIOR_WINDOW_EVIDENCE_MAX_RATIO)
+        prior_cap = 0
+        if today_count > 0 and ratio > 0:
+            prior_cap = int(today_count * ratio / (1.0 - ratio))
+            prior_cap = min(max(0, prior_cap), cap - today_count)
+        prior_rows = [
+            row for row in window_rows
+            if repository.date_in_digest_tz(int(row["hn_time"] or 0)) != target_date
+        ]
         add_rows(
             _limit_insight_rows(
-                window_rows,
-                max_rows=cap,
+                prior_rows,
+                max_rows=prior_cap,
                 feed_ranks=feed_ranks,
             )
         )
@@ -2080,6 +2091,7 @@ def run_insights_once(
         evidence_rows = _select_evidence_rows(
             window_rows,
             today_rows=today_rows,
+            target_date=target_date,
             feed_ranks=feed_ranks,
             max_rows=settings.INSIGHTS_EVIDENCE_MAX_STORIES,
         )

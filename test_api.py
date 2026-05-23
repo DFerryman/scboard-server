@@ -991,6 +991,10 @@ class SettingsValidation(unittest.TestCase):
             launcher,
         )
         self.assertIn(
+            'HNREADER_INSIGHTS_PRIOR_WINDOW_EVIDENCE_MAX_RATIO="${HNREADER_INSIGHTS_PRIOR_WINDOW_EVIDENCE_MAX_RATIO:-0.30}"',
+            launcher,
+        )
+        self.assertIn(
             'HNREADER_INSIGHTS_WINDOW_DAYS="${HNREADER_INSIGHTS_WINDOW_DAYS:-3}"',
             launcher,
         )
@@ -2737,6 +2741,63 @@ class CloudSyncReadModel(_SqliteCase):
             "fresh_high_signal_stories",
             insights._fresh_material_update_reason(row, today_rows),
         )
+
+    def test_evidence_selection_caps_prior_window_rows(self):
+        from . import insights
+
+        target = "2026-05-19"
+        window_start, window_end, _ = insights._window_bounds(target, 3)
+        target_start, _ = repository.digest_date_epoch_bounds(target)
+        old_ratio = settings.INSIGHTS_PRIOR_WINDOW_EVIDENCE_MAX_RATIO
+        try:
+            settings.INSIGHTS_PRIOR_WINDOW_EVIDENCE_MAX_RATIO = 0.30  # type: ignore[assignment]
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    for offset in range(160):
+                        self._insert_done_story(
+                            conn,
+                            10_000 + offset,
+                            target_start + offset * 60,
+                            score=200 - offset,
+                        )
+                    for offset in range(200):
+                        self._insert_done_story(
+                            conn,
+                            20_000 + offset,
+                            target_start - 86400 + offset * 60,
+                            score=300 - offset,
+                        )
+                window_rows = repository.candidate_rows_for_insights(
+                    conn,
+                    start_ts=window_start,
+                    end_ts=window_end,
+                )
+                today_rows = [
+                    row for row in window_rows
+                    if repository.date_in_digest_tz(int(row["hn_time"] or 0)) == target
+                ]
+            finally:
+                conn.close()
+            evidence_rows = insights._select_evidence_rows(
+                window_rows,
+                today_rows=today_rows,
+                target_date=target,
+                feed_ranks={},
+                max_rows=300,
+            )
+        finally:
+            settings.INSIGHTS_PRIOR_WINDOW_EVIDENCE_MAX_RATIO = old_ratio  # type: ignore[assignment]
+
+        today_count = sum(
+            1
+            for row in evidence_rows
+            if repository.date_in_digest_tz(int(row["hn_time"] or 0)) == target
+        )
+        prior_count = len(evidence_rows) - today_count
+        self.assertEqual(today_count, 160)
+        self.assertEqual(prior_count, 68)
+        self.assertEqual(len(evidence_rows), 228)
 
     def test_opportunity_and_debate_inputs_do_not_backfill_low_signal_windows(self):
         from . import insights
