@@ -213,12 +213,11 @@ def recent_cloud_sync_runs(
 def last_successful_cloud_sync_version(
     conn: sqlite3.Connection,
 ) -> Optional[int]:
-    """The last syncVersion that was successfully pushed (used for meta.previousVersion).
+    """The last syncVersion from a fully successful cloud sync run.
 
-    Returning ``None`` means nothing has ever been pushed successfully -- in
-    that case both cleanup and previousVersion must be treated as "there is no
-    previous version" rather than blindly using ``currentVersion - 1``, to
-    avoid referencing a version number that does not actually exist in the cloud.
+    Returning ``None`` means no full business+dashboard cloud sync has ever
+    completed; callers that care only about business switchMeta should use
+    ``last_published_cloud_sync_version``.
     """
     try:
         row = conn.execute(
@@ -245,13 +244,74 @@ def recent_successful_cloud_sync_versions(
     *,
     limit: int,
 ) -> List[int]:
-    """Return distinct recently successful cloud sync versions, newest first."""
+    """Return distinct recently fully successful cloud sync versions, newest first."""
     try:
         rows = conn.execute(
             """
             SELECT sync_version, MAX(started_at) AS last_started
             FROM cloud_sync_runs
             WHERE status = 'ok'
+              AND sync_version IS NOT NULL
+            GROUP BY sync_version
+            ORDER BY last_started DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+    except (sqlite3.Error, TypeError, ValueError):
+        return []
+    versions: List[int] = []
+    for row in rows:
+        try:
+            version = int(row["sync_version"])
+        except (TypeError, ValueError):
+            continue
+        if version >= 1 and version not in versions:
+            versions.append(version)
+    return versions
+
+
+def last_published_cloud_sync_version(
+    conn: sqlite3.Connection,
+) -> Optional[int]:
+    """The last syncVersion whose business data reached switchMeta.
+
+    ``warning`` rows count here because this status is assigned only after the
+    business publish succeeded and the dashboard phase failed.
+    """
+    try:
+        row = conn.execute(
+            """
+            SELECT sync_version
+            FROM cloud_sync_runs
+            WHERE status IN ('ok', 'warning')
+              AND sync_version IS NOT NULL
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or row["sync_version"] is None:
+        return None
+    try:
+        return int(row["sync_version"])
+    except (TypeError, ValueError):
+        return None
+
+
+def recent_published_cloud_sync_versions(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+) -> List[int]:
+    """Return distinct recently business-published cloud versions, newest first."""
+    try:
+        rows = conn.execute(
+            """
+            SELECT sync_version, MAX(started_at) AS last_started
+            FROM cloud_sync_runs
+            WHERE status IN ('ok', 'warning')
               AND sync_version IS NOT NULL
             GROUP BY sync_version
             ORDER BY last_started DESC

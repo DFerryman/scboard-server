@@ -94,7 +94,7 @@ def _check_config() -> Optional[str]:
 
 
 def _local_cloud_versions() -> tuple[int, Optional[int]]:
-    """Return local catalog_version and the last syncVersion recorded as ok."""
+    """Return local catalog_version and the last fully successful syncVersion."""
     conn = db.connect_readonly()
     try:
         raw_current = repository.get_catalog_version(conn) or "0"

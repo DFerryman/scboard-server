@@ -14652,6 +14652,42 @@ class DashboardProjectionContract(_SqliteCase):
         finally:
             conn.close()
 
+    def test_last_published_cloud_sync_version_includes_business_published_warning(self):
+        from . import dashboard_projection
+
+        now = int(time.time())
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                rows = [
+                    ("r-ok", now - 300, now - 290, "ok", 11, None),
+                    (
+                        "r-warning",
+                        now - 100,
+                        now - 90,
+                        "warning",
+                        12,
+                        "business ok; dashboard publish failed: writeDashboard failed",
+                    ),
+                    ("r-failed", now - 50, now - 40, "failed", None, "push failed"),
+                ]
+                for row in rows:
+                    conn.execute(
+                        "INSERT INTO cloud_sync_runs(run_id, started_at, finished_at, status, sync_version, error) "
+                        "VALUES(?, ?, ?, ?, ?, ?)",
+                        row,
+                    )
+        finally:
+            conn.close()
+        conn = db.connect_readonly()
+        try:
+            self.assertEqual(
+                dashboard_projection.last_published_cloud_sync_version(conn),
+                12,
+            )
+        finally:
+            conn.close()
+
     def test_recent_successful_cloud_sync_versions_returns_distinct_recent_ok(self):
         from . import dashboard_projection
 
@@ -14679,6 +14715,50 @@ class DashboardProjectionContract(_SqliteCase):
         try:
             self.assertEqual(
                 dashboard_projection.recent_successful_cloud_sync_versions(conn, limit=3),
+                [9, 8, 7],
+            )
+        finally:
+            conn.close()
+
+    def test_recent_published_cloud_sync_versions_includes_business_published_warning(self):
+        from . import dashboard_projection
+
+        now = int(time.time())
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                rows = [
+                    ("r-ok-7", now - 500, now - 490, "ok", 7, None),
+                    (
+                        "r-warning-8",
+                        now - 400,
+                        now - 390,
+                        "warning",
+                        8,
+                        "business ok; dashboard publish failed: timeout",
+                    ),
+                    ("r-ok-9", now - 300, now - 290, "ok", 9, None),
+                    (
+                        "r-warning-9",
+                        now - 100,
+                        now - 90,
+                        "warning",
+                        9,
+                        "business ok; dashboard publish failed: retry later",
+                    ),
+                ]
+                for row in rows:
+                    conn.execute(
+                        "INSERT INTO cloud_sync_runs(run_id, started_at, finished_at, status, sync_version, error) "
+                        "VALUES(?, ?, ?, ?, ?, ?)",
+                        row,
+                    )
+        finally:
+            conn.close()
+        conn = db.connect_readonly()
+        try:
+            self.assertEqual(
+                dashboard_projection.recent_published_cloud_sync_versions(conn, limit=3),
                 [9, 8, 7],
             )
         finally:
@@ -14878,6 +14958,41 @@ class CloudSyncPreviousVersionUsesLastSuccessful(_SqliteCase):
         # the cloud last time.
         self.assertEqual(meta["previousVersion"], 16)
         self.assertEqual(meta["retainedVersions"][:4], [20, 16, 15, 14])
+
+    def test_previous_version_reflects_business_published_warning_run(self):
+        from . import cloud_sync
+
+        now = int(time.time())
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "catalog_version", "20")
+                for row in [
+                    ("r-ok-15", now - 700, now - 690, "ok", 15, None),
+                    ("r-ok-16", now - 600, now - 590, "ok", 16, None),
+                    (
+                        "r-warning-18",
+                        now - 100,
+                        now - 90,
+                        "warning",
+                        18,
+                        "business ok; dashboard publish failed: writeDashboard failed",
+                    ),
+                ]:
+                    conn.execute(
+                        "INSERT INTO cloud_sync_runs(run_id, started_at, finished_at, status, sync_version, error) "
+                        "VALUES(?, ?, ?, ?, ?, ?)",
+                        row,
+                    )
+        finally:
+            conn.close()
+
+        out_dir = Path(self.tmpdir) / "read-model-warning"
+        cloud_sync.build_read_model(out_dir, include_dashboard=False)
+        meta = json.loads((out_dir / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["currentVersion"], 20)
+        self.assertEqual(meta["previousVersion"], 18)
+        self.assertEqual(meta["retainedVersions"][:3], [20, 18, 16])
 
     def test_previous_version_is_none_when_never_pushed_successfully(self):
         from . import cloud_sync

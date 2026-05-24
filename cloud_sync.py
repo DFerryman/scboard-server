@@ -474,10 +474,10 @@ def build_read_model(
         # while retainedVersions controls cleanup. Blindly using ``currentVersion - 1``
         # would write a version number the cloud does not have into meta
         # (which can happen after any failed/skipped push), so take the last
-        # successfully pushed version from cloud_sync_runs as the
-        # authoritative value, falling back to None only on the first push or
+        # business-published version from cloud_sync_runs as the authoritative
+        # value, falling back to None only on the first push or
         # when the cloud_sync_runs table is empty.
-        last_pushed = dashboard_projection.last_successful_cloud_sync_version(conn)
+        last_pushed = dashboard_projection.last_published_cloud_sync_version(conn)
         if last_pushed is not None and last_pushed >= current_version:
             # Current version already pushed (re-running the same catalog) ->
             # there is no "previous version" to clean up.
@@ -489,7 +489,7 @@ def build_read_model(
 
         retained_versions = [current_version]
         history_limit = max(1, int(settings.CLOUD_SYNC_RETAINED_VERSION_COUNT) - 1)
-        for version in dashboard_projection.recent_successful_cloud_sync_versions(
+        for version in dashboard_projection.recent_published_cloud_sync_versions(
             conn, limit=history_limit
         ):
             if version != current_version and version not in retained_versions:
