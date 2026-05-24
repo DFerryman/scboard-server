@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 from . import cloud_push
@@ -16,6 +17,7 @@ _PAYLOAD_TOO_LARGE_CODES = {
     "PAYLOAD_TOO_LARGE",
     "REQUEST_ENTITY_TOO_LARGE",
 }
+_UPLOAD_SECRET_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def _require_config(url: str, secret: str) -> tuple[str, str]:
@@ -25,6 +27,8 @@ def _require_config(url: str, secret: str) -> tuple[str, str]:
         raise StoryImageUploadError("story image upload URL is not configured")
     if not clean_secret:
         raise StoryImageUploadError("story image upload secret is not configured")
+    if not _UPLOAD_SECRET_RE.fullmatch(clean_secret):
+        raise StoryImageUploadError("story image upload secret must be 64 hexadecimal characters")
     return clean_url, clean_secret
 
 

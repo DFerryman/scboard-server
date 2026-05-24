@@ -337,6 +337,8 @@ def row_to_story(row: sqlite3.Row, feed: Optional[str] = None) -> Story:
         _row_optional(row, "topic_name", ""),
     )
 
+    image_file_id = _row_optional(row, "image_file_id", "") or ""
+    image_url = "" if image_file_id else (_row_optional(row, "image_url", "") or "")
     return Story(
         id=row["id"],
         type=_story_type_from(row, feed),
@@ -350,8 +352,8 @@ def row_to_story(row: sqlite3.Row, feed: Optional[str] = None) -> Story:
         time=int(hn_time or 0),
         updatedAt=int(enriched_at) if enriched_at else None,
         topic=topic,
-        imageUrl=_row_optional(row, "image_url", "") or "",
-        imageFileID=_row_optional(row, "image_file_id", "") or "",
+        imageUrl=image_url,
+        imageFileID=image_file_id,
         imageSourceUrl=_row_optional(row, "image_source_url", "") or "",
         aiSummary=row["ai_summary"] or "",
         discussionThemes=_coerce_discussion_themes(
@@ -2008,6 +2010,7 @@ def record_story_image_upload(
 ) -> None:
     now = int(checked_at or now_seconds())
     clean_image_file_id = str(image_file_id or "").strip()
+    stored_image_url = "" if clean_image_file_id else (image_url or "")
     if clean_image_file_id:
         delete_after = now + int(settings.STORY_IMAGE_DELETE_GRACE_SECONDS)
         conn.execute(
@@ -2037,7 +2040,7 @@ def record_story_image_upload(
         WHERE id=?
         """,
         (
-            image_url or "",
+            stored_image_url,
             clean_image_file_id,
             image_source_url or "",
             now,
@@ -2069,7 +2072,7 @@ def record_story_image_upload(
         (
             clean_image_file_id,
             int(story_id),
-            image_url or "",
+            stored_image_url,
             image_source_url or "",
             cloud_path or "",
             sha256 or "",

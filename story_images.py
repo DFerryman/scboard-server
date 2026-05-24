@@ -198,36 +198,31 @@ def extract_image_candidates(html_text: str, base_url: str) -> List[ImageCandida
 
 
 def _normalize_image(raw: bytes, *, max_pixels: int) -> bytes:
-    old_limit = Image.MAX_IMAGE_PIXELS
-    Image.MAX_IMAGE_PIXELS = max_pixels
-    try:
-        with Image.open(BytesIO(raw)) as im:
-            im.seek(0)
-            if int(im.width) * int(im.height) > int(max_pixels):
-                raise StoryImageError(
-                    f"image has {int(im.width) * int(im.height)} pixels > limit {max_pixels}"
-                )
-            im = im.convert("RGBA")
-            size = _thumbnail_size()
-            thumb = ImageOps.contain(
-                im, (size, size),
-                method=Image.Resampling.LANCZOS,
+    with Image.open(BytesIO(raw)) as im:
+        im.seek(0)
+        if int(im.width) * int(im.height) > int(max_pixels):
+            raise StoryImageError(
+                f"image has {int(im.width) * int(im.height)} pixels > limit {max_pixels}"
             )
-            out = Image.new(
-                "RGBA", (size, size), (0, 0, 0, 255)
-            )
-            out.alpha_composite(
-                thumb,
-                (
-                    (size - thumb.width) // 2,
-                    (size - thumb.height) // 2,
-                ),
-            )
-            buf = BytesIO()
-            out.convert("RGB").save(buf, format="PNG", optimize=True)
-            return buf.getvalue()
-    finally:
-        Image.MAX_IMAGE_PIXELS = old_limit
+        im = im.convert("RGBA")
+        size = _thumbnail_size()
+        thumb = ImageOps.contain(
+            im, (size, size),
+            method=Image.Resampling.LANCZOS,
+        )
+        out = Image.new(
+            "RGBA", (size, size), (0, 0, 0, 255)
+        )
+        out.alpha_composite(
+            thumb,
+            (
+                (size - thumb.width) // 2,
+                (size - thumb.height) // 2,
+            ),
+        )
+        buf = BytesIO()
+        out.convert("RGB").save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
 
 
 def _cloud_path(story_id: int, sha256_hex: str) -> str:
@@ -318,7 +313,10 @@ def process_story_images_for_ids(story_ids: Sequence[int]) -> Dict[str, Any]:
         conn.close()
     todo = [
         row for row in rows
-        if not (str(row.get("image_status") or "") == "ready" and row.get("image_url"))
+        if not (
+            str(row.get("image_status") or "") == "ready"
+            and (row.get("image_file_id") or row.get("image_url"))
+        )
     ]
     summary: Dict[str, Any] = {
         "skipped": False,
@@ -404,12 +402,11 @@ def process_story_images_for_ids(story_ids: Sequence[int]) -> Dict[str, Any]:
                     for story_id, item in by_story.items():
                         result = uploaded.get(story_id) or {}
                         file_id = str(result.get("fileID") or "")
-                        image_url = str(result.get("tempFileURL") or result.get("url") or "")
-                        if file_id and image_url:
+                        if file_id:
                             repository.record_story_image_upload(
                                 conn,
                                 story_id=story_id,
-                                image_url=image_url,
+                                image_url="",
                                 image_file_id=file_id,
                                 image_source_url=item.source_url,
                                 cloud_path=item.cloud_path,
@@ -423,7 +420,7 @@ def process_story_images_for_ids(story_ids: Sequence[int]) -> Dict[str, Any]:
                                 status="failed",
                                 error=str(
                                     result.get("error")
-                                    or "upload result missing fileID/tempFileURL"
+                                    or "upload result missing fileID"
                                 ),
                             )
                             summary["failed"] += 1

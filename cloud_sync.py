@@ -128,6 +128,7 @@ def _story_to_doc(
     feed_ranks: Dict[str, int],
     default_type: str,
 ) -> dict:
+    image_url = "" if story.imageFileID else story.imageUrl
     return {
         "_id": f"{sync_version}:{story.id}",
         "id": story.id,
@@ -143,7 +144,7 @@ def _story_to_doc(
         "time": story.time,
         "updatedAt": story.updatedAt,
         "topic": story.topic,
-        "imageUrl": story.imageUrl,
+        "imageUrl": image_url,
         "imageFileID": story.imageFileID,
         "imageSourceUrl": story.imageSourceUrl,
         "aiSummary": story.aiSummary,
@@ -160,6 +161,7 @@ def _story_to_doc(
 
 def _client_story_dict_from_story(story: Story) -> dict:
     """Shape the read cloud function will return -- used inside digest docs."""
+    image_url = "" if story.imageFileID else story.imageUrl
     return {
         "id": story.id,
         "type": story.type.value,
@@ -173,7 +175,7 @@ def _client_story_dict_from_story(story: Story) -> dict:
         "time": story.time,
         "updatedAt": story.updatedAt,
         "topic": story.topic,
-        "imageUrl": story.imageUrl,
+        "imageUrl": image_url,
         "imageFileID": story.imageFileID,
         "imageSourceUrl": story.imageSourceUrl,
         "aiSummary": story.aiSummary,

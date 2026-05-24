@@ -17286,6 +17286,29 @@ class StoryImagePipelineTests(_SqliteCase):
         finally:
             settings.STORY_IMAGE_THUMBNAIL_SIZE = old_size  # type: ignore[assignment]
 
+    def test_normalize_image_does_not_change_global_pillow_pixel_limit(self):
+        from PIL import Image
+        from . import story_images
+
+        src = io.BytesIO()
+        Image.new("RGB", (20, 20), (10, 20, 30)).save(src, format="PNG")
+        old_limit = Image.MAX_IMAGE_PIXELS
+        observed_limits = []
+        real_open = Image.open
+        try:
+            Image.MAX_IMAGE_PIXELS = 987_654_321
+
+            def observing_open(*args, **kwargs):
+                observed_limits.append(Image.MAX_IMAGE_PIXELS)
+                return real_open(*args, **kwargs)
+
+            with patch.object(story_images.Image, "open", side_effect=observing_open):
+                story_images._normalize_image(src.getvalue(), max_pixels=1_000_000)
+        finally:
+            Image.MAX_IMAGE_PIXELS = old_limit
+
+        self.assertEqual(observed_limits, [987_654_321])
+
     def test_process_story_images_uploads_and_records_asset(self):
         from . import story_images
         from .story_images import ProcessedImage
@@ -17316,13 +17339,12 @@ class StoryImagePipelineTests(_SqliteCase):
                 101: {
                     "storyId": 101,
                     "fileID": "cloud://env/hn/story-thumbs/v1/101.png",
-                    "tempFileURL": "https://temp.example/101.png",
                 }
             }
 
         with patch.object(settings, "STORY_IMAGES_ENABLED", True), \
              patch.object(settings, "STORY_IMAGE_UPLOAD_URL", "https://8.8.8.8/uploadStoryImages"), \
-             patch.object(settings, "STORY_IMAGE_UPLOAD_SECRET", "secret"), \
+             patch.object(settings, "STORY_IMAGE_UPLOAD_SECRET", VALID_CLOUD_PUSH_SECRET), \
              patch.object(story_images, "fetch_and_normalize_story_image", side_effect=fake_fetch), \
              patch.object(story_images.cloud_image_upload, "upload_story_images", side_effect=fake_upload):
             summary = story_images.process_story_images_for_ids([101])
@@ -17338,10 +17360,58 @@ class StoryImagePipelineTests(_SqliteCase):
             ).fetchone()
         finally:
             conn.close()
-        self.assertEqual(row["image_url"], "https://temp.example/101.png")
+        self.assertEqual(row["image_url"], "")
         self.assertEqual(row["image_file_id"], "cloud://env/hn/story-thumbs/v1/101.png")
         self.assertEqual(asset["status"], "ready")
         self.assertEqual(asset["sha256"], digest)
+
+    def test_upload_story_images_rejects_weak_secret_before_posting(self):
+        from . import cloud_image_upload
+
+        with patch.object(cloud_image_upload.cloud_push, "_post") as post:
+            with self.assertRaisesRegex(
+                cloud_image_upload.StoryImageUploadError,
+                "64 hexadecimal",
+            ):
+                cloud_image_upload.upload_story_images(
+                    url="https://upload.example/uploadStoryImages",
+                    secret="secret",
+                    images=[{"storyId": 1, "pngBase64": "x"}],
+                    batch_size=1,
+                    timeout_seconds=7,
+                )
+
+        post.assert_not_called()
+
+    def test_process_story_images_skips_ready_file_id_without_image_url(self):
+        from . import story_images
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                self._insert_story(conn, 102, done=False)
+                repository.record_story_image_upload(
+                    conn,
+                    story_id=102,
+                    image_url="",
+                    image_file_id="cloud://env/hn/story-thumbs/v1/102.png",
+                    image_source_url="https://cdn.example/102.png",
+                    cloud_path="hn/story-thumbs/v1/102.png",
+                    sha256="a" * 64,
+                )
+        finally:
+            conn.close()
+
+        with patch.object(settings, "STORY_IMAGES_ENABLED", True), \
+             patch.object(settings, "STORY_IMAGE_UPLOAD_URL", "https://8.8.8.8/uploadStoryImages"), \
+             patch.object(settings, "STORY_IMAGE_UPLOAD_SECRET", VALID_CLOUD_PUSH_SECRET), \
+             patch.object(story_images, "fetch_and_normalize_story_image") as fetch:
+            summary = story_images.process_story_images_for_ids([102])
+
+        fetch.assert_not_called()
+        self.assertEqual(summary["already_ready"], 1)
+        self.assertEqual(summary["processed"], 0)
+        self.assertEqual(summary["uploaded"], 0)
 
     def test_upload_story_images_splits_payload_limited_batches(self):
         from . import cloud_image_upload
@@ -17374,7 +17444,7 @@ class StoryImagePipelineTests(_SqliteCase):
         with patch.object(cloud_image_upload.cloud_push, "_post", side_effect=fake_post):
             uploaded = cloud_image_upload.upload_story_images(
                 url="https://upload.example/uploadStoryImages",
-                secret="secret",
+                secret=VALID_CLOUD_PUSH_SECRET,
                 images=images,
                 batch_size=4,
                 timeout_seconds=7,
@@ -17398,7 +17468,7 @@ class StoryImagePipelineTests(_SqliteCase):
         with patch.object(cloud_image_upload.cloud_push, "_post", side_effect=fake_post):
             uploaded = cloud_image_upload.upload_story_images(
                 url="https://upload.example/uploadStoryImages",
-                secret="secret",
+                secret=VALID_CLOUD_PUSH_SECRET,
                 images=[{"storyId": 9, "pngBase64": "x"}],
                 batch_size=1,
                 timeout_seconds=7,
@@ -17433,7 +17503,7 @@ class StoryImagePipelineTests(_SqliteCase):
         with patch.object(cloud_image_upload.cloud_push, "_post", side_effect=fake_post):
             uploaded = cloud_image_upload.upload_story_images(
                 url="https://upload.example/uploadStoryImages",
-                secret="secret",
+                secret=VALID_CLOUD_PUSH_SECRET,
                 images=images,
                 batch_size=3,
                 timeout_seconds=7,
@@ -17458,7 +17528,7 @@ class StoryImagePipelineTests(_SqliteCase):
         with patch.object(cloud_image_upload.cloud_push, "_post", side_effect=fake_post):
             uploaded = cloud_image_upload.upload_story_images(
                 url="https://upload.example/uploadStoryImages",
-                secret="secret",
+                secret=VALID_CLOUD_PUSH_SECRET,
                 images=[{"storyId": 21, "pngBase64": "x"}],
                 batch_size=1,
                 timeout_seconds=7,
@@ -17512,7 +17582,7 @@ class StoryImagePipelineTests(_SqliteCase):
             conn.close()
 
         self.assertEqual(story["image_file_id"], "cloud://env/151-new.png")
-        self.assertEqual(story["image_url"], "https://temp.example/151-new.png")
+        self.assertEqual(story["image_url"], "")
         self.assertEqual(assets["cloud://env/151-old.png"]["status"], "pending_delete")
         self.assertGreaterEqual(assets["cloud://env/151-old.png"]["delete_after"], now)
         self.assertEqual(assets["cloud://env/151-new.png"]["status"], "ready")
@@ -17552,7 +17622,7 @@ class StoryImagePipelineTests(_SqliteCase):
             (out_dir / "stories.jsonl").read_text(encoding="utf-8").splitlines()[0]
         )
         manifest = json.loads((out_dir / "story_images.json").read_text(encoding="utf-8"))
-        self.assertEqual(story_doc["imageUrl"], "https://temp.example/201.png")
+        self.assertEqual(story_doc["imageUrl"], "")
         self.assertEqual(story_doc["imageFileID"], "cloud://env/hn/story-thumbs/v1/201.png")
         self.assertEqual(manifest["activeFileIDs"], ["cloud://env/hn/story-thumbs/v1/201.png"])
 
@@ -17660,7 +17730,7 @@ class StoryImagePipelineTests(_SqliteCase):
 
         with patch.object(settings, "STORY_IMAGES_ENABLED", True), \
              patch.object(settings, "STORY_IMAGE_UPLOAD_URL", "https://8.8.8.8/uploadStoryImages"), \
-             patch.object(settings, "STORY_IMAGE_UPLOAD_SECRET", "secret"), \
+             patch.object(settings, "STORY_IMAGE_UPLOAD_SECRET", VALID_CLOUD_PUSH_SECRET), \
              patch.object(settings, "STORY_IMAGE_DELETE_GRACE_SECONDS", 0), \
              patch.object(story_images.cloud_image_upload, "delete_story_images", side_effect=fake_delete):
             summary = story_images.cleanup_cloud_images_after_publish(
