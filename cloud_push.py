@@ -12,7 +12,7 @@ Dashboard publish (:func:`push_dashboard`, called independently):
                         runs in byte-limited batches
 
 Cleanup (:func:`cleanup_old`, after the business publish):
-    cleanupOld - delete old data where syncVersion NOT IN [current, previous],
+    cleanupOld - delete old data where syncVersion is not retained,
                  covering the stories / topics / hn_dashboard_* run collections.
 
 Why they are split: the business publish and the dashboard publish are
@@ -420,6 +420,26 @@ def _payload_json_bytes(payload: dict) -> bytes:
 
 def _payload_size_bytes(payload: dict) -> int:
     return len(_payload_json_bytes(payload))
+
+
+def _retained_versions_from_meta(meta: dict) -> List[int]:
+    versions: List[int] = []
+
+    def add(value: Any) -> None:
+        try:
+            version = int(value)
+        except (TypeError, ValueError):
+            return
+        if version >= 1 and version not in versions:
+            versions.append(version)
+
+    add(meta.get("currentVersion"))
+    raw_retained = meta.get("retainedVersions")
+    if isinstance(raw_retained, list):
+        for value in raw_retained:
+            add(value)
+    add(meta.get("previousVersion"))
+    return versions
 
 
 def _is_retryable_write_batch_response(response: dict) -> bool:
@@ -961,6 +981,7 @@ def push_read_model(
     insights = _load_required_jsonl(out_dir / "insights.jsonl")
     current_version = int(meta["currentVersion"])
     previous_version = meta.get("previousVersion")
+    retained_versions = _retained_versions_from_meta(meta)
     insights_content_changed = int(meta.get("insightsContentChanged") or 0)
     _validate_versioned_docs("stories", stories, current_version)
     _validate_versioned_docs("topics", topics, current_version)
@@ -1058,6 +1079,7 @@ def push_read_model(
     switch_meta_payload: Dict[str, Any] = {
         "currentVersion": current_version,
         "previousVersion": previous_version,
+        "retainedVersions": retained_versions,
         "feedCounts": meta["feedCounts"],
         "publishedAt": meta.get("publishedAt"),
         "manifest": manifest,
@@ -1072,14 +1094,10 @@ def push_read_model(
     log.info("[push] switchMeta ok: %s", r)
 
     # ---------- 4. cleanupOld (non-fatal) ----------
-    # keepVersions=[current, previous] -- keep only two generations in the
-    # cloud, which both allows rollback and sweeps away the partial residue
-    # of a few half-failed rounds in between (v17/18/19 partials are cleaned
-    # up together once v20 is ok).
+    # Keep the current snapshot and recently published historical snapshots
+    # so clients holding a cursor can continue pagination after a meta switch.
     cleanup_result: dict = {"skipped": True}
-    keep_versions: List[int] = [current_version]
-    if previous_version and int(previous_version) >= 1 and int(previous_version) != current_version:
-        keep_versions.append(int(previous_version))
+    keep_versions: List[int] = retained_versions or [current_version]
     remaining = _budget_remaining(deadline_at)
     if remaining is not None and remaining < _MIN_PER_CALL_SECONDS:
         log.info(
@@ -1102,6 +1120,7 @@ def push_read_model(
     return {
         "syncVersion": current_version,
         "previousVersion": previous_version,
+        "retainedVersions": retained_versions,
         "stories": sent["stories"],
         "topics": sent["topics"],
         "digests": sent["digests"],

@@ -14652,6 +14652,38 @@ class DashboardProjectionContract(_SqliteCase):
         finally:
             conn.close()
 
+    def test_recent_successful_cloud_sync_versions_returns_distinct_recent_ok(self):
+        from . import dashboard_projection
+
+        now = int(time.time())
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                rows = [
+                    ("r1", now - 500, now - 490, "ok", 7),
+                    ("r2", now - 400, now - 390, "ok", 8),
+                    ("r3", now - 300, now - 290, "failed", None),
+                    ("r4", now - 200, now - 190, "ok", 9),
+                    # Duplicate sync_version from a retry must not consume an extra slot.
+                    ("r5", now - 100, now - 90, "ok", 9),
+                ]
+                for row in rows:
+                    conn.execute(
+                        "INSERT INTO cloud_sync_runs(run_id, started_at, finished_at, status, sync_version) "
+                        "VALUES(?, ?, ?, ?, ?)",
+                        row,
+                    )
+        finally:
+            conn.close()
+        conn = db.connect_readonly()
+        try:
+            self.assertEqual(
+                dashboard_projection.recent_successful_cloud_sync_versions(conn, limit=3),
+                [9, 8, 7],
+            )
+        finally:
+            conn.close()
+
     def test_build_dashboard_projection_writes_three_files(self):
         from . import dashboard_projection
 
@@ -14824,16 +14856,17 @@ class CloudSyncPreviousVersionUsesLastSuccessful(_SqliteCase):
             with db.transaction(conn):
                 repository.set_meta(conn, "catalog_version", "20")
                 # The last successful push was v=16 (17 / 18 / 19 all failed).
-                conn.execute(
-                    "INSERT INTO cloud_sync_runs(run_id, started_at, finished_at, status, sync_version) "
-                    "VALUES(?, ?, ?, ?, ?)",
+                for row in [
+                    ("r-older-14", now - 800, now - 790, "ok", 14),
+                    ("r-older-15", now - 700, now - 690, "ok", 15),
                     ("r-old", now - 500, now - 490, "ok", 16),
-                )
-                conn.execute(
-                    "INSERT INTO cloud_sync_runs(run_id, started_at, finished_at, status, sync_version) "
-                    "VALUES(?, ?, ?, ?, ?)",
                     ("r-fail", now - 100, now - 90, "failed", None),
-                )
+                ]:
+                    conn.execute(
+                        "INSERT INTO cloud_sync_runs(run_id, started_at, finished_at, status, sync_version) "
+                        "VALUES(?, ?, ?, ?, ?)",
+                        row,
+                    )
         finally:
             conn.close()
 
@@ -14844,6 +14877,7 @@ class CloudSyncPreviousVersionUsesLastSuccessful(_SqliteCase):
         # Key point: not 19, but 16 -- the version that actually landed in
         # the cloud last time.
         self.assertEqual(meta["previousVersion"], 16)
+        self.assertEqual(meta["retainedVersions"][:4], [20, 16, 15, 14])
 
     def test_previous_version_is_none_when_never_pushed_successfully(self):
         from . import cloud_sync
@@ -14859,6 +14893,7 @@ class CloudSyncPreviousVersionUsesLastSuccessful(_SqliteCase):
         meta = json.loads((out_dir / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["currentVersion"], 3)
         self.assertIsNone(meta["previousVersion"])
+        self.assertEqual(meta["retainedVersions"], [3])
 
 
 class CloudSyncBusinessIdempotency(_SqliteCase):
@@ -15672,6 +15707,7 @@ class CloudPushBusinessDashboardSeparation(unittest.TestCase):
             "_id": "catalog",
             "currentVersion": 5,
             "previousVersion": 4,
+            "retainedVersions": [5, 4, 3, 2],
             "feedCounts": {},
             "publishedAt": int(time.time()),
         }
@@ -15772,22 +15808,22 @@ class CloudPushBusinessDashboardSeparation(unittest.TestCase):
 
         switch = next(p for p in payloads if p.get("action") == "switchMeta")
         self.assertNotIn("dashboardSummaryAt", switch["meta"])
+        self.assertEqual(switch["meta"]["retainedVersions"], [5, 4, 3, 2])
         # The manifest also no longer carries dashboard collections -- their
         # cleanup goes through cleanupOld+keepVersions.
         self.assertNotIn("dashboardIngestRuns", switch["meta"]["manifest"])
         self.assertNotIn("dashboardCloudSyncRuns", switch["meta"]["manifest"])
 
     def test_cleanup_old_uses_keep_versions_not_cutoff(self):
-        """The cleanupOld payload uses the new keepVersions=[current,
-        previous] protocol."""
+        """The cleanupOld payload keeps every retained snapshot version."""
         src = self._write_read_model(with_dashboard=True)
         payloads = self._capture_payloads(src)
 
         cleanup = next(p for p in payloads if p.get("action") == "cleanupOld")
         self.assertNotIn("cutoff", cleanup)
         self.assertIn("keepVersions", cleanup)
-        # current=5, previous=4 -- both versions must be kept.
-        self.assertEqual(sorted(cleanup["keepVersions"]), [4, 5])
+        # current plus retained historical snapshots must be kept.
+        self.assertEqual(cleanup["keepVersions"], [5, 4, 3, 2])
 
     def test_cleanup_old_keep_versions_drops_previous_when_none(self):
         """On the first push (previousVersion=None), keepVersions contains
@@ -15797,6 +15833,7 @@ class CloudPushBusinessDashboardSeparation(unittest.TestCase):
         src = self._write_read_model(with_dashboard=True)
         meta = json.loads((src / "meta.json").read_text(encoding="utf-8"))
         meta["previousVersion"] = None
+        meta["retainedVersions"] = [5]
         (src / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
 
         payloads = []

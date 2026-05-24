@@ -1830,6 +1830,16 @@ CLOUD_SYNC_TIMEOUT_SECONDS = _require_int_range(
     min_value=10,
     max_value=600,
 )
+CLOUD_SYNC_RETAINED_VERSION_COUNT = _require_int_range(
+    "HNREADER_CLOUD_SYNC_RETAINED_VERSION_COUNT",
+    _env_int(
+        "HNREADER_CLOUD_SYNC_RETAINED_VERSION_COUNT",
+        6,
+        fallback="HACKERMINI_CLOUD_SYNC_RETAINED_VERSION_COUNT",
+    ),
+    min_value=2,
+    max_value=50,
+)
 
 # ---------- Story image extraction / cloud storage ----------
 

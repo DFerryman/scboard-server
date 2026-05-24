@@ -240,6 +240,37 @@ def last_successful_cloud_sync_version(
     except (TypeError, ValueError):
         return None
 
+def recent_successful_cloud_sync_versions(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+) -> List[int]:
+    """Return distinct recently successful cloud sync versions, newest first."""
+    try:
+        rows = conn.execute(
+            """
+            SELECT sync_version, MAX(started_at) AS last_started
+            FROM cloud_sync_runs
+            WHERE status = 'ok'
+              AND sync_version IS NOT NULL
+            GROUP BY sync_version
+            ORDER BY last_started DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+    except (sqlite3.Error, TypeError, ValueError):
+        return []
+    versions: List[int] = []
+    for row in rows:
+        try:
+            version = int(row["sync_version"])
+        except (TypeError, ValueError):
+            continue
+        if version >= 1 and version not in versions:
+            versions.append(version)
+    return versions
+
 
 def _safe_ai_status_for_dashboard(ai_status: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Strip dashboard AI status of fields we don't want in cloud DB.

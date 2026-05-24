@@ -470,8 +470,8 @@ def build_read_model(
         # ---------- meta.json ----------
         #
         # previousVersion must point at a version number that actually still
-        # exists in the cloud -- cleanup uses it as the cutoff and switchMeta
-        # uses it as the rollback anchor. Blindly using ``currentVersion - 1``
+        # exists in the cloud -- switchMeta uses it as the rollback anchor,
+        # while retainedVersions controls cleanup. Blindly using ``currentVersion - 1``
         # would write a version number the cloud does not have into meta
         # (which can happen after any failed/skipped push), so take the last
         # successfully pushed version from cloud_sync_runs as the
@@ -487,11 +487,20 @@ def build_read_model(
         else:
             previous_version = None
 
+        retained_versions = [current_version]
+        history_limit = max(1, int(settings.CLOUD_SYNC_RETAINED_VERSION_COUNT) - 1)
+        for version in dashboard_projection.recent_successful_cloud_sync_versions(
+            conn, limit=history_limit
+        ):
+            if version != current_version and version not in retained_versions:
+                retained_versions.append(version)
+
         published_at = int(time.time())
         meta = {
             "_id": "catalog",
             "currentVersion": current_version,
             "previousVersion": previous_version,
+            "retainedVersions": retained_versions,
             "feedCounts": _build_feed_counts(conn, visible_ids),
             "publishedAt": published_at,
             "insightsUploaded": insight_count,
@@ -505,6 +514,7 @@ def build_read_model(
         stats = {
             "currentVersion": current_version,
             "previousVersion": previous_version,
+            "retainedVersions": retained_versions,
             "stories": story_count,
             "topics": len(topics),
             "digests": len(digest_rows),
