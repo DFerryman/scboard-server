@@ -6306,8 +6306,8 @@ class CloudSyncReadModel(_SqliteCase):
         from . import cloud_sync
 
         now = repository.now_seconds()
-        hn_time = 1700000000
-        digest_date = repository.date_in_digest_tz(hn_time)
+        digest_date = repository.today_in_digest_tz()
+        hn_time = repository.digest_date_epoch_bounds(digest_date)[0]
         conn = db.connect()
         try:
             with db.transaction(conn):
@@ -6437,6 +6437,46 @@ class CloudSyncReadModel(_SqliteCase):
         self.assertEqual(digest_docs[0]["_id"], f"1:{digest_date}")
         self.assertEqual(digest_docs[0]["syncVersion"], 1)
         self.assertEqual([s["id"] for s in digest_docs[0]["stories"]], [101])
+
+    def test_build_read_model_exports_only_recent_seven_digest_dates(self):
+        from . import cloud_sync
+
+        now = repository.now_seconds()
+        today = repository.today_in_digest_tz()
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "catalog_version", "1")
+                for days_ago in range(8):
+                    date = repository.digest_date_minus_days(days_ago)
+                    conn.execute(
+                        """
+                        INSERT INTO digests(date, intro, story_ids, generated_at)
+                        VALUES(?, ?, '[]', ?)
+                        """,
+                        (date, f"intro {days_ago}", now),
+                    )
+        finally:
+            conn.close()
+
+        out_dir = Path(self.tmpdir) / "recent-digest-read-model"
+        cloud_sync.build_read_model(out_dir, include_dashboard=False)
+
+        digest_docs = [
+            json.loads(line)
+            for line in (out_dir / "digests.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+        self.assertEqual(
+            sorted(doc["date"] for doc in digest_docs),
+            sorted(repository.digest_date_minus_days(days) for days in range(7)),
+        )
+        self.assertNotIn(
+            repository.digest_date_minus_days(7),
+            {doc["date"] for doc in digest_docs},
+        )
+        self.assertIn(today, {doc["date"] for doc in digest_docs})
 
     def test_build_read_model_does_not_publish_unmapped_legacy_topic_as_general(self):
         from . import cloud_sync

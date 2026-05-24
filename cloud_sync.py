@@ -396,8 +396,11 @@ def build_read_model(
         # writeBatch can succeed while switchMeta fails. The digest cloud
         # function only reads the doc for meta.currentVersion, so a half-pushed
         # digest never becomes visible early.
+        recent_digest_start = repository.digest_date_minus_days(6)
+        recent_digest_end = repository.today_in_digest_tz()
         digest_rows = conn.execute(
-            "SELECT date FROM digests ORDER BY date"
+            "SELECT date FROM digests WHERE date >= ? AND date <= ? ORDER BY date",
+            (recent_digest_start, recent_digest_end),
         ).fetchall()
         digests_path = out_dir / "digests.jsonl"
         digest_docs = []
