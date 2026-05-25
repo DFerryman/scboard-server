@@ -292,7 +292,10 @@ def main() -> None:
 
         # ----- digests -----
         digest_idx = {d["_id"]: d for d in digests_jsonl}
-        digest_rows = conn.execute("SELECT date FROM digests").fetchall()
+        digest_rows = conn.execute(
+            "SELECT date FROM digests WHERE date >= ? AND date <= ? ORDER BY date",
+            (recent_digest_start, recent_digest_end),
+        ).fetchall()
         for r in digest_rows:
             date = r["date"]
             exp_date, exp_intro, exp_stories = repository.get_digest(conn, date)
