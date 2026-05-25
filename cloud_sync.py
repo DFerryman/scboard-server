@@ -218,7 +218,10 @@ def _all_visible_story_ids(conn) -> List[int]:
         ).fetchall()
     }
     in_digests: set[int] = set()
-    for r in conn.execute("SELECT story_ids FROM digests").fetchall():
+    for r in conn.execute(
+        "SELECT story_ids FROM digests WHERE date >= ? AND date <= ?",
+        (recent_digest_start, recent_digest_end),
+    ).fetchall():
         try:
             ids = json.loads(r["story_ids"])
         except (TypeError, ValueError):
