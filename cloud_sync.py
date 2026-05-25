@@ -29,7 +29,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import ai_config_status, db, dashboard_projection, repository, settings
 from .schemas import Story, TopicEntry
@@ -209,8 +209,22 @@ def _collect_feed_ranks(conn) -> Dict[int, Dict[str, int]]:
     return out
 
 
-def _all_visible_story_ids(conn) -> List[int]:
+def _recent_digest_bounds() -> Tuple[str, str]:
+    return repository.digest_date_minus_days(6), repository.today_in_digest_tz()
+
+
+def _all_visible_story_ids(
+    conn,
+    *,
+    recent_digest_start: Optional[str] = None,
+    recent_digest_end: Optional[str] = None,
+) -> List[int]:
     """Union of ranked/digest stories that have real AI enrichment output."""
+    if recent_digest_start is None or recent_digest_end is None:
+        default_start, default_end = _recent_digest_bounds()
+        recent_digest_start = recent_digest_start or default_start
+        recent_digest_end = recent_digest_end or default_end
+
     in_rankings = {
         int(r["id"]) for r in conn.execute(
             "SELECT DISTINCT s.id FROM rankings r JOIN stories s ON s.id=r.story_id "
@@ -353,7 +367,12 @@ def build_read_model(
             )
 
         feed_ranks_index = _collect_feed_ranks(conn)
-        visible_ids = _all_visible_story_ids(conn)
+        recent_digest_start, recent_digest_end = _recent_digest_bounds()
+        visible_ids = _all_visible_story_ids(
+            conn,
+            recent_digest_start=recent_digest_start,
+            recent_digest_end=recent_digest_end,
+        )
 
         # ---------- stories.jsonl ----------
         stories_path = out_dir / "stories.jsonl"
@@ -399,8 +418,6 @@ def build_read_model(
         # writeBatch can succeed while switchMeta fails. The digest cloud
         # function only reads the doc for meta.currentVersion, so a half-pushed
         # digest never becomes visible early.
-        recent_digest_start = repository.digest_date_minus_days(6)
-        recent_digest_end = repository.today_in_digest_tz()
         digest_rows = conn.execute(
             "SELECT date FROM digests WHERE date >= ? AND date <= ? ORDER BY date",
             (recent_digest_start, recent_digest_end),

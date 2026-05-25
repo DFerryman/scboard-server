@@ -24,6 +24,7 @@ from .cloud_sync import (
     FEED_TYPES,
     _all_visible_story_ids,
     _list_ai_ready_topics,
+    _recent_digest_bounds,
     _story_is_ai_ready,
     default_output_dir,
 )
@@ -253,7 +254,12 @@ def main() -> None:
     try:
         sqlite_version = int(repository.get_catalog_version(conn) or "0")
         differ.expect("catalog_version", sqlite_version, current_version)
-        source_visible_ids = _all_visible_story_ids(conn)
+        recent_digest_start, recent_digest_end = _recent_digest_bounds()
+        source_visible_ids = _all_visible_story_ids(
+            conn,
+            recent_digest_start=recent_digest_start,
+            recent_digest_end=recent_digest_end,
+        )
 
         # ----- feed stories -----
         for feed in FEED_TYPES:

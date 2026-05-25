@@ -6478,6 +6478,60 @@ class CloudSyncReadModel(_SqliteCase):
         )
         self.assertIn(today, {doc["date"] for doc in digest_docs})
 
+    def test_build_read_model_limits_digest_only_stories_to_recent_digest_dates(self):
+        from . import cloud_sync
+
+        now = repository.now_seconds()
+        recent_date = repository.digest_date_minus_days(6)
+        old_date = repository.digest_date_minus_days(7)
+        recent_hn_time = repository.digest_date_epoch_bounds(recent_date)[0] + 3600
+        old_hn_time = repository.digest_date_epoch_bounds(old_date)[0] + 3600
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "catalog_version", "1")
+                self._insert_done_story(conn, 201, recent_hn_time)
+                self._insert_done_story(conn, 202, old_hn_time)
+                conn.execute(
+                    """
+                    INSERT INTO digests(date, intro, story_ids, generated_at)
+                    VALUES(?, 'recent', ?, ?)
+                    """,
+                    (recent_date, json.dumps([201]), now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO digests(date, intro, story_ids, generated_at)
+                    VALUES(?, 'old', ?, ?)
+                    """,
+                    (old_date, json.dumps([202]), now),
+                )
+        finally:
+            conn.close()
+
+        out_dir = Path(self.tmpdir) / "recent-digest-only-read-model"
+        stats = cloud_sync.build_read_model(out_dir, include_dashboard=False)
+
+        story_docs = [
+            json.loads(line)
+            for line in (out_dir / "stories.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+        digest_docs = [
+            json.loads(line)
+            for line in (out_dir / "digests.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+
+        self.assertEqual(stats["stories"], 1)
+        self.assertEqual([doc["id"] for doc in story_docs], [201])
+        self.assertEqual([doc["date"] for doc in digest_docs], [recent_date])
+        self.assertEqual([s["id"] for s in digest_docs[0]["stories"]], [201])
+
     def test_build_read_model_does_not_publish_unmapped_legacy_topic_as_general(self):
         from . import cloud_sync
 
@@ -6596,8 +6650,8 @@ class CloudSyncReadModel(_SqliteCase):
         from . import cloud_sync
 
         now = repository.now_seconds()
-        hn_time = 1700000000
-        digest_date = repository.date_in_digest_tz(hn_time)
+        digest_date = repository.today_in_digest_tz()
+        hn_time = repository.digest_date_epoch_bounds(digest_date)[0] + 3600
         story_ids = list(range(1, 902))
 
         conn = db.connect()
