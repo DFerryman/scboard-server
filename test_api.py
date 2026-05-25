@@ -2649,6 +2649,119 @@ class GdeltIntegration(_SqliteCase):
         payload = json.loads(codex.user_content)
         self.assertEqual(payload["articles"][0]["rawText"], long_text)
 
+    def test_intake_safety_default_codex_timeout_uses_safety_cap(self):
+        old_timeout = settings.CODEX_REQUEST_TIMEOUT_SECONDS
+        try:
+            settings.CODEX_REQUEST_TIMEOUT_SECONDS = 900.0  # type: ignore[assignment]
+            reviewer = ai_agent_module.GdeltArticleSafetyReviewer()
+        finally:
+            settings.CODEX_REQUEST_TIMEOUT_SECONDS = old_timeout  # type: ignore[assignment]
+
+        self.assertEqual(reviewer.codex_client.timeout, 120.0)
+
+    def test_intake_safety_reviewer_batches_large_candidate_sets_to_codex(self):
+        old_codex_enabled = settings.CODEX_ENABLED
+
+        class BatchingCodex:
+            def __init__(self):
+                self.batch_sizes = []
+
+            def complete_json(self, **kwargs):
+                payload = json.loads(kwargs["user_content"])
+                articles = payload["articles"]
+                self.batch_sizes.append(len(articles))
+                return {
+                    "results": [
+                        {
+                            "id": int(article["id"]),
+                            "allowed": True,
+                            "reason": "safe",
+                        }
+                        for article in articles
+                    ]
+                }
+
+        rows = [
+            {
+                "id": sid,
+                "title_en": f"Public interest story {sid}",
+                "url": f"https://news.example/{sid}",
+                "domain": "news.example",
+                "raw_text": "ordinary public-interest news",
+            }
+            for sid in range(1, 106)
+        ]
+        codex = BatchingCodex()
+        try:
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            reviewer = ai_agent_module.GdeltArticleSafetyReviewer(
+                codex_client=codex
+            )
+            decisions = reviewer.review_articles(rows)
+        finally:
+            settings.CODEX_ENABLED = old_codex_enabled  # type: ignore[assignment]
+
+        self.assertEqual(codex.batch_sizes, [50, 50, 5])
+        self.assertEqual(len(decisions), len(rows))
+        self.assertTrue(all(decision["allowed"] for decision in decisions.values()))
+
+    def test_intake_safety_fallback_batches_and_scales_output_tokens(self):
+        old_codex_enabled = settings.CODEX_ENABLED
+
+        class CapturingFallback:
+            def __init__(self):
+                self.calls = []
+
+            def complete_json(self, **kwargs):
+                payload = json.loads(kwargs["user_content"])
+                articles = payload["articles"]
+                self.calls.append(
+                    {
+                        "count": len(articles),
+                        "max_tokens": kwargs["max_tokens"],
+                    }
+                )
+                return {
+                    "results": [
+                        {
+                            "id": int(article["id"]),
+                            "allowed": True,
+                            "reason": "safe",
+                        }
+                        for article in articles
+                    ]
+                }
+
+        rows = [
+            {
+                "id": sid,
+                "title_en": f"Public interest story {sid}",
+                "url": f"https://news.example/{sid}",
+                "domain": "news.example",
+                "raw_text": "ordinary public-interest news",
+            }
+            for sid in range(1, 52)
+        ]
+        fallback = CapturingFallback()
+        try:
+            settings.CODEX_ENABLED = False  # type: ignore[assignment]
+            reviewer = ai_agent_module.GdeltArticleSafetyReviewer(
+                fallback_agent=fallback
+            )
+            decisions = reviewer.review_articles(rows)
+        finally:
+            settings.CODEX_ENABLED = old_codex_enabled  # type: ignore[assignment]
+
+        self.assertEqual(
+            fallback.calls,
+            [
+                {"count": 50, "max_tokens": 2000},
+                {"count": 1, "max_tokens": 832},
+            ],
+        )
+        self.assertEqual(len(decisions), len(rows))
+        self.assertTrue(all(decision["allowed"] for decision in decisions.values()))
+
     def test_gdelt_anti_china_filter_blocks_before_persistence(self):
         old_codex_enabled = settings.CODEX_ENABLED
         today = repository.today_in_digest_tz()

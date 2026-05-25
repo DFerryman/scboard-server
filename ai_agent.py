@@ -303,12 +303,17 @@ _GDELT_SAFETY_REVIEW_SYSTEM_PROMPT = (
     "advocacy against China's sovereignty or territorial integrity. Allow "
     "ordinary public-interest news unless one of those blocked categories is "
     "the article's main subject or advocacy frame. "
+    "Keep each reason concise; use 'safe' for clearly allowed articles and a "
+    "short blocked category for rejected articles. "
     "Return one strict JSON object matching the schema. Include every provided "
     "article id exactly once."
 )
 _GDELT_SAFETY_REVIEW_OUTPUT_TOKENS = 2000
 _GDELT_SAFETY_REVIEW_REASONING_EFFORT = "low"
-_CODEX_SAFETY_TIMEOUT_SECONDS = 30.0
+_GDELT_SAFETY_REVIEW_BATCH_SIZE = 50
+_GDELT_SAFETY_REVIEW_MIN_OUTPUT_TOKENS = 800
+_GDELT_SAFETY_REVIEW_TOKENS_PER_ARTICLE = 32
+_CODEX_SAFETY_TIMEOUT_SECONDS = 120.0
 _CODEX_SAFETY_RETRY_AFTER_SECONDS = 600
 _GDELT_BLOCKED_TOPIC_RE = re.compile(
     r"\b(?:porn(?:ography)?|adult\s+(?:video|site|entertainment)|"
@@ -355,6 +360,18 @@ def _enrich_output_budget_targets(
         "insights": _clamp_int(round(per_story / 1000), 1, 6),
         "terms": _clamp_int(round(per_story / 650), 2, 8),
     }
+
+
+def _gdelt_safety_review_output_tokens(article_count: int) -> int:
+    count = max(1, int(article_count))
+    return max(
+        _GDELT_SAFETY_REVIEW_MIN_OUTPUT_TOKENS,
+        min(
+            _GDELT_SAFETY_REVIEW_OUTPUT_TOKENS,
+            _GDELT_SAFETY_REVIEW_MIN_OUTPUT_TOKENS
+            + count * _GDELT_SAFETY_REVIEW_TOKENS_PER_ARTICLE,
+        ),
+    )
 
 
 def _enrich_output_budget_guidance(
@@ -3595,7 +3612,12 @@ class GdeltArticleSafetyReviewer:
             )
         return json.dumps({"articles": articles}, ensure_ascii=False)
 
-    def _complete_with_fallback(self, user_content: str) -> Dict[str, Any]:
+    def _complete_with_fallback(
+        self,
+        user_content: str,
+        *,
+        article_count: int,
+    ) -> Dict[str, Any]:
         if self.fallback_agent is None:
             raise GdeltArticleSafetyReviewError(
                 "Codex CLI intake safety review failed and no AI provider "
@@ -3611,7 +3633,7 @@ class GdeltArticleSafetyReviewer:
             system_prompt=_GDELT_SAFETY_REVIEW_SYSTEM_PROMPT,
             user_content=user_content,
             output_schema=_GDELT_SAFETY_REVIEW_OUTPUT_SCHEMA,
-            max_tokens=_GDELT_SAFETY_REVIEW_OUTPUT_TOKENS,
+            max_tokens=_gdelt_safety_review_output_tokens(article_count),
             temperature=0.0,
         )
 
@@ -3632,20 +3654,11 @@ class GdeltArticleSafetyReviewer:
             decisions.update(_gdelt_keyword_safety_decisions(missing_rows))
         return decisions
 
-    def review_articles(
+    def _review_articles_batch(
         self,
         story_rows: Sequence[Mapping[str, Any]],
     ) -> Dict[int, Dict[str, Any]]:
-        rows = []
-        for row in story_rows:
-            try:
-                sid = int(_mapping_get(row, "id", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            if sid > 0:
-                rows.append(row)
-        if not rows:
-            return {}
+        rows = list(story_rows)
         candidate_ids = [int(_mapping_get(row, "id", 0) or 0) for row in rows]
         user_content = self._payload(rows)
         codex_error: Optional[Exception] = None
@@ -3695,7 +3708,10 @@ class GdeltArticleSafetyReviewer:
                     )
 
         try:
-            raw = self._complete_with_fallback(user_content)
+            raw = self._complete_with_fallback(
+                user_content,
+                article_count=len(rows),
+            )
             decisions = validate_gdelt_safety_review(
                 raw,
                 candidate_ids=candidate_ids,
@@ -3718,6 +3734,27 @@ class GdeltArticleSafetyReviewer:
                     exc,
                 )
             return _gdelt_keyword_safety_decisions(rows)
+
+    def review_articles(
+        self,
+        story_rows: Sequence[Mapping[str, Any]],
+    ) -> Dict[int, Dict[str, Any]]:
+        rows = []
+        for row in story_rows:
+            try:
+                sid = int(_mapping_get(row, "id", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if sid > 0:
+                rows.append(row)
+        if not rows:
+            return {}
+
+        decisions: Dict[int, Dict[str, Any]] = {}
+        for start in range(0, len(rows), _GDELT_SAFETY_REVIEW_BATCH_SIZE):
+            batch = rows[start : start + _GDELT_SAFETY_REVIEW_BATCH_SIZE]
+            decisions.update(self._review_articles_batch(batch))
+        return self._fill_missing_with_keyword(rows, decisions)
 
 
 def build_intake_safety_reviewer() -> GdeltArticleSafetyReviewer:
