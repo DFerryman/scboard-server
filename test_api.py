@@ -1061,7 +1061,7 @@ class SettingsValidation(unittest.TestCase):
             launcher,
         )
         self.assertIn(
-            'HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS="${HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS:-7200}"',
+            'HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS="${HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS:-300}"',
             launcher,
         )
         self.assertIn(
