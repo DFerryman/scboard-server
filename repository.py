@@ -2419,6 +2419,110 @@ def upsert_digest(
     return True
 
 
+def remove_story_ids_from_digests(
+    conn: sqlite3.Connection,
+    story_ids: Sequence[int],
+) -> int:
+    rejected = {int(sid) for sid in story_ids}
+    if not rejected:
+        return 0
+    changed = 0
+    rows = conn.execute("SELECT date, story_ids FROM digests").fetchall()
+    for row in rows:
+        raw_ids = _json_loads(row["story_ids"], [])
+        if not isinstance(raw_ids, list):
+            continue
+        kept: List[int] = []
+        removed = False
+        for raw_id in raw_ids:
+            try:
+                sid = int(raw_id)
+            except (TypeError, ValueError):
+                removed = True
+                continue
+            if sid in rejected:
+                removed = True
+                continue
+            kept.append(sid)
+        if not removed:
+            continue
+        conn.execute(
+            "UPDATE digests SET story_ids=?, generated_at=? WHERE date=?",
+            (_json_dumps(kept), now_seconds(), row["date"]),
+        )
+        changed += 1
+    return changed
+
+
+_INSIGHT_STORY_ID_KEYS = {
+    "storyId",
+    "storyIds",
+    "linkedStoryId",
+    "linkedStoryIds",
+    "sourceStoryId",
+    "sourceStoryIds",
+    "todayStoryId",
+    "todayStoryIds",
+    "priorWindowStoryId",
+    "priorWindowStoryIds",
+}
+
+
+def _json_story_ids_overlap(value: Any, rejected: set[int]) -> bool:
+    if not rejected:
+        return False
+    if isinstance(value, list):
+        for item in value:
+            try:
+                if int(item) in rejected:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
+def _payload_references_story_ids(value: Any, rejected: set[int]) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in _INSIGHT_STORY_ID_KEYS:
+                if isinstance(item, list) and _json_story_ids_overlap(item, rejected):
+                    return True
+                try:
+                    if int(item) in rejected:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+            if _payload_references_story_ids(item, rejected):
+                return True
+    elif isinstance(value, list):
+        for item in value:
+            if _payload_references_story_ids(item, rejected):
+                return True
+    return False
+
+
+def remove_story_ids_from_insights(
+    conn: sqlite3.Connection,
+    story_ids: Sequence[int],
+) -> int:
+    rejected = {int(sid) for sid in story_ids}
+    if not rejected:
+        return 0
+    deleted = 0
+    rows = conn.execute("SELECT date, payload, source_story_ids FROM insights").fetchall()
+    for row in rows:
+        source_story_ids = _json_loads(row["source_story_ids"], [])
+        payload = _json_loads(row["payload"], {})
+        if not (
+            _json_story_ids_overlap(source_story_ids, rejected)
+            or _payload_references_story_ids(payload, rejected)
+        ):
+            continue
+        cursor = conn.execute("DELETE FROM insights WHERE date=?", (row["date"],))
+        deleted += int(cursor.rowcount or 0)
+    return deleted
+
+
 # ---------- insights reads/writes ----------
 
 def get_insight_row(conn: sqlite3.Connection, date: str) -> Optional[sqlite3.Row]:
@@ -3321,6 +3425,8 @@ __all__ = [
     "list_story_comments",
     "purge_old_comments",
     "upsert_digest",
+    "remove_story_ids_from_digests",
+    "remove_story_ids_from_insights",
     "get_insight_row",
     "list_insight_rows",
     "recent_insight_rows_before",

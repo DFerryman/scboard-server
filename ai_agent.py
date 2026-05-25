@@ -296,19 +296,39 @@ _GDELT_SAFETY_REVIEW_SYSTEM_PROMPT = (
     "and source text. Reject an article when its primary subject promotes, "
     "centers on, or routes readers to pornography or sex services; gambling, "
     "betting, casinos, sportsbooks, or lottery services; narcotics, illegal "
-    "drugs, drug sales, or drug trafficking. Allow ordinary public-interest "
-    "news unless one of those blocked categories is the article's main subject. "
+    "drugs, drug sales, or drug trafficking (including Chinese-language "
+    "equivalents such as 色情, 赌博, 毒品, 贩毒); or anti-China / anti-PRC "
+    "political advocacy, hostile anti-Chinese rhetoric, calls to oppose, "
+    "boycott, sanction, contain, split, or overthrow China, or separatist "
+    "advocacy against China's sovereignty or territorial integrity. Allow "
+    "ordinary public-interest news unless one of those blocked categories is "
+    "the article's main subject or advocacy frame. "
     "Return one strict JSON object matching the schema. Include every provided "
     "article id exactly once."
 )
 _GDELT_SAFETY_REVIEW_OUTPUT_TOKENS = 2000
 _GDELT_SAFETY_REVIEW_REASONING_EFFORT = "low"
+_CODEX_SAFETY_TIMEOUT_SECONDS = 30.0
+_CODEX_SAFETY_RETRY_AFTER_SECONDS = 600
 _GDELT_BLOCKED_TOPIC_RE = re.compile(
     r"\b(?:porn(?:ography)?|adult\s+(?:video|site|entertainment)|"
     r"sex\s+(?:service|services|work|worker|workers)|escort\s+service|"
     r"prostitution|brothel|casino|gambling|betting|sportsbook|lottery|"
     r"cocaine|heroin|meth(?:amphetamine)?|fentanyl|narcotics?|"
-    r"illegal\s+drugs?|drug\s+(?:sales?|dealing|dealer|dealers|trafficking))\b",
+    r"illegal\s+drugs?|drug\s+(?:sales?|dealing|dealer|dealers|trafficking)|"
+    r"anti[-\s]?(?:china|chinese|prc|beijing|ccp)|"
+    r"(?:oppose|opposes|opposing|resist|resists|resisting|counter|countering|"
+    r"contain|containing|boycott|boycotting|sanction|sanctioning|decouple|"
+    r"decoupling)\s+(?:china|the\s+prc|prc|beijing|ccp)|"
+    r"(?:china|the\s+prc|prc|beijing|ccp)\s+(?:is\s+)?(?:an?\s+)?"
+    r"(?:enemy|threat)|"
+    r"(?:free|liberate)\s+(?:hong\s+kong|taiwan|tibet|xinjiang)\s+from\s+"
+    r"(?:china|the\s+prc|prc|beijing|ccp))\b|"
+    r"(?:色情|黄片|成人视频|成人网站|成人内容|性服务|卖淫|嫖娼|援交|"
+    r"赌博|博彩|赌场|赌球|赌盘|彩票|六合彩|毒品|贩毒|吸毒|制毒|"
+    r"毒贩|海洛因|可卡因|冰毒|芬太尼|麻醉品|"
+    r"反华|反中|仇中|排华|辱华|抗中|反对中国|抵制中国|制裁中国|"
+    r"遏制中国|围堵中国|中国威胁论|台独|藏独|疆独|港独)",
     re.IGNORECASE,
 )
 
@@ -1574,7 +1594,7 @@ _SYSTEM_PROMPT = (
     "transliteration plus a leftover English suffix/prefix.\n"
     "- topicId: string, required. Choose exactly one id from the fixed topic "
     "catalog provided below. Do NOT create, rename, translate, merge, or "
-    "invent topics. Do NOT classify by feed/source section "
+    "invent topics. Do NOT classify by Hacker News feed/source section "
     "(top/new/best/ask/show/global). Use general only when no fixed topic truly "
     "fits.\n"
     "- topicName: string, required for backward compatibility. Use the fixed "
@@ -3513,8 +3533,19 @@ def _gdelt_keyword_safety_decisions(
     return decisions
 
 
+def keyword_intake_safety_decisions(
+    story_rows: Sequence[Mapping[str, Any]],
+) -> Dict[int, Dict[str, Any]]:
+    """Deterministic intake safety screen shared by source fetchers."""
+    return _gdelt_keyword_safety_decisions(story_rows)
+
+
 class GdeltArticleSafetyReviewer:
-    """Codex-first intake reviewer for GDELT articles before persistence."""
+    """Codex-first intake reviewer for fetched articles before persistence."""
+
+    _codex_unavailable_until = 0.0
+    _codex_unavailable_reason = ""
+    _codex_unavailable_lock = Lock()
 
     def __init__(
         self,
@@ -3522,8 +3553,32 @@ class GdeltArticleSafetyReviewer:
         codex_client: Optional[CodexCliJsonClient] = None,
         fallback_agent: Optional[Any] = None,
     ) -> None:
-        self.codex_client = codex_client or CodexCliJsonClient()
+        self._uses_default_codex_client = codex_client is None
+        if codex_client is None:
+            self.codex_client = CodexCliJsonClient(
+                timeout=min(
+                    float(settings.CODEX_REQUEST_TIMEOUT_SECONDS),
+                    _CODEX_SAFETY_TIMEOUT_SECONDS,
+                )
+            )
+        else:
+            self.codex_client = codex_client
         self.fallback_agent = fallback_agent
+
+    @classmethod
+    def _codex_temporarily_unavailable(cls) -> tuple[bool, str]:
+        with cls._codex_unavailable_lock:
+            if time.time() < cls._codex_unavailable_until:
+                return True, cls._codex_unavailable_reason
+            return False, ""
+
+    @classmethod
+    def _mark_codex_temporarily_unavailable(cls, exc: Exception) -> None:
+        with cls._codex_unavailable_lock:
+            cls._codex_unavailable_until = (
+                time.time() + _CODEX_SAFETY_RETRY_AFTER_SECONDS
+            )
+            cls._codex_unavailable_reason = f"{type(exc).__name__}: {exc}"
 
     def _payload(self, story_rows: Sequence[Mapping[str, Any]]) -> str:
         articles = []
@@ -3535,9 +3590,7 @@ class GdeltArticleSafetyReviewer:
                     "url": _mapping_get(row, "url", "") or "",
                     "domain": _mapping_get(row, "domain", "") or "",
                     "source": _mapping_get(row, "by", "") or "",
-                    "rawTextSnippet": str(
-                        _mapping_get(row, "raw_text", "") or ""
-                    )[:1200],
+                    "rawText": str(_mapping_get(row, "raw_text", "") or ""),
                 }
             )
         return json.dumps({"articles": articles}, ensure_ascii=False)
@@ -3545,16 +3598,16 @@ class GdeltArticleSafetyReviewer:
     def _complete_with_fallback(self, user_content: str) -> Dict[str, Any]:
         if self.fallback_agent is None:
             raise GdeltArticleSafetyReviewError(
-                "Codex CLI GDELT safety review failed and no AI provider "
+                "Codex CLI intake safety review failed and no AI provider "
                 "fallback is configured"
             )
         method = getattr(self.fallback_agent, "complete_json", None)
         if not callable(method):
             raise GdeltArticleSafetyReviewError(
-                "AI provider fallback cannot perform JSON GDELT safety review"
+                "AI provider fallback cannot perform JSON intake safety review"
             )
         return method(
-            purpose="gdelt-safety",
+            purpose="intake-safety",
             system_prompt=_GDELT_SAFETY_REVIEW_SYSTEM_PROMPT,
             user_content=user_content,
             output_schema=_GDELT_SAFETY_REVIEW_OUTPUT_SCHEMA,
@@ -3597,26 +3650,49 @@ class GdeltArticleSafetyReviewer:
         user_content = self._payload(rows)
         codex_error: Optional[Exception] = None
         if settings.CODEX_ENABLED:
-            try:
-                raw = self.codex_client.complete_json(
-                    purpose="gdelt-safety",
-                    system_prompt=_GDELT_SAFETY_REVIEW_SYSTEM_PROMPT,
-                    user_content=user_content,
-                    output_schema=_GDELT_SAFETY_REVIEW_OUTPUT_SCHEMA,
-                    reasoning_effort=_GDELT_SAFETY_REVIEW_REASONING_EFFORT,
-                )
-                decisions = validate_gdelt_safety_review(
-                    raw,
-                    candidate_ids=candidate_ids,
-                )
-                return self._fill_missing_with_keyword(rows, decisions)
-            except (CodexCliError, subprocess.SubprocessError, OSError, ValueError) as exc:
-                codex_error = exc
+            codex_unavailable, codex_reason = (
+                self._codex_temporarily_unavailable()
+                if self._uses_default_codex_client
+                else (False, "")
+            )
+            if codex_unavailable:
                 log.warning(
-                    "Codex CLI GDELT safety review failed; trying fallback: %s: %s",
-                    type(exc).__name__,
-                    exc,
+                    "Codex CLI intake safety review temporarily unavailable; "
+                    "trying fallback: %s",
+                    codex_reason,
                 )
+            else:
+                try:
+                    raw = self.codex_client.complete_json(
+                        purpose="intake-safety",
+                        system_prompt=_GDELT_SAFETY_REVIEW_SYSTEM_PROMPT,
+                        user_content=user_content,
+                        output_schema=_GDELT_SAFETY_REVIEW_OUTPUT_SCHEMA,
+                        reasoning_effort=_GDELT_SAFETY_REVIEW_REASONING_EFFORT,
+                    )
+                    decisions = validate_gdelt_safety_review(
+                        raw,
+                        candidate_ids=candidate_ids,
+                    )
+                    return self._fill_missing_with_keyword(rows, decisions)
+                except (CodexCliError, subprocess.SubprocessError, OSError) as exc:
+                    codex_error = exc
+                    if self._uses_default_codex_client:
+                        self._mark_codex_temporarily_unavailable(exc)
+                    log.warning(
+                        "Codex CLI intake safety review failed; trying fallback: "
+                        "%s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
+                except ValueError as exc:
+                    codex_error = exc
+                    log.warning(
+                        "Codex CLI intake safety review failed; trying fallback: "
+                        "%s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
 
         try:
             raw = self._complete_with_fallback(user_content)
@@ -3628,7 +3704,7 @@ class GdeltArticleSafetyReviewer:
         except Exception as exc:  # noqa: BLE001
             if codex_error is not None:
                 log.warning(
-                    "GDELT safety AI review failed; using keyword fallback: "
+                    "Intake safety AI review failed; using keyword fallback: "
                     "codex=%s: %s; fallback=%s: %s",
                     type(codex_error).__name__,
                     codex_error,
@@ -3637,14 +3713,14 @@ class GdeltArticleSafetyReviewer:
                 )
             else:
                 log.warning(
-                    "GDELT safety AI review unavailable; using keyword fallback: %s: %s",
+                    "Intake safety AI review unavailable; using keyword fallback: %s: %s",
                     type(exc).__name__,
                     exc,
                 )
             return _gdelt_keyword_safety_decisions(rows)
 
 
-def build_gdelt_safety_reviewer() -> GdeltArticleSafetyReviewer:
+def build_intake_safety_reviewer() -> GdeltArticleSafetyReviewer:
     settings.refresh_ai_settings_from_env_files()
     fallback_agent: Optional[RealAiAgent] = None
     provider = (settings.AI_PROVIDER or "none").strip().lower()
@@ -3653,6 +3729,10 @@ def build_gdelt_safety_reviewer() -> GdeltArticleSafetyReviewer:
         if configs:
             fallback_agent = RealAiAgent(configs=configs)
     return GdeltArticleSafetyReviewer(fallback_agent=fallback_agent)
+
+
+def build_gdelt_safety_reviewer() -> GdeltArticleSafetyReviewer:
+    return build_intake_safety_reviewer()
 
 
 # ---------- factory ----------
@@ -3699,6 +3779,7 @@ __all__ = [
     "AiProviderResponseError",
     "RealAiAgent",
     "build_ai_agent",
+    "build_intake_safety_reviewer",
     "build_gdelt_safety_reviewer",
     "build_ai_quality_reviewer",
     "build_ai_provider_configs",
@@ -3709,6 +3790,7 @@ __all__ = [
     "is_ai_quota_or_balance_error",
     "GdeltArticleSafetyReviewError",
     "GdeltArticleSafetyReviewer",
+    "keyword_intake_safety_decisions",
     "validate_ai_quality_review",
     "validate_gdelt_safety_review",
     "validate_ai_output",

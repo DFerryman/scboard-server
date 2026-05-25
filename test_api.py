@@ -1906,6 +1906,193 @@ class FetcherBehavior(_SqliteCase):
         finally:
             conn.close()
 
+    def test_hn_intake_safety_blocks_before_persistence(self):
+        old_codex_enabled = settings.CODEX_ENABLED
+
+        class FailingCodex:
+            def complete_json(self, **kwargs):
+                raise ai_agent_module.CodexCliError("codex unavailable")
+
+        blocked_id = 777
+        client = self._client(
+            rankings={"top": [101, blocked_id]},
+            items={
+                blocked_id: {
+                    "id": blocked_id,
+                    "type": "story",
+                    "title": "Anti-China lobby calls to sanction China",
+                    "url": "https://blocked.example/anti-china",
+                    "by": "bad",
+                    "score": 99,
+                    "descendants": 0,
+                    "time": 1700000600,
+                },
+            },
+        )
+        run_id = "hn-safety-stage"
+        try:
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            with self.assertLogs("server.ingest", level="INFO") as log_ctx:
+                summary = run_fetcher_once(
+                    client=client,
+                    run_id=run_id,
+                    safety_reviewer=ai_agent_module.GdeltArticleSafetyReviewer(
+                        codex_client=FailingCodex()
+                    ),
+                )
+        finally:
+            settings.CODEX_ENABLED = old_codex_enabled  # type: ignore[assignment]
+
+        intake_logs = "\n".join(log_ctx.output)
+        self.assertIn("HN intake safety reviewed=", intake_logs)
+        self.assertIn("rejected=1", intake_logs)
+        self.assertIn(str(blocked_id), intake_logs)
+        self.assertIn("keyword safety fallback rejected blocked topic", intake_logs)
+        self.assertEqual(summary["stories_rejected"], 1)
+        self.assertTrue(summary["successful_round"], summary)
+        conn = db.connect()
+        try:
+            top_candidates = conn.execute(
+                """
+                SELECT story_id
+                FROM ranking_candidates
+                WHERE run_id=? AND feed='top'
+                ORDER BY rank
+                """,
+                (run_id,),
+            ).fetchall()
+            all_candidates = repository.candidate_story_ids(conn, run_id)
+            blocked = conn.execute(
+                "SELECT id FROM stories WHERE id=?",
+                (blocked_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual([int(r["story_id"]) for r in top_candidates], [101])
+        self.assertNotIn(blocked_id, all_candidates)
+        self.assertIsNone(blocked)
+
+    def test_publish_intake_safety_removes_existing_rejected_candidates(self):
+        old_codex_enabled = settings.CODEX_ENABLED
+        run_id = "publish-safety-stage"
+        allowed_id = 901
+        blocked_id = 902
+
+        def _story_row(sid, title):
+            row = normalize_item(
+                {
+                    "id": sid,
+                    "type": "story",
+                    "title": title,
+                    "url": f"https://example.com/{sid}",
+                    "by": "author",
+                    "score": 10,
+                    "descendants": 0,
+                    "time": 1700000000 + sid,
+                    "text": title,
+                },
+                source_feed="top",
+            )
+            assert row is not None
+            return row
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                digest_date = repository.date_in_digest_tz(1700000000 + allowed_id)
+                for sid, title in (
+                    (allowed_id, "Global science cooperation expands"),
+                    (blocked_id, "Anti-China lobby calls to sanction China"),
+                ):
+                    repository.insert_story_pending(conn, _story_row(sid, title))
+                    repository.write_enriched_story(
+                        conn,
+                        sid,
+                        title_zh=f"测试标题{sid}",
+                        topic="general",
+                        ai_summary="这是一条测试摘要。",
+                        discussion_themes=[],
+                        insights=[],
+                        terms=[],
+                    )
+                repository.replace_ranking_candidates(
+                    conn,
+                    run_id,
+                    "top",
+                    [allowed_id, blocked_id],
+                )
+                repository.replace_feed_ranking(conn, "top", [blocked_id, allowed_id])
+                conn.execute(
+                    """
+                    INSERT INTO digests(date, intro, story_ids, generated_at)
+                    VALUES(?, ?, ?, ?)
+                    """,
+                    (
+                        digest_date,
+                        "test intro",
+                        json.dumps([blocked_id, allowed_id]),
+                        repository.now_seconds(),
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO insights(
+                        date, payload, source_story_ids, generated_at, window_days
+                    )
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (
+                        digest_date,
+                        json.dumps(
+                            {
+                                "headline": "test insight",
+                                "signals": [
+                                    {
+                                        "title": "blocked signal",
+                                        "linkedStoryIds": [blocked_id],
+                                    }
+                                ],
+                                "opportunities": [],
+                                "debates": [],
+                            }
+                        ),
+                        json.dumps([blocked_id, allowed_id]),
+                        repository.now_seconds(),
+                        7,
+                    ),
+                )
+        finally:
+            conn.close()
+
+        try:
+            settings.CODEX_ENABLED = False  # type: ignore[assignment]
+            with self.assertLogs("server.ingest", level="INFO") as log_ctx:
+                summary = ingest_module._run_publish_intake_safety_guard(
+                    run_id,
+                    safety_reviewer=ai_agent_module.GdeltArticleSafetyReviewer(),
+                )
+        finally:
+            settings.CODEX_ENABLED = old_codex_enabled  # type: ignore[assignment]
+
+        intake_logs = "\n".join(log_ctx.output)
+        self.assertIn("PUBLISH intake safety reviewed=2 allowed=1 rejected=1", intake_logs)
+        self.assertIn(str(blocked_id), intake_logs)
+        self.assertEqual(summary["rejected"], 1)
+        self.assertEqual(summary["rejected_ids"], [blocked_id])
+        self.assertEqual(summary["ranking_candidates_deleted"], 1)
+        self.assertEqual(summary["rankings_deleted"], 1)
+        self.assertEqual(summary["digests_updated"], 1)
+        self.assertEqual(summary["insights_deleted"], 1)
+
+        conn = db.connect()
+        try:
+            self.assertEqual(repository.candidate_story_ids(conn, run_id), [allowed_id])
+            self.assertEqual(repository.feed_story_ids(conn, "top"), [allowed_id])
+            self.assertEqual(repository.digest_story_ids(conn, digest_date), [allowed_id])
+            self.assertIsNone(repository.get_insight_row(conn, digest_date))
+        finally:
+            conn.close()
+
     def test_no_change_round_does_not_bump_catalog_version(self):
         client = self._client()
         run_fetcher_once(client=client)
@@ -2304,10 +2491,12 @@ class GdeltIntegration(_SqliteCase):
         self.assertTrue(summary["rate_limited"], summary)
         self.assertEqual(summary["reason"], "rate_limited")
         self.assertEqual(summary["retry_after_seconds"], 17)
+        self.assertGreaterEqual(summary["rate_limit_until"], before + 17)
         self.assertEqual(summary["upstream_retry_after_seconds"], 17)
         self.assertTrue(retry_summary["skipped"], retry_summary)
         self.assertEqual(retry_summary["reason"], "rate_limit_cooldown")
         self.assertGreater(int(retry_summary["retry_after_seconds"]), 0)
+        self.assertGreaterEqual(retry_summary["rate_limit_until"], before + 17)
 
         conn = db.connect()
         try:
@@ -2392,6 +2581,20 @@ class GdeltIntegration(_SqliteCase):
                         "domain": "news.example",
                         "raw_text": "public-interest emergency report",
                     },
+                    {
+                        "id": 3,
+                        "title_en": "Anti-China group calls for boycott",
+                        "url": "https://blocked.example/anti-china",
+                        "domain": "blocked.example",
+                        "raw_text": "anti-China boycott China advocacy",
+                    },
+                    {
+                        "id": 4,
+                        "title_en": "Public app ranking update",
+                        "url": "https://blocked.example/cn-gambling",
+                        "domain": "blocked.example",
+                        "raw_text": "博彩平台和毒品交易推广",
+                    },
                 ]
             )
         finally:
@@ -2399,6 +2602,119 @@ class GdeltIntegration(_SqliteCase):
 
         self.assertFalse(decisions[1]["allowed"])
         self.assertTrue(decisions[2]["allowed"])
+        self.assertFalse(decisions[3]["allowed"])
+        self.assertFalse(decisions[4]["allowed"])
+
+    def test_intake_safety_reviewer_sends_full_raw_text_to_codex(self):
+        old_codex_enabled = settings.CODEX_ENABLED
+
+        class CapturingCodex:
+            def __init__(self):
+                self.user_content = ""
+
+            def complete_json(self, **kwargs):
+                self.user_content = kwargs["user_content"]
+                return {
+                    "results": [
+                        {
+                            "id": 5,
+                            "allowed": True,
+                            "reason": "allowed by fake reviewer",
+                        }
+                    ]
+                }
+
+        long_text = "lead " + ("x" * 1300) + " no-truncation-tail"
+        codex = CapturingCodex()
+        try:
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            reviewer = ai_agent_module.GdeltArticleSafetyReviewer(
+                codex_client=codex
+            )
+            decisions = reviewer.review_articles(
+                [
+                    {
+                        "id": 5,
+                        "title_en": "Long source article",
+                        "url": "https://news.example/full-source",
+                        "domain": "news.example",
+                        "raw_text": long_text,
+                    }
+                ]
+            )
+        finally:
+            settings.CODEX_ENABLED = old_codex_enabled  # type: ignore[assignment]
+
+        self.assertTrue(decisions[5]["allowed"])
+        payload = json.loads(codex.user_content)
+        self.assertEqual(payload["articles"][0]["rawText"], long_text)
+
+    def test_gdelt_anti_china_filter_blocks_before_persistence(self):
+        old_codex_enabled = settings.CODEX_ENABLED
+        today = repository.today_in_digest_tz()
+        allowed_url = "https://world.example/allowed-global"
+        blocked_url = "https://world.example/anti-china"
+        articles = [
+            self._article(
+                "Global science cooperation expands",
+                allowed_url,
+                self._seendate_for_digest_date(today),
+            ),
+            self._article(
+                "Anti-China lobby calls to sanction China",
+                blocked_url,
+                self._seendate_for_digest_date(today),
+            ),
+        ]
+
+        try:
+            settings.CODEX_ENABLED = False  # type: ignore[assignment]
+            with self.assertLogs("server.ingest", level="INFO") as log_ctx:
+                summary = ingest_module.run_gdelt_fetcher_once(
+                    client=_FakeGdelt(articles),
+                    run_id="gdelt-anti-china",
+                    safety_reviewer=ai_agent_module.GdeltArticleSafetyReviewer(),
+                    force=True,
+                )
+        finally:
+            settings.CODEX_ENABLED = old_codex_enabled  # type: ignore[assignment]
+
+        allowed_id = gdelt_normalizer.stable_gdelt_story_id(allowed_url)
+        blocked_id = gdelt_normalizer.stable_gdelt_story_id(blocked_url)
+        intake_logs = "\n".join(log_ctx.output)
+        self.assertIn("GDELT intake safety reviewed=2 allowed=1 rejected=1", intake_logs)
+        self.assertIn(str(blocked_id), intake_logs)
+        self.assertIn("keyword safety fallback rejected blocked topic", intake_logs)
+        self.assertTrue(summary["successful_round"], summary)
+        self.assertEqual(summary["stories_inserted"], 1)
+        self.assertEqual(summary["stories_rejected"], 1)
+        self.assertEqual(summary["candidate_count"], 1)
+
+        conn = db.connect()
+        try:
+            candidates = conn.execute(
+                """
+                SELECT story_id
+                FROM ranking_candidates
+                WHERE run_id=?
+                ORDER BY rank
+                """,
+                ("gdelt-anti-china",),
+            ).fetchall()
+            allowed = conn.execute(
+                "SELECT id FROM stories WHERE id=?",
+                (allowed_id,),
+            ).fetchone()
+            blocked = conn.execute(
+                "SELECT id FROM stories WHERE id=?",
+                (blocked_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual([int(r["story_id"]) for r in candidates], [allowed_id])
+        self.assertIsNotNone(allowed)
+        self.assertIsNone(blocked)
 
     def test_cloud_sync_exports_global_feed_source_and_count(self):
         from . import cloud_sync

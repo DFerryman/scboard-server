@@ -89,6 +89,7 @@ _MAX_AI_QUALITY_ISSUES = 8
 # item type itself), then explicit ``ask``/``show`` feeds, then plain
 # ``story``. We never downgrade an existing more-specific kind.
 _KIND_PRIORITY = {"story": 0, "ask": 1, "show": 1, "job": 2}
+_INTAKE_SAFETY_LOG_REJECTION_LIMIT = 8
 
 
 def _kind_can_supersede(current: str, new: str) -> bool:
@@ -466,11 +467,178 @@ def _resolve_source_feed(
     return None
 
 
+def _log_intake_safety_summary(
+    source: str,
+    rows: Sequence[Mapping[str, Any]],
+    decisions: Mapping[int, Mapping[str, Any]],
+) -> None:
+    if not rows:
+        return
+    rejected = 0
+    preview = []
+    for row in rows:
+        try:
+            sid = int(_row_value(row, "id", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        decision = decisions.get(sid)
+        if decision is not None and bool(decision.get("allowed")):
+            continue
+        rejected += 1
+        if len(preview) < _INTAKE_SAFETY_LOG_REJECTION_LIMIT:
+            reason = ""
+            if decision is not None:
+                reason = str(decision.get("reason") or "")
+            preview.append(
+                {
+                    "id": sid,
+                    "reason": reason[:240] or "missing safety decision",
+                }
+            )
+    reviewed = len(rows)
+    log.info(
+        "%s intake safety reviewed=%d allowed=%d rejected=%d rejected_preview=%s",
+        source,
+        reviewed,
+        max(0, reviewed - rejected),
+        rejected,
+        json.dumps(preview, ensure_ascii=False),
+    )
+
+
+def _publish_safety_story_rows(conn, run_id: str) -> List[Any]:
+    return conn.execute(
+        """
+        SELECT DISTINCT s.*
+        FROM ranking_candidates rc
+        JOIN stories s ON s.id=rc.story_id
+        WHERE rc.run_id=?
+        ORDER BY s.id
+        """,
+        (run_id,),
+    ).fetchall()
+
+
+def _rejected_intake_safety_ids(
+    rows: Sequence[Mapping[str, Any]],
+    decisions: Mapping[int, Mapping[str, Any]],
+) -> List[int]:
+    rejected_ids: List[int] = []
+    for row in rows:
+        try:
+            sid = int(_row_value(row, "id", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        decision = decisions.get(sid)
+        if decision is not None and bool(decision.get("allowed")):
+            continue
+        rejected_ids.append(sid)
+    return rejected_ids
+
+
+def _remove_story_ids_from_publish_surfaces(
+    conn,
+    *,
+    run_id: str,
+    story_ids: Sequence[int],
+) -> Dict[str, int]:
+    ids = [int(sid) for sid in story_ids]
+    if not ids:
+        return {
+            "ranking_candidates_deleted": 0,
+            "rankings_deleted": 0,
+            "digests_updated": 0,
+            "insights_deleted": 0,
+        }
+    with repository.id_in_clause(conn, ids) as (clause, params):
+        candidate_cursor = conn.execute(
+            f"""
+            DELETE FROM ranking_candidates
+            WHERE run_id=?
+              AND story_id {clause}
+            """,
+            (run_id, *params),
+        )
+    with repository.id_in_clause(conn, ids) as (clause, params):
+        ranking_cursor = conn.execute(
+            f"DELETE FROM rankings WHERE story_id {clause}",
+            params,
+        )
+    digests_updated = repository.remove_story_ids_from_digests(conn, ids)
+    insights_deleted = repository.remove_story_ids_from_insights(conn, ids)
+    if ranking_cursor.rowcount or digests_updated or insights_deleted:
+        repository.bump_catalog_version(conn)
+    return {
+        "ranking_candidates_deleted": int(candidate_cursor.rowcount or 0),
+        "rankings_deleted": int(ranking_cursor.rowcount or 0),
+        "digests_updated": int(digests_updated),
+        "insights_deleted": int(insights_deleted),
+    }
+
+
+def _run_publish_intake_safety_guard(
+    run_id: str,
+    *,
+    safety_reviewer=None,
+) -> Dict[str, Any]:
+    conn = db.connect()
+    try:
+        rows = _publish_safety_story_rows(conn, run_id)
+    finally:
+        conn.close()
+
+    summary: Dict[str, Any] = {
+        "reviewed": len(rows),
+        "rejected": 0,
+        "rejected_ids": [],
+        "failed": False,
+        "ranking_candidates_deleted": 0,
+        "rankings_deleted": 0,
+        "digests_updated": 0,
+        "insights_deleted": 0,
+    }
+    if not rows:
+        return summary
+
+    try:
+        if safety_reviewer is None:
+            from .ai_agent import build_intake_safety_reviewer
+
+            safety_reviewer = build_intake_safety_reviewer()
+        decisions = safety_reviewer.review_articles(rows)
+        _log_intake_safety_summary("PUBLISH", rows, decisions)
+    except Exception as exc:  # noqa: BLE001
+        summary["failed"] = True
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+        log.warning("publish intake safety review failed closed: %s", exc)
+        return summary
+
+    rejected_ids = _rejected_intake_safety_ids(rows, decisions)
+    summary["rejected"] = len(rejected_ids)
+    summary["rejected_ids"] = rejected_ids
+    if not rejected_ids:
+        return summary
+
+    conn = db.connect()
+    try:
+        with db.transaction(conn):
+            removed = _remove_story_ids_from_publish_surfaces(
+                conn,
+                run_id=run_id,
+                story_ids=rejected_ids,
+            )
+    finally:
+        conn.close()
+    summary.update(removed)
+    return summary
+
+
 def run_fetcher_once(
     client=None,
     *,
     run_id: Optional[str] = None,
     deadline_at: Optional[float] = None,
+    safety_reviewer=None,
 ) -> Dict[str, Any]:
     """Fetch HN data and stage visible rankings for a run.
 
@@ -489,10 +657,12 @@ def run_fetcher_once(
         "stories_inserted": 0,
         "stories_updated": 0,
         "stories_skipped": 0,
+        "stories_rejected": 0,
         "items_fetched": 0,
         "candidate_count": 0,
         "successful_round": False,
         "timed_out": False,
+        "safety_review_failed": False,
     }
 
     feed_ids, ranking_timed_out = _collect_feed_rankings(
@@ -538,15 +708,43 @@ def run_fetcher_once(
     # (keep the existing row eligible until cleanup ages it out).
     displayable_ids: set = set()
     fetched_non_display_ids: set = set()
+    rejected_ids: set = set()
+    normalized_rows: List[Dict[str, Any]] = []
+    for sid, raw in items.items():
+        source_feed = _resolve_source_feed(feed_ids, sid)
+        normalized = normalizer.normalize_item(raw, source_feed=source_feed)
+        if not normalized:
+            fetched_non_display_ids.add(sid)
+            summary["stories_skipped"] += 1
+            continue
+        normalized_rows.append(normalized)
+
+    if normalized_rows:
+        try:
+            if safety_reviewer is None:
+                from .ai_agent import build_intake_safety_reviewer
+
+                safety_reviewer = build_intake_safety_reviewer()
+            decisions = safety_reviewer.review_articles(normalized_rows)
+            _log_intake_safety_summary("HN", normalized_rows, decisions)
+        except Exception as exc:  # noqa: BLE001
+            summary["safety_review_failed"] = True
+            summary["stories_rejected"] = len(normalized_rows)
+            summary["successful_round"] = False
+            summary["error"] = f"{type(exc).__name__}: {exc}"
+            log.warning("HN intake safety review failed closed: %s", exc)
+            return summary
+    else:
+        decisions = {}
 
     conn = db.connect()
     try:
-        for sid, raw in items.items():
-            source_feed = _resolve_source_feed(feed_ids, sid)
-            normalized = normalizer.normalize_item(raw, source_feed=source_feed)
-            if not normalized:
-                fetched_non_display_ids.add(sid)
-                summary["stories_skipped"] += 1
+        for normalized in normalized_rows:
+            sid = int(normalized["id"])
+            decision = decisions.get(sid)
+            if not decision or not bool(decision.get("allowed")):
+                rejected_ids.add(sid)
+                summary["stories_rejected"] += 1
                 continue
 
             with db.transaction(conn):
@@ -603,6 +801,10 @@ def run_fetcher_once(
                         # the active ranking even when an old `stories` row
                         # still exists; cleanup.py owns the row deletion once
                         # last_seen_at ages past RANKING_GRACE_SECONDS.
+                        continue
+                    elif sid in rejected_ids:
+                        # Intake safety rejection must also remove a previously
+                        # visible story from this run's staged ranking.
                         continue
                     elif repository.story_exists(conn, sid):
                         # Temporary item fetch failure for an existing story:
@@ -724,6 +926,12 @@ def run_gdelt_fetcher_once(
                 summary["skipped"] = True
                 summary["reason"] = throttle_reason
                 summary["retry_after_seconds"] = retry_after
+                if throttle_reason == "rate_limit_cooldown":
+                    rate_limit_until = repository.get_meta_int(
+                        conn, _GDELT_RATE_LIMIT_UNTIL_META
+                    )
+                    if rate_limit_until is not None:
+                        summary["rate_limit_until"] = int(rate_limit_until)
                 return summary
             repository.set_meta(
                 conn,
@@ -752,10 +960,12 @@ def run_gdelt_fetcher_once(
         )
     except GdeltRateLimitError as exc:
         cooldown = _gdelt_rate_limit_cooldown_seconds(exc)
+        rate_limit_until = repository.now_seconds() + cooldown
         summary["rate_limited"] = True
         summary["skipped"] = True
         summary["reason"] = "rate_limited"
         summary["retry_after_seconds"] = cooldown
+        summary["rate_limit_until"] = rate_limit_until
         if exc.retry_after_seconds is not None:
             summary["upstream_retry_after_seconds"] = exc.retry_after_seconds
         conn = db.connect()
@@ -764,11 +974,18 @@ def run_gdelt_fetcher_once(
                 repository.set_meta(
                     conn,
                     _GDELT_RATE_LIMIT_UNTIL_META,
-                    str(repository.now_seconds() + cooldown),
+                    str(rate_limit_until),
                 )
         finally:
             conn.close()
-        log.warning("GDELT fetch rate limited: %s", exc)
+        log.warning(
+            "GDELT fetch rate limited: retry_after_seconds=%s "
+            "rate_limit_until=%s upstream_retry_after_seconds=%s error=%s",
+            cooldown,
+            rate_limit_until,
+            exc.retry_after_seconds,
+            exc,
+        )
         return summary
     except GdeltFetchError as exc:
         summary["skipped"] = True
@@ -813,11 +1030,12 @@ def run_gdelt_fetcher_once(
 
     if normalized_rows:
         if safety_reviewer is None:
-            from .ai_agent import build_gdelt_safety_reviewer
+            from .ai_agent import build_intake_safety_reviewer
 
-            safety_reviewer = build_gdelt_safety_reviewer()
+            safety_reviewer = build_intake_safety_reviewer()
         try:
             decisions = safety_reviewer.review_articles(normalized_rows)
+            _log_intake_safety_summary("GDELT", normalized_rows, decisions)
         except Exception as exc:  # noqa: BLE001
             summary["safety_review_failed"] = True
             summary["stories_rejected"] = len(normalized_rows)
@@ -2143,15 +2361,34 @@ def _publish_ranking_checkpoint(
     *,
     preserve_existing: bool,
 ) -> Dict[str, Any]:
+    publish_safety = _run_publish_intake_safety_guard(run_id)
+    if publish_safety.get("failed"):
+        log.warning(
+            "publisher checkpoint skipped after intake safety failure: %s",
+            publish_safety,
+        )
+        return {
+            "changed": False,
+            "feeds": {},
+            "published_count": 0,
+            "ready_count": 0,
+            "preserve_existing": bool(preserve_existing),
+            "skipped_stale_run": False,
+            "skipped": True,
+            "safety_failed": True,
+            "publish_safety": publish_safety,
+        }
     conn = db.connect()
     try:
         with db.transaction(conn):
-            return repository.publish_ranking_candidates(
+            summary = repository.publish_ranking_candidates(
                 conn,
                 run_id,
                 PUBLISH_FEEDS,
                 preserve_existing=preserve_existing,
             )
+            summary["publish_safety"] = publish_safety
+            return summary
     finally:
         conn.close()
 
@@ -3063,6 +3300,7 @@ def _compact_round_summary_for_log(summary: Mapping[str, Any]) -> Dict[str, Any]
         "digest": _compact_digest_for_log(summary.get("digest")),
         "insights": _compact_insights_for_log(summary.get("insights")),
         "publish": _compact_publish_for_log(summary.get("publish")),
+        "publish_safety": summary.get("publish_safety"),
         "cleanup": summary.get("cleanup"),
         "discard": summary.get("discard"),
     }
@@ -3126,6 +3364,7 @@ def run_ingest_round(
         "images": None,
         "insights": None,
         "publish": None,
+        "publish_safety": None,
         "cleanup": None,
     }
     candidate_count = 0
@@ -3390,6 +3629,36 @@ def run_ingest_round(
         summary["enrich"] = enrich_summary
         log.info("enricher: %s", _compact_enrich_for_log(enrich_summary))
 
+        publish_safety_summary = _run_publish_intake_safety_guard(run_id)
+        summary["publish_safety"] = publish_safety_summary
+        log.info("publisher intake safety: %s", publish_safety_summary)
+        if publish_safety_summary.get("failed"):
+            error = "publish intake safety review failed"
+            cleanup = _discard_run(run_id, release_inflight=True)
+            _finish_run(run_id, "failed", error=error)
+            _alert(
+                "publish_safety_failed",
+                "HN ingest publish intake safety failed",
+                error,
+                run_id=run_id,
+                extra=_round_alert_extra(
+                    started_at=started,
+                    candidate_count=candidate_count,
+                    target_ids=target_ids,
+                    extra={
+                        "publish_safety": json.dumps(
+                            publish_safety_summary,
+                            ensure_ascii=False,
+                        ),
+                        **cleanup,
+                    },
+                ),
+            )
+            summary["status"] = "failed"
+            summary["error"] = error
+            collect_image_pipeline(wait=False)
+            return summary
+
         conn = db.connect()
         try:
             with db.transaction(conn):
@@ -3401,6 +3670,8 @@ def run_ingest_round(
                     failed=int(enrich_summary.get("failed", 0) or 0),
                     retried=int(enrich_summary.get("retried", 0) or 0),
                 )
+                target_ids = repository.candidate_story_ids(conn, run_id)
+                candidate_count = len(target_ids)
                 incomplete = repository.count_incomplete_candidates(conn, run_id)
         finally:
             conn.close()
