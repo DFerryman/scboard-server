@@ -39,7 +39,7 @@ from .topics import resolve_fixed_source_topic, topic_name_from_id
 log = logging.getLogger(__name__)
 
 
-FEED_TYPES = ("top", "new", "best", "ask", "show", "job")
+FEED_TYPES = ("top", "new", "best", "ask", "show", "job", "global")
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 AI_READY_STORY_SQL = """
     s.enrich_status='done'
@@ -129,11 +129,13 @@ def _story_to_doc(
     default_type: str,
 ) -> dict:
     image_url = "" if story.imageFileID else story.imageUrl
+    client_default_type = "global" if story.source == "gdelt" else default_type
     return {
         "_id": f"{sync_version}:{story.id}",
         "id": story.id,
         "syncVersion": sync_version,
-        "defaultType": default_type,
+        "defaultType": client_default_type,
+        "source": story.source,
         "titleZh": story.titleZh,
         "titleEn": story.titleEn,
         "url": story.url,

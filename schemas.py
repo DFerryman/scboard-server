@@ -29,6 +29,7 @@ class StoryType(str, Enum):
     ASK = "ask"
     SHOW = "show"
     JOB = "job"
+    GLOBAL = "global"
 
 
 # ---------- Story substructures ----------
@@ -65,6 +66,7 @@ class Story(BaseModel):
     """
     id: int
     type: StoryType
+    source: str = Field(default="hn", description="Source system: hn or gdelt")
     titleZh: str = Field(description="AI-translated Chinese title; may be an empty string")
     titleEn: str = Field(description="Original English title; may be an empty string")
     url: str = Field(description="Original article link; empty string for the Ask HN type")

@@ -7,6 +7,7 @@ Run from project root::
 
 from __future__ import annotations
 
+import calendar
 import http.client
 import io
 import json
@@ -30,7 +31,7 @@ from unittest.mock import patch
 
 from . import ai_agent as ai_agent_module
 from . import ai_config_status
-from . import db, repository, settings
+from . import db, gdelt_normalizer, repository, settings
 from . import ingest as ingest_module
 from .ai_agent import (
     AiProviderConfig,
@@ -2050,6 +2051,309 @@ class FetcherBehavior(_SqliteCase):
 
         self.assertEqual(summary["status"], "timeout")
         self.assertEqual(client.item_calls, 0)
+
+
+class _FakeGdelt:
+    def __init__(self, articles):
+        self.articles = list(articles)
+        self.kwargs = None
+
+    def fetch_articles(self, **kwargs):
+        self.kwargs = dict(kwargs)
+        return list(self.articles)
+
+
+class _TitleSafety:
+    def review_articles(self, rows):
+        out = {}
+        for row in rows:
+            title = str(row.get("title_en") or "").lower()
+            blocked = "casino" in title
+            out[int(row["id"])] = {
+                "allowed": not blocked,
+                "reason": "blocked casino" if blocked else "ok",
+            }
+        return out
+
+
+class GdeltIntegration(_SqliteCase):
+    def _seendate_for_digest_date(self, date: str) -> str:
+        start, _ = repository.digest_date_epoch_bounds(date)
+        return time.strftime("%Y%m%d%H%M%S", time.gmtime(start + 3600))
+
+    def _article(self, title: str, url: str, seendate: str) -> dict:
+        return {
+            "seendate": seendate,
+            "title": title,
+            "url": url,
+            "domain": urllib.parse.urlsplit(url).hostname or "",
+            "sourcecountry": "US",
+            "sourcelanguage": "English",
+        }
+
+    def test_gdelt_normalizer_parses_artlist_article(self):
+        row = gdelt_normalizer.normalize_article(
+            self._article(
+                "Earthquake update",
+                "https://news.example/a",
+                "20260525083000",
+            ),
+            rank=1,
+            total=3,
+            fetched_at=123,
+        )
+
+        self.assertIsNotNone(row)
+        assert row is not None
+        expected_ts = calendar.timegm(
+            time.strptime("20260525083000", "%Y%m%d%H%M%S")
+        )
+        self.assertEqual(row["source"], "gdelt")
+        self.assertGreaterEqual(row["id"], 2_000_000_000)
+        self.assertLess(row["id"], 3_000_000_000)
+        self.assertEqual(row["hn_time"], expected_ts)
+        self.assertEqual(row["domain"], "news.example")
+        self.assertIn("Earthquake update", row["raw_json"])
+
+    def test_gdelt_fetcher_stages_global_today_and_safety_filters(self):
+        today = repository.today_in_digest_tz()
+        yesterday = repository.digest_date_minus_days(1)
+        allowed_url = "https://world.example/allowed"
+        articles = [
+            self._article(
+                "Earthquake response expands",
+                allowed_url,
+                self._seendate_for_digest_date(today),
+            ),
+            self._article(
+                "Casino launch draws crowds",
+                "https://world.example/casino",
+                self._seendate_for_digest_date(today),
+            ),
+            self._article(
+                "Old flood report",
+                "https://world.example/old",
+                self._seendate_for_digest_date(yesterday),
+            ),
+        ]
+
+        summary = ingest_module.run_gdelt_fetcher_once(
+            client=_FakeGdelt(articles),
+            run_id="gdelt-stage",
+            safety_reviewer=_TitleSafety(),
+            force=True,
+        )
+
+        allowed_id = gdelt_normalizer.stable_gdelt_story_id(allowed_url)
+        self.assertTrue(summary["successful_round"], summary)
+        self.assertEqual(summary["stories_inserted"], 1)
+        self.assertEqual(summary["stories_rejected"], 1)
+        self.assertEqual(summary["stories_old"], 1)
+
+        conn = db.connect()
+        try:
+            candidates = conn.execute(
+                """
+                SELECT feed, story_id
+                FROM ranking_candidates
+                WHERE run_id=?
+                ORDER BY rank
+                """,
+                ("gdelt-stage",),
+            ).fetchall()
+            row = conn.execute(
+                "SELECT source, enrich_status FROM stories WHERE id=?",
+                (allowed_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(
+            [(r["feed"], int(r["story_id"])) for r in candidates],
+            [("global", allowed_id)],
+        )
+        self.assertIsNotNone(row)
+        self.assertEqual(row["source"], "gdelt")
+        self.assertEqual(row["enrich_status"], "pending")
+
+    def test_gdelt_safety_reviewer_keyword_fallback_blocks_disallowed_topics(self):
+        old_codex_enabled = settings.CODEX_ENABLED
+        try:
+            settings.CODEX_ENABLED = False  # type: ignore[assignment]
+            reviewer = ai_agent_module.GdeltArticleSafetyReviewer()
+            decisions = reviewer.review_articles(
+                [
+                    {
+                        "id": 1,
+                        "title_en": "Casino betting app launches",
+                        "url": "https://blocked.example/casino",
+                        "domain": "blocked.example",
+                        "raw_text": "casino sportsbook betting",
+                    },
+                    {
+                        "id": 2,
+                        "title_en": "Wildfire evacuation update",
+                        "url": "https://news.example/wildfire",
+                        "domain": "news.example",
+                        "raw_text": "public-interest emergency report",
+                    },
+                ]
+            )
+        finally:
+            settings.CODEX_ENABLED = old_codex_enabled  # type: ignore[assignment]
+
+        self.assertFalse(decisions[1]["allowed"])
+        self.assertTrue(decisions[2]["allowed"])
+
+    def test_cloud_sync_exports_global_feed_source_and_count(self):
+        from . import cloud_sync
+
+        sid = gdelt_normalizer.stable_gdelt_story_id("https://world.example/global")
+        article = self._article(
+            "Global science story",
+            "https://world.example/global",
+            self._seendate_for_digest_date(repository.today_in_digest_tz()),
+        )
+        row = gdelt_normalizer.normalize_article(article, rank=1, total=1)
+        self.assertIsNotNone(row)
+        assert row is not None
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "catalog_version", "1")
+                repository.insert_story_pending(conn, row)
+                repository.write_enriched_story(
+                    conn,
+                    sid,
+                    title_zh="全球科学新闻",
+                    topic="science-culture",
+                    ai_summary="这是一条面向中文读者的全球新闻摘要。",
+                    discussion_themes=[],
+                    insights=[],
+                    terms=[],
+                    comments_fetched_descendants=0,
+                )
+                repository.replace_feed_ranking(conn, "global", [sid])
+        finally:
+            conn.close()
+
+        out_dir = Path(self.tmpdir) / "read-model-gdelt"
+        cloud_sync.build_read_model(out_dir, include_dashboard=False)
+        story_docs = [
+            json.loads(line)
+            for line in (out_dir / "stories.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        meta = json.loads((out_dir / "meta.json").read_text(encoding="utf-8"))
+
+        self.assertEqual([doc["id"] for doc in story_docs], [sid])
+        self.assertEqual(story_docs[0]["source"], "gdelt")
+        self.assertEqual(story_docs[0]["defaultType"], "global")
+        self.assertEqual(story_docs[0]["feedRanks"]["global"], 1)
+        self.assertEqual(meta["feedCounts"]["global"], 1)
+
+    def test_gdelt_done_story_is_eligible_for_digest_insights_and_topics(self):
+        from . import cloud_sync
+
+        today = repository.today_in_digest_tz()
+        url = "https://world.example/integrated"
+        sid = gdelt_normalizer.stable_gdelt_story_id(url)
+        row = gdelt_normalizer.normalize_article(
+            self._article(
+                "Global climate report",
+                url,
+                self._seendate_for_digest_date(today),
+            ),
+            rank=1,
+            total=1,
+        )
+        self.assertIsNotNone(row)
+        assert row is not None
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "catalog_version", "1")
+                repository.insert_story_pending(conn, row)
+                repository.write_enriched_story(
+                    conn,
+                    sid,
+                    title_zh="全球气候报告",
+                    topic="science-culture",
+                    ai_summary="这是一条进入精选、洞察和分类的全球资讯摘要。",
+                    discussion_themes=[],
+                    insights=[],
+                    terms=[],
+                    comments_fetched_descendants=0,
+                )
+                repository.replace_feed_ranking(conn, "global", [sid])
+
+            digest_rows = repository.candidate_done_stories_for_digest(
+                conn,
+                today,
+                10,
+            )
+            start, end = repository.digest_date_epoch_bounds(today)
+            insight_rows = repository.candidate_rows_for_insights(
+                conn,
+                start_ts=start,
+                end_ts=end,
+            )
+        finally:
+            conn.close()
+
+        self.assertIn(sid, [int(r["id"]) for r in digest_rows])
+        self.assertIn(sid, [int(r["id"]) for r in insight_rows])
+
+        out_dir = Path(self.tmpdir) / "read-model-gdelt-topics"
+        cloud_sync.build_read_model(out_dir, include_dashboard=False)
+        topic_docs = [
+            json.loads(line)
+            for line in (out_dir / "topics.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        science = [doc for doc in topic_docs if doc["id"] == "science-culture"]
+        self.assertEqual(len(science), 1)
+        self.assertEqual(science[0]["count"], 1)
+
+    def test_cleanup_purges_old_gdelt_even_when_fetcher_stale(self):
+        from .cleanup import run_cleanup_once
+
+        old_url = "https://world.example/old-gdelt"
+        sid = gdelt_normalizer.stable_gdelt_story_id(old_url)
+        row = gdelt_normalizer.normalize_article(
+            self._article(
+                "Old global story",
+                old_url,
+                self._seendate_for_digest_date(repository.digest_date_minus_days(1)),
+            ),
+            rank=1,
+            total=1,
+        )
+        self.assertIsNotNone(row)
+        assert row is not None
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.insert_story_pending(conn, row)
+                repository.replace_feed_ranking(conn, "global", [sid])
+                repository.set_meta(conn, "catalog_version", "1")
+        finally:
+            conn.close()
+
+        summary = run_cleanup_once()
+
+        conn = db.connect()
+        try:
+            story = conn.execute("SELECT 1 FROM stories WHERE id=?", (sid,)).fetchone()
+            catalog_version = repository.get_catalog_version(conn)
+        finally:
+            conn.close()
+        self.assertTrue(summary["skipped"])
+        self.assertEqual(summary["reason"], "no_last_full_fetch_at")
+        self.assertEqual(summary["gdelt_stories_deleted"], 1)
+        self.assertIsNone(story)
+        self.assertGreater(int(catalog_version), 1)
 
 
 # ---------- Full ingest publish behavior ----------

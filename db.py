@@ -29,6 +29,8 @@ _WRITE_TRANSACTION_LOCK = RLock()
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS stories (
   id INTEGER PRIMARY KEY,
+  source TEXT NOT NULL DEFAULT 'hn'
+    CHECK (source IN ('hn', 'gdelt')),
   kind TEXT NOT NULL DEFAULT 'story'
     CHECK (kind IN ('story', 'ask', 'show', 'job')),
   title_en TEXT NOT NULL DEFAULT '',
@@ -94,7 +96,7 @@ ON topics(last_seen_at DESC);
 
 CREATE TABLE IF NOT EXISTS rankings (
   feed TEXT NOT NULL
-    CHECK (feed IN ('top', 'new', 'best', 'ask', 'show', 'job')),
+    CHECK (feed IN ('top', 'new', 'best', 'ask', 'show', 'job', 'global')),
   rank INTEGER NOT NULL,
   story_id INTEGER NOT NULL,
   refreshed_at INTEGER NOT NULL,
@@ -109,7 +111,7 @@ ON rankings(feed, rank);
 CREATE TABLE IF NOT EXISTS ranking_candidates (
   run_id TEXT NOT NULL,
   feed TEXT NOT NULL
-    CHECK (feed IN ('top', 'new', 'best', 'ask', 'show', 'job')),
+    CHECK (feed IN ('top', 'new', 'best', 'ask', 'show', 'job', 'global')),
   rank INTEGER NOT NULL,
   story_id INTEGER NOT NULL,
   fetched_at INTEGER NOT NULL,
@@ -257,6 +259,10 @@ ON story_image_assets(story_id, status);
 
 
 STORY_COLUMN_MIGRATIONS = {
+    "source": (
+        "ALTER TABLE stories ADD COLUMN "
+        "source TEXT NOT NULL DEFAULT 'hn' CHECK (source IN ('hn', 'gdelt'))"
+    ),
     "enriched_title_en": (
         "ALTER TABLE stories ADD COLUMN "
         "enriched_title_en TEXT NOT NULL DEFAULT ''"
@@ -444,6 +450,7 @@ def init_db(path: Optional[Path] = None) -> None:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA_SQL)
         _migrate_story_columns(conn)
+        _migrate_ranking_feed_tables(conn)
         _migrate_story_image_assets_table(conn)
         _migrate_ingest_run_columns(conn)
         _migrate_insight_columns(conn)
@@ -502,6 +509,110 @@ def _migrate_story_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_stories_reenrich_work "
         "ON stories(needs_reenrich, last_seen_at DESC)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stories_source_time "
+        "ON stories(source, hn_time DESC)"
+    )
+
+
+def _table_sql(conn: sqlite3.Connection, table: str) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return str(row["sql"] or "") if row else ""
+
+
+def _ranking_table_allows_global(conn: sqlite3.Connection, table: str) -> bool:
+    sql = _table_sql(conn, table)
+    return "'global'" in sql or '"global"' in sql
+
+
+def _migrate_rankings_table(conn: sqlite3.Connection) -> None:
+    if _ranking_table_allows_global(conn, "rankings"):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rankings_type_rank "
+            "ON rankings(feed, rank)"
+        )
+        return
+    conn.execute("DROP INDEX IF EXISTS idx_rankings_type_rank")
+    conn.execute("ALTER TABLE rankings RENAME TO rankings_old_feed_check")
+    conn.execute(
+        """
+        CREATE TABLE rankings (
+          feed TEXT NOT NULL
+            CHECK (feed IN ('top', 'new', 'best', 'ask', 'show', 'job', 'global')),
+          rank INTEGER NOT NULL,
+          story_id INTEGER NOT NULL,
+          refreshed_at INTEGER NOT NULL,
+          PRIMARY KEY (feed, rank),
+          UNIQUE (feed, story_id),
+          FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO rankings(feed, rank, story_id, refreshed_at)
+        SELECT feed, rank, story_id, refreshed_at
+        FROM rankings_old_feed_check
+        WHERE feed IN ('top', 'new', 'best', 'ask', 'show', 'job', 'global')
+        """
+    )
+    conn.execute("DROP TABLE rankings_old_feed_check")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rankings_type_rank "
+        "ON rankings(feed, rank)"
+    )
+
+
+def _migrate_ranking_candidates_table(conn: sqlite3.Connection) -> None:
+    if _ranking_table_allows_global(conn, "ranking_candidates"):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ranking_candidates_run_feed "
+            "ON ranking_candidates(run_id, feed, rank)"
+        )
+        return
+    conn.execute("DROP INDEX IF EXISTS idx_ranking_candidates_run_feed")
+    conn.execute(
+        "ALTER TABLE ranking_candidates RENAME TO ranking_candidates_old_feed_check"
+    )
+    conn.execute(
+        """
+        CREATE TABLE ranking_candidates (
+          run_id TEXT NOT NULL,
+          feed TEXT NOT NULL
+            CHECK (feed IN ('top', 'new', 'best', 'ask', 'show', 'job', 'global')),
+          rank INTEGER NOT NULL,
+          story_id INTEGER NOT NULL,
+          fetched_at INTEGER NOT NULL,
+          PRIMARY KEY (run_id, feed, rank),
+          UNIQUE (run_id, feed, story_id),
+          FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO ranking_candidates(
+            run_id, feed, rank, story_id, fetched_at
+        )
+        SELECT run_id, feed, rank, story_id, fetched_at
+        FROM ranking_candidates_old_feed_check
+        WHERE feed IN ('top', 'new', 'best', 'ask', 'show', 'job', 'global')
+        """
+    )
+    conn.execute("DROP TABLE ranking_candidates_old_feed_check")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ranking_candidates_run_feed "
+        "ON ranking_candidates(run_id, feed, rank)"
+    )
+
+
+def _migrate_ranking_feed_tables(conn: sqlite3.Connection) -> None:
+    """Widen feed CHECK constraints to include the GDELT global section."""
+    _migrate_rankings_table(conn)
+    _migrate_ranking_candidates_table(conn)
 
 
 def _create_story_image_assets_indexes(conn: sqlite3.Connection) -> None:

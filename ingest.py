@@ -35,13 +35,14 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from threading import Lock
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
-from . import db, normalizer, repository, settings
+from . import db, gdelt_normalizer, normalizer, repository, settings
 from .ai_agent import (
     AiCapacityDeferred,
     AiProviderHttpError,
     AiProviderResponseError,
     is_ai_capacity_error,
 )
+from .gdelt_client import GdeltClient, GdeltFetchError, GdeltRateLimitError
 from .hn_client import HnClient, HnFetchError
 from .logging_config import configure_logging
 
@@ -49,7 +50,10 @@ from .logging_config import configure_logging
 log = logging.getLogger("server.ingest")
 
 
-FEEDS: Sequence[str] = ("top", "new", "best", "ask", "show", "job")
+HN_FEEDS: Sequence[str] = ("top", "new", "best", "ask", "show", "job")
+GDELT_FEED = "global"
+FEEDS: Sequence[str] = HN_FEEDS
+PUBLISH_FEEDS: Sequence[str] = (*HN_FEEDS, GDELT_FEED)
 # Higher-priority feed wins when one item appears in several rankings.
 _FEED_PRIORITY: Sequence[str] = ("job", "ask", "show", "top", "best", "new")
 _ENRICH_AI_USAGE_PURPOSES: Sequence[str] = ("story", "story-batch")
@@ -404,9 +408,9 @@ def _collect_feed_rankings(
     leave that feed's existing rankings untouched.
     """
     feed_ids: Dict[str, List[int]] = {}
-    for feed in FEEDS:
+    for feed in HN_FEEDS:
         if _deadline_reached(deadline_at):
-            for rest in FEEDS:
+            for rest in HN_FEEDS:
                 feed_ids.setdefault(rest, [])
             return feed_ids, True
         try:
@@ -561,6 +565,7 @@ def run_fetcher_once(
                         raw_text=normalized["raw_text"],
                         raw_json=normalized["raw_json"],
                         fetched_at=normalized["fetched_at"],
+                        source="hn",
                     )
                     existing = repository.get_story_basic(conn, sid)
                     new_kind = normalized["kind"]
@@ -609,6 +614,217 @@ def run_fetcher_once(
             with db.transaction(conn):
                 summary["candidate_count"] = repository.candidate_count(conn, run_id)
             summary["successful_round"] = True
+    finally:
+        conn.close()
+
+    return summary
+
+
+def _gdelt_fetch_enabled(force: bool) -> bool:
+    return bool(force or settings.GDELT_ENABLED)
+
+
+def _gdelt_fetch_throttled(conn) -> tuple[bool, int]:
+    now = repository.now_seconds()
+    last = repository.get_meta_int(conn, "last_gdelt_fetch_at")
+    if last is None:
+        return False, 0
+    elapsed = max(0, now - int(last))
+    min_interval = max(0, int(settings.GDELT_MIN_FETCH_INTERVAL_SECONDS))
+    return elapsed < min_interval, max(0, min_interval - elapsed)
+
+
+def run_gdelt_fetcher_once(
+    client=None,
+    *,
+    run_id: Optional[str] = None,
+    safety_reviewer=None,
+    deadline_at: Optional[float] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Fetch GDELT DOC articles into the isolated global ranking candidate set."""
+    if run_id is None:
+        run_id = f"manual-gdelt-{uuid.uuid4().hex}"
+
+    summary: Dict[str, Any] = {
+        "run_id": run_id,
+        "feed": GDELT_FEED,
+        "enabled": _gdelt_fetch_enabled(force),
+        "skipped": False,
+        "reason": "",
+        "articles_fetched": 0,
+        "stories_inserted": 0,
+        "stories_updated": 0,
+        "stories_rejected": 0,
+        "stories_old": 0,
+        "candidate_count": 0,
+        "purged_old": 0,
+        "successful_round": False,
+        "timed_out": False,
+        "rate_limited": False,
+        "safety_review_failed": False,
+    }
+
+    conn = db.connect()
+    try:
+        with db.transaction(conn):
+            summary["purged_old"] = repository.purge_old_gdelt_stories(
+                conn,
+                repository.today_in_digest_tz(),
+            )
+            if summary["purged_old"]:
+                repository.bump_catalog_version(conn)
+
+            if not summary["enabled"]:
+                summary["skipped"] = True
+                summary["reason"] = "disabled"
+                return summary
+
+            throttled, retry_after = _gdelt_fetch_throttled(conn)
+            if throttled and not force:
+                summary["skipped"] = True
+                summary["reason"] = "throttled"
+                summary["retry_after_seconds"] = retry_after
+                return summary
+    finally:
+        conn.close()
+
+    if _deadline_reached(deadline_at):
+        summary["timed_out"] = True
+        summary["reason"] = "deadline_before_gdelt_fetch"
+        return summary
+
+    if client is None:
+        client = GdeltClient()
+
+    try:
+        articles = client.fetch_articles(
+            query=settings.GDELT_QUERY,
+            timespan=settings.GDELT_TIMESPAN,
+            maxrecords=settings.GDELT_MAX_RECORDS,
+            sort=settings.GDELT_SORT,
+            mode=settings.GDELT_MODE,
+            format_=settings.GDELT_FORMAT,
+        )
+    except GdeltRateLimitError as exc:
+        summary["rate_limited"] = True
+        summary["skipped"] = True
+        summary["reason"] = "rate_limited"
+        if exc.retry_after_seconds is not None:
+            summary["retry_after_seconds"] = exc.retry_after_seconds
+        log.warning("GDELT fetch rate limited: %s", exc)
+        return summary
+    except GdeltFetchError as exc:
+        summary["skipped"] = True
+        summary["reason"] = "fetch_error"
+        summary["error"] = str(exc)
+        log.warning("GDELT fetch failed: %s", exc)
+        return summary
+    except Exception as exc:  # noqa: BLE001
+        summary["skipped"] = True
+        summary["reason"] = "fetch_error"
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+        log.warning("GDELT fetch raised: %s", exc)
+        return summary
+
+    summary["articles_fetched"] = len(articles)
+    if _deadline_reached(deadline_at):
+        summary["timed_out"] = True
+        summary["reason"] = "deadline_after_gdelt_fetch"
+        return summary
+
+    fetched_at = repository.now_seconds()
+    today_date = repository.today_in_digest_tz()
+    normalized_rows: List[Dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for rank, article in enumerate(articles, start=1):
+        row = gdelt_normalizer.normalize_article(
+            article,
+            rank=rank,
+            total=len(articles),
+            fetched_at=fetched_at,
+        )
+        if not row:
+            continue
+        sid = int(row["id"])
+        if sid in seen_ids:
+            continue
+        seen_ids.add(sid)
+        if repository.date_in_digest_tz(int(row["hn_time"] or 0)) != today_date:
+            summary["stories_old"] += 1
+            continue
+        normalized_rows.append(row)
+
+    if normalized_rows:
+        if safety_reviewer is None:
+            from .ai_agent import build_gdelt_safety_reviewer
+
+            safety_reviewer = build_gdelt_safety_reviewer()
+        try:
+            decisions = safety_reviewer.review_articles(normalized_rows)
+        except Exception as exc:  # noqa: BLE001
+            summary["safety_review_failed"] = True
+            summary["stories_rejected"] = len(normalized_rows)
+            summary["skipped"] = True
+            summary["reason"] = "safety_review_failed"
+            summary["error"] = f"{type(exc).__name__}: {exc}"
+            log.warning("GDELT safety review failed closed: %s", exc)
+            return summary
+    else:
+        decisions = {}
+
+    stored_ids: List[int] = []
+    for row in normalized_rows:
+        sid = int(row["id"])
+        decision = decisions.get(sid)
+        if not decision or not bool(decision.get("allowed")):
+            summary["stories_rejected"] += 1
+            continue
+        stored_ids.append(sid)
+
+    if _deadline_reached(deadline_at):
+        summary["timed_out"] = True
+        summary["reason"] = "deadline_before_gdelt_store"
+        return summary
+
+    conn = db.connect()
+    try:
+        with db.transaction(conn):
+            for row in normalized_rows:
+                sid = int(row["id"])
+                if sid not in stored_ids:
+                    continue
+                if not repository.story_exists(conn, sid):
+                    if repository.insert_story_pending(conn, row):
+                        summary["stories_inserted"] += 1
+                else:
+                    repository.update_story_metrics(
+                        conn,
+                        sid,
+                        score=row["score"],
+                        descendants=row["descendants"],
+                        last_seen_at=row["last_seen_at"],
+                        title_en=row["title_en"],
+                        url=row["url"],
+                        domain=row["domain"],
+                        by=row["by"],
+                        hn_time=row["hn_time"],
+                        raw_text=row["raw_text"],
+                        raw_json=row["raw_json"],
+                        fetched_at=row["fetched_at"],
+                        source="gdelt",
+                    )
+                    summary["stories_updated"] += 1
+            repository.replace_ranking_candidates(conn, run_id, GDELT_FEED, stored_ids)
+            if stored_ids:
+                repository.set_meta(
+                    conn,
+                    f"source_ranking_hash:{GDELT_FEED}",
+                    repository.hash_int_sequence(stored_ids),
+                )
+            repository.set_meta(conn, "last_gdelt_fetch_at", str(fetched_at))
+            summary["candidate_count"] = repository.candidate_count(conn, run_id)
+            summary["successful_round"] = bool(stored_ids)
     finally:
         conn.close()
 
@@ -708,6 +924,8 @@ def _maybe_fetch_comments(client, conn, story_row):
 
     Returns ``(comments, freshly_fetched)``.
     """
+    if (_row_value(story_row, "source", "hn") or "hn") == "gdelt":
+        return [], False
     descendants = int(story_row["descendants"] or 0)
     if descendants < settings.COMMENT_MIN_DESCENDANTS:
         return [], False
@@ -1874,7 +2092,7 @@ def _publish_ranking_checkpoint(
             return repository.publish_ranking_candidates(
                 conn,
                 run_id,
-                FEEDS,
+                PUBLISH_FEEDS,
                 preserve_existing=preserve_existing,
             )
     finally:
@@ -2783,6 +3001,7 @@ def _compact_round_summary_for_log(summary: Mapping[str, Any]) -> Dict[str, Any]
         "status": summary.get("status"),
         "error": summary.get("error"),
         "fetch": summary.get("fetch"),
+        "gdelt_fetch": summary.get("gdelt_fetch"),
         "enrich": _compact_enrich_for_log(summary.get("enrich")),
         "digest": _compact_digest_for_log(summary.get("digest")),
         "insights": _compact_insights_for_log(summary.get("insights")),
@@ -2843,6 +3062,7 @@ def run_ingest_round(
         "run_id": run_id,
         "status": "running",
         "fetch": None,
+        "gdelt_fetch": None,
         "enrich": None,
         "digest": None,
         "digest_checkpoints": [],
@@ -2941,6 +3161,7 @@ def run_ingest_round(
                 summary["error"] = error
                 return summary
 
+        gdelt_summary: Optional[Dict[str, Any]] = None
         fetch_summary = run_fetcher_once(
             client=client,
             run_id=run_id,
@@ -2948,6 +3169,13 @@ def run_ingest_round(
         )
         summary["fetch"] = fetch_summary
         log.info("fetcher: %s", fetch_summary)
+        if settings.GDELT_ENABLED:
+            gdelt_summary = run_gdelt_fetcher_once(
+                run_id=run_id,
+                deadline_at=fetch_deadline,
+            )
+            summary["gdelt_fetch"] = gdelt_summary
+            log.info("gdelt_fetcher: %s", gdelt_summary)
 
         conn = db.connect()
         try:
@@ -2955,8 +3183,11 @@ def run_ingest_round(
                 repository.update_ingest_run(
                     conn,
                     run_id,
-                    raw_count=int(fetch_summary.get("items_fetched", 0) or 0),
-                    candidate_count=int(fetch_summary.get("candidate_count", 0) or 0),
+                    raw_count=int(fetch_summary.get("items_fetched", 0) or 0)
+                    + int(
+                        (gdelt_summary or {}).get("articles_fetched", 0) or 0
+                    ),
+                    candidate_count=repository.candidate_count(conn, run_id),
                 )
                 target_ids = repository.candidate_story_ids(conn, run_id)
                 candidate_count = len(target_ids)
@@ -2965,7 +3196,9 @@ def run_ingest_round(
         if target_ids:
             start_image_pipeline(target_ids)
 
-        if fetch_summary.get("timed_out"):
+        if fetch_summary.get("timed_out") or (
+            gdelt_summary is not None and gdelt_summary.get("timed_out")
+        ):
             error = "round deadline reached during fetch"
             cleanup = _discard_run(run_id, release_inflight=True)
             _finish_run(run_id, "timeout", error=error)
@@ -2980,6 +3213,10 @@ def run_ingest_round(
                     target_ids=target_ids,
                     extra={
                         "fetch": json.dumps(fetch_summary, ensure_ascii=False),
+                        "gdelt_fetch": json.dumps(
+                            gdelt_summary or {},
+                            ensure_ascii=False,
+                        ),
                         **cleanup,
                     },
                 ),
@@ -2989,7 +3226,11 @@ def run_ingest_round(
             collect_image_pipeline(wait=False)
             return summary
 
-        if not fetch_summary.get("successful_round") or not target_ids:
+        fetch_success = bool(fetch_summary.get("successful_round"))
+        gdelt_success = bool(
+            gdelt_summary is not None and gdelt_summary.get("successful_round")
+        )
+        if not (fetch_success or gdelt_success) or not target_ids:
             error = "fetch produced no publishable candidates"
             _discard_run(run_id)
             _finish_run(run_id, "failed", error=error)
@@ -3002,7 +3243,13 @@ def run_ingest_round(
                     started_at=started,
                     candidate_count=candidate_count,
                     target_ids=target_ids,
-                    extra={"fetch": json.dumps(fetch_summary, ensure_ascii=False)},
+                    extra={
+                        "fetch": json.dumps(fetch_summary, ensure_ascii=False),
+                        "gdelt_fetch": json.dumps(
+                            gdelt_summary or {},
+                            ensure_ascii=False,
+                        ),
+                    },
                 ),
             )
             summary["status"] = "failed"
@@ -3118,7 +3365,7 @@ def run_ingest_round(
                 publish_summary = repository.publish_ranking_candidates(
                     conn,
                     run_id,
-                    FEEDS,
+                    PUBLISH_FEEDS,
                     preserve_existing=bool(partial_error),
                 )
             summary["publish"] = publish_summary
@@ -4029,6 +4276,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             try:
                 summary = run_fetcher_once(run_id=args.run_id or None)
                 log.info("fetcher: %s", summary)
+                if settings.GDELT_ENABLED:
+                    gdelt_summary = run_gdelt_fetcher_once(
+                        run_id=args.run_id or None
+                    )
+                    log.info("gdelt_fetcher: %s", gdelt_summary)
             except Exception as exc:  # noqa: BLE001
                 log.exception("fetcher failed: %s", exc)
         if requested["enrich"]:

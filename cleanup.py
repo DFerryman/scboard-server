@@ -16,8 +16,9 @@ Plan §D startup guard: read ``meta.last_full_fetch_at``; if missing or
 older than ``CLEANUP_STALE_GUARD_SECONDS``, skip the round so a long
 Fetcher outage doesn't get interpreted as "everything is stale".
 
-Cleanup does NOT bump ``catalog_version`` because it touches only
-client-invisible old data.
+Cleanup normally does NOT bump ``catalog_version`` because it touches only
+client-invisible old data. The exception is expired GDELT rows, because the
+global feed is user-visible and intentionally keeps only today's articles.
 
 The backing ``stories`` table also has a hard row cap. When the cap is
 exceeded, cleanup evicts unprotected rows with lower HN ranking signals first.
@@ -39,6 +40,7 @@ def run_cleanup_once() -> Dict[str, Any]:
         "skipped": False,
         "reason": "",
         "stories_deleted": 0,
+        "gdelt_stories_deleted": 0,
         "overflow_stories_deleted": 0,
         "comments_deleted": 0,
         "digests_deleted": 0,
@@ -53,6 +55,12 @@ def run_cleanup_once() -> Dict[str, Any]:
     conn = db.connect()
     try:
         with db.transaction(conn):
+            summary["gdelt_stories_deleted"] = repository.purge_old_gdelt_stories(
+                conn,
+                repository.today_in_digest_tz(),
+            )
+            if summary["gdelt_stories_deleted"]:
+                repository.bump_catalog_version(conn)
             summary["ranking_candidates_deleted"] = (
                 repository.purge_old_ranking_candidates(
                     conn, settings.RANKING_CANDIDATE_RETENTION_DAYS

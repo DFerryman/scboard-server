@@ -14,6 +14,9 @@ from typing import Any
 HN_RESPONSE_MAX_BYTES = 1 * 1024 * 1024
 """1 MiB — HN list endpoints (~500 ints) and item payloads are tiny."""
 
+GDELT_RESPONSE_MAX_BYTES = 5 * 1024 * 1024
+"""5 MiB — GDELT DOC ArtList JSON for bounded maxrecords windows."""
+
 AI_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
 """4 MiB — OpenAI-compatible chat completion JSON. 8k output tokens fit easily."""
 

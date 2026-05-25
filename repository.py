@@ -342,6 +342,7 @@ def row_to_story(row: sqlite3.Row, feed: Optional[str] = None) -> Story:
     return Story(
         id=row["id"],
         type=_story_type_from(row, feed),
+        source=_row_optional(row, "source", "hn") or "hn",
         titleZh=title_zh,
         titleEn=title_en,
         url=url,
@@ -739,7 +740,7 @@ def insert_story_pending(
     cursor = conn.execute(
         """
         INSERT OR IGNORE INTO stories (
-            id, kind, title_en, title_zh, url, domain, by,
+            id, source, kind, title_en, title_zh, url, domain, by,
             score, descendants, hn_time,
             raw_text, raw_json,
             topic, ai_summary,
@@ -748,7 +749,7 @@ def insert_story_pending(
             enrich_started_at, enriched_at,
             fetched_at, last_seen_at
         ) VALUES (
-            :id, :kind, :title_en, :title_zh, :url, :domain, :by,
+            :id, :source, :kind, :title_en, :title_zh, :url, :domain, :by,
             :score, :descendants, :hn_time,
             :raw_text, :raw_json,
             :topic, '',
@@ -760,6 +761,7 @@ def insert_story_pending(
         """,
         {
             "id": story_row["id"],
+            "source": story_row.get("source", "hn") or "hn",
             "kind": story_row.get("kind", "story"),
             "title_en": story_row.get("title_en", ""),
             "title_zh": story_row.get("title_zh", "") or story_row.get("title_en", ""),
@@ -794,12 +796,13 @@ def update_story_metrics(
     raw_text: Optional[str] = None,
     raw_json: Optional[str] = None,
     fetched_at: Optional[int] = None,
+    source: Optional[str] = None,
 ) -> None:
     """Plan §A2: only score/descendants/last_seen_at on existing rows."""
     current = conn.execute(
         """
         SELECT
-            title_en, url, domain, by, hn_time, raw_text, raw_json, fetched_at,
+            source, title_en, url, domain, by, hn_time, raw_text, raw_json, fetched_at,
             descendants, enrich_status, needs_reenrich,
             comments_fetched_descendants, enriched_descendants
         FROM stories WHERE id=?
@@ -810,6 +813,7 @@ def update_story_metrics(
         return
 
     next_title = title_en if title_en is not None else current["title_en"]
+    next_source = source if source is not None else current["source"]
     next_url = url if url is not None else current["url"]
     next_domain = domain if domain is not None else current["domain"]
     next_by = by if by is not None else current["by"]
@@ -857,7 +861,8 @@ def update_story_metrics(
     conn.execute(
         """
         UPDATE stories
-        SET title_en=?,
+        SET source=?,
+            title_en=?,
             title_zh=CASE
                 WHEN enrich_status IN ('pending', 'failed') THEN ?
                 ELSE title_zh
@@ -907,6 +912,7 @@ def update_story_metrics(
         WHERE id=?
         """,
         (
+            next_source or "hn",
             next_title or "",
             next_title or "",
             next_url or "",
@@ -3086,6 +3092,32 @@ def evict_story_overflow(
     return cursor.rowcount or 0
 
 
+def purge_old_gdelt_stories(conn: sqlite3.Connection, today_date: str) -> int:
+    """Delete GDELT rows that are outside today's digest timezone date."""
+    rows = conn.execute(
+        "SELECT id, hn_time FROM stories WHERE source='gdelt'"
+    ).fetchall()
+    ids: List[int] = []
+    for row in rows:
+        sid = int(row["id"])
+        try:
+            hn_time = int(row["hn_time"] or 0)
+        except (TypeError, ValueError):
+            hn_time = 0
+        if hn_time <= 0 or date_in_digest_tz(hn_time) != today_date:
+            ids.append(sid)
+    if not ids:
+        return 0
+    mark_story_images_pending_delete(
+        conn,
+        ids,
+        delete_after=now_seconds() + int(settings.STORY_IMAGE_DELETE_GRACE_SECONDS),
+    )
+    with id_in_clause(conn, ids) as (clause, params):
+        cursor = conn.execute(f"DELETE FROM stories WHERE id {clause}", params)
+    return cursor.rowcount or 0
+
+
 def delete_run_pending_orphans(
     conn: sqlite3.Connection,
     run_id: str,
@@ -3245,5 +3277,6 @@ __all__ = [
     "digest_referenced_story_ids",
     "delete_orphan_stories",
     "evict_story_overflow",
+    "purge_old_gdelt_stories",
     "delete_run_pending_orphans",
 ]

@@ -1647,6 +1647,63 @@ HN_RETRY_ATTEMPTS = _require_int_range(
     max_value=20,
 )
 
+# ---------- GDELT DOC API ----------
+
+GDELT_ENABLED = _env_bool(
+    "HNREADER_GDELT_ENABLED", False, fallback="HACKERMINI_GDELT_ENABLED"
+)
+GDELT_DOC_API_URL = _env_str(
+    "HNREADER_GDELT_DOC_API_URL",
+    "https://api.gdeltproject.org/api/v2/doc/doc",
+    fallback="HACKERMINI_GDELT_DOC_API_URL",
+).strip()
+GDELT_QUERY = _env_str(
+    "HNREADER_GDELT_QUERY",
+    (
+        '(technology OR "artificial intelligence" OR cybersecurity OR science '
+        "OR climate OR economy OR startup OR semiconductor)"
+    ),
+    fallback="HACKERMINI_GDELT_QUERY",
+).strip()
+GDELT_MODE = _env_str(
+    "HNREADER_GDELT_MODE", "ArtList", fallback="HACKERMINI_GDELT_MODE"
+).strip() or "ArtList"
+GDELT_FORMAT = _env_str(
+    "HNREADER_GDELT_FORMAT", "json", fallback="HACKERMINI_GDELT_FORMAT"
+).strip() or "json"
+GDELT_TIMESPAN = _env_str(
+    "HNREADER_GDELT_TIMESPAN", "24h", fallback="HACKERMINI_GDELT_TIMESPAN"
+).strip() or "24h"
+GDELT_SORT = _env_str(
+    "HNREADER_GDELT_SORT", "DateDesc", fallback="HACKERMINI_GDELT_SORT"
+).strip() or "DateDesc"
+GDELT_MAX_RECORDS = _require_int_range(
+    "HNREADER_GDELT_MAX_RECORDS",
+    _env_int("HNREADER_GDELT_MAX_RECORDS", 50, fallback="HACKERMINI_GDELT_MAX_RECORDS"),
+    min_value=1,
+    max_value=250,
+)
+GDELT_REQUEST_TIMEOUT_SECONDS = _require_float_range(
+    "HNREADER_GDELT_REQUEST_TIMEOUT_SECONDS",
+    _env_float(
+        "HNREADER_GDELT_REQUEST_TIMEOUT_SECONDS",
+        20.0,
+        fallback="HACKERMINI_GDELT_REQUEST_TIMEOUT_SECONDS",
+    ),
+    min_value=0.1,
+    max_value=120.0,
+)
+GDELT_MIN_FETCH_INTERVAL_SECONDS = _require_int_range(
+    "HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS",
+    _env_int(
+        "HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS",
+        30 * 60,
+        fallback="HACKERMINI_GDELT_MIN_FETCH_INTERVAL_SECONDS",
+    ),
+    min_value=0,
+    max_value=24 * 60 * 60,
+)
+
 # ---------- App version ----------
 
 APP_VERSION = _env_str(
