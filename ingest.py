@@ -22,6 +22,7 @@ import argparse
 import inspect
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -630,14 +631,20 @@ def _gdelt_fetch_enabled(force: bool) -> bool:
 def _gdelt_fetch_throttled(conn) -> tuple[bool, int, str]:
     now = repository.now_seconds()
     rate_limit_until = repository.get_meta_int(conn, _GDELT_RATE_LIMIT_UNTIL_META)
-    if rate_limit_until is not None and now < int(rate_limit_until):
-        return True, max(0, int(rate_limit_until) - now), "rate_limit_cooldown"
+    last_attempt = repository.get_meta_int(conn, _GDELT_LAST_ATTEMPT_META)
+    last_fetch = repository.get_meta_int(conn, _GDELT_LAST_FETCH_META)
+    if rate_limit_until is not None:
+        rate_limit_until = int(rate_limit_until)
+        if now < rate_limit_until:
+            return True, max(0, rate_limit_until - now), "rate_limit_cooldown"
+        if rate_limit_until > 0 and not any(
+            value is not None and int(value) >= rate_limit_until
+            for value in (last_attempt, last_fetch)
+        ):
+            return False, 0, ""
     last_values = [
         value
-        for value in (
-            repository.get_meta_int(conn, _GDELT_LAST_ATTEMPT_META),
-            repository.get_meta_int(conn, _GDELT_LAST_FETCH_META),
-        )
+        for value in (last_attempt, last_fetch)
         if value is not None
     ]
     if not last_values:
@@ -649,17 +656,18 @@ def _gdelt_fetch_throttled(conn) -> tuple[bool, int, str]:
 
 
 def _gdelt_rate_limit_cooldown_seconds(exc: GdeltRateLimitError) -> int:
-    cooldown = max(
+    if exc.retry_after_seconds is not None:
+        try:
+            hint = float(exc.retry_after_seconds)
+        except (TypeError, ValueError, OverflowError):
+            hint = -1.0
+        if math.isfinite(hint) and hint >= 0:
+            return int(math.ceil(hint))
+    return max(
+        0,
         int(settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS),
         int(settings.GDELT_MIN_FETCH_INTERVAL_SECONDS),
     )
-    if exc.retry_after_seconds is None:
-        return max(0, cooldown)
-    hint = max(0.0, float(exc.retry_after_seconds))
-    rounded_hint = int(hint)
-    if hint > rounded_hint:
-        rounded_hint += 1
-    return max(0, cooldown, rounded_hint)
 
 
 def run_gdelt_fetcher_once(

@@ -1057,11 +1057,11 @@ class SettingsValidation(unittest.TestCase):
             launcher,
         )
         self.assertIn(
-            'HNREADER_GDELT_MAX_RECORDS="${HNREADER_GDELT_MAX_RECORDS:-50}"',
+            'HNREADER_GDELT_MAX_RECORDS="${HNREADER_GDELT_MAX_RECORDS:-100}"',
             launcher,
         )
         self.assertIn(
-            'HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS="${HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS:-21600}"',
+            'HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS="${HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS:-7200}"',
             launcher,
         )
         self.assertIn(
@@ -2275,7 +2275,7 @@ class GdeltIntegration(_SqliteCase):
         self.assertEqual(summary["reason"], "throttled")
         self.assertGreater(int(summary["retry_after_seconds"]), 0)
 
-    def test_gdelt_rate_limit_sets_hard_cooldown_even_for_force(self):
+    def test_gdelt_rate_limit_honors_retry_after_even_for_force(self):
         old_enabled = settings.GDELT_ENABLED
         old_interval = settings.GDELT_MIN_FETCH_INTERVAL_SECONDS
         old_cooldown = settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS
@@ -2303,7 +2303,7 @@ class GdeltIntegration(_SqliteCase):
         self.assertEqual(limited_client.calls, 1)
         self.assertTrue(summary["rate_limited"], summary)
         self.assertEqual(summary["reason"], "rate_limited")
-        self.assertEqual(summary["retry_after_seconds"], 123)
+        self.assertEqual(summary["retry_after_seconds"], 17)
         self.assertEqual(summary["upstream_retry_after_seconds"], 17)
         self.assertTrue(retry_summary["skipped"], retry_summary)
         self.assertEqual(retry_summary["reason"], "rate_limit_cooldown")
@@ -2317,8 +2317,59 @@ class GdeltIntegration(_SqliteCase):
             conn.close()
         self.assertIsNotNone(rate_limit_until)
         assert rate_limit_until is not None
-        self.assertGreaterEqual(rate_limit_until, before + 123)
+        self.assertGreaterEqual(rate_limit_until, before + 17)
         self.assertIsNotNone(last_attempt)
+
+    def test_gdelt_expired_rate_limit_cooldown_allows_next_probe(self):
+        now = repository.now_seconds()
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "gdelt_rate_limit_until", str(now - 1))
+                repository.set_meta(conn, "last_gdelt_fetch_attempt_at", str(now - 10))
+                repository.set_meta(conn, "last_gdelt_fetch_at", str(now - 20))
+            throttled, retry_after, reason = ingest_module._gdelt_fetch_throttled(conn)
+        finally:
+            conn.close()
+
+        self.assertFalse(throttled)
+        self.assertEqual(retry_after, 0)
+        self.assertEqual(reason, "")
+
+    def test_gdelt_rate_limit_without_valid_retry_after_uses_local_cooldown(self):
+        old_enabled = settings.GDELT_ENABLED
+        old_interval = settings.GDELT_MIN_FETCH_INTERVAL_SECONDS
+        old_cooldown = settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS
+        limited_client = _RateLimitedGdelt(retry_after_seconds="not-a-number")
+        try:
+            settings.GDELT_ENABLED = True  # type: ignore[assignment]
+            settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = 0  # type: ignore[assignment]
+            settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = 123  # type: ignore[assignment]
+            before = repository.now_seconds()
+            summary = ingest_module.run_gdelt_fetcher_once(
+                client=limited_client,
+                run_id="gdelt-429-invalid-retry-after",
+                force=True,
+            )
+        finally:
+            settings.GDELT_ENABLED = old_enabled  # type: ignore[assignment]
+            settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
+            settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = old_cooldown  # type: ignore[assignment]
+
+        self.assertEqual(limited_client.calls, 1)
+        self.assertTrue(summary["rate_limited"], summary)
+        self.assertEqual(summary["reason"], "rate_limited")
+        self.assertEqual(summary["retry_after_seconds"], 123)
+        self.assertEqual(summary["upstream_retry_after_seconds"], "not-a-number")
+
+        conn = db.connect()
+        try:
+            rate_limit_until = repository.get_meta_int(conn, "gdelt_rate_limit_until")
+        finally:
+            conn.close()
+        self.assertIsNotNone(rate_limit_until)
+        assert rate_limit_until is not None
+        self.assertGreaterEqual(rate_limit_until, before + 123)
 
     def test_gdelt_safety_reviewer_keyword_fallback_blocks_disallowed_topics(self):
         old_codex_enabled = settings.CODEX_ENABLED
