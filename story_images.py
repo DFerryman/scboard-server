@@ -5,23 +5,23 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import http.client
 import ipaddress
 import logging
 import socket
+import ssl
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from io import BytesIO
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from PIL import Image, ImageOps
 
 from . import cloud_image_upload, db, repository, settings
-from .http_client import ResponseTooLargeError, read_limited, urlopen_no_redirect
+from .http_client import ResponseTooLargeError, read_limited
 
 
 log = logging.getLogger("server.story_images")
@@ -64,6 +64,13 @@ class ProcessedImage:
     cloud_path: str
     sha256: str
     png_bytes: bytes
+
+
+@dataclass(frozen=True)
+class _ValidatedUrl:
+    url: str
+    parsed: urllib.parse.SplitResult
+    pinned_ip: str
 
 
 class _ImageCandidateParser(HTMLParser):
@@ -117,17 +124,10 @@ def _is_public_ip(address: str) -> bool:
         ip = ipaddress.ip_address(address)
     except ValueError:
         return False
-    return not (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    )
+    return ip.is_global and not ip.is_multicast
 
 
-def _validate_url(url: str) -> str:
+def _validate_url_with_pinned_ip(url: str) -> _ValidatedUrl:
     parsed = urllib.parse.urlsplit(str(url or "").strip())
     if parsed.scheme not in {"http", "https"}:
         raise UnsafeUrlError(f"unsupported URL scheme: {parsed.scheme or '<empty>'}")
@@ -139,13 +139,134 @@ def _validate_url(url: str) -> str:
     if host.lower() in {"localhost", "localhost.localdomain"}:
         raise UnsafeUrlError("localhost is not allowed")
     try:
-        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise UnsafeUrlError(f"invalid URL port: {exc}") from exc
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (socket.gaierror, socket.herror, OSError) as exc:
         raise UnsafeUrlError(f"DNS resolution failed for {host}") from exc
-    addresses = {info[4][0] for info in infos if info and info[4]}
+    addresses: List[str] = []
+    for info in infos:
+        if not info or not info[4]:
+            continue
+        address = str(info[4][0]).split("%", 1)[0]
+        if address not in addresses:
+            addresses.append(address)
     if not addresses or any(not _is_public_ip(addr) for addr in addresses):
         raise UnsafeUrlError(f"URL host resolves to a non-public address: {host}")
-    return urllib.parse.urlunsplit(parsed)
+    return _ValidatedUrl(
+        url=urllib.parse.urlunsplit(parsed),
+        parsed=parsed,
+        pinned_ip=addresses[0],
+    )
+
+
+def _validate_url(url: str) -> str:
+    return _validate_url_with_pinned_ip(url).url
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(
+        self,
+        host: str,
+        *,
+        pinned_ip: str,
+        port: int,
+        timeout: float,
+    ) -> None:
+        super().__init__(host, port=port, timeout=timeout)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self._pinned_ip, self.port),
+            self.timeout,
+            self.source_address,
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(
+        self,
+        host: str,
+        *,
+        pinned_ip: str,
+        port: int,
+        timeout: float,
+    ) -> None:
+        super().__init__(
+            host,
+            port=port,
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        sock = socket.create_connection(
+            (self._pinned_ip, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        try:
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        except Exception:
+            sock.close()
+            raise
+
+
+def _request_target(parsed: urllib.parse.SplitResult) -> str:
+    path = parsed.path or "/"
+    if parsed.query:
+        return f"{path}?{parsed.query}"
+    return path
+
+
+def _host_header_value(parsed: urllib.parse.SplitResult) -> str:
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = parsed.port
+    default_port = 443 if parsed.scheme == "https" else 80
+    if port is not None and port != default_port:
+        return f"{host}:{port}"
+    return host
+
+
+def _open_pinned_no_redirect(
+    current: _ValidatedUrl,
+    *,
+    accept: str,
+    timeout: float,
+) -> Tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
+    parsed = current.parsed
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    conn_cls = (
+        _PinnedHTTPSConnection
+        if parsed.scheme == "https"
+        else _PinnedHTTPConnection
+    )
+    conn = conn_cls(
+        parsed.hostname or "",
+        pinned_ip=current.pinned_ip,
+        port=port,
+        timeout=timeout,
+    )
+    try:
+        conn.request(
+            "GET",
+            _request_target(parsed),
+            headers={
+                "Host": _host_header_value(parsed),
+                "User-Agent": _UA,
+                "Accept": accept,
+            },
+        )
+        return conn, conn.getresponse()
+    except Exception:
+        conn.close()
+        raise
 
 
 def _fetch_limited(
@@ -155,32 +276,41 @@ def _fetch_limited(
     max_bytes: int,
     timeout: float,
 ) -> tuple[str, bytes, Mapping[str, str]]:
-    current = _validate_url(url)
+    current = _validate_url_with_pinned_ip(url)
     for _ in range(_MAX_REDIRECTS + 1):
-        req = urllib.request.Request(
-            current,
-            headers={
-                "User-Agent": _UA,
-                "Accept": accept,
-            },
-        )
+        conn = None
+        resp = None
         try:
-            with urlopen_no_redirect(req, timeout=timeout) as resp:
-                final_url = getattr(resp, "url", current)
-                headers = {str(k).lower(): str(v) for k, v in resp.headers.items()}
-                return final_url, read_limited(resp, max_bytes), headers
-        except urllib.error.HTTPError as exc:
-            if exc.code in {301, 302, 303, 307, 308}:
-                location = exc.headers.get("Location")
+            conn, resp = _open_pinned_no_redirect(
+                current,
+                accept=accept,
+                timeout=timeout,
+            )
+            status = int(getattr(resp, "status", 0) or 0)
+            headers = {str(k).lower(): str(v) for k, v in resp.getheaders()}
+            if status in {301, 302, 303, 307, 308}:
+                location = headers.get("location")
                 if not location:
-                    raise StoryImageError(f"redirect without Location from {current}") from exc
-                current = _validate_url(urllib.parse.urljoin(current, location))
+                    raise StoryImageError(f"redirect without Location from {current.url}")
+                current = _validate_url_with_pinned_ip(
+                    urllib.parse.urljoin(current.url, location)
+                )
                 continue
-            raise StoryImageError(f"HTTP {exc.code} for {current}") from exc
+            if status < 200 or status >= 300:
+                raise StoryImageError(f"HTTP {status} for {current.url}")
+            return current.url, read_limited(resp, max_bytes), headers
         except ResponseTooLargeError as exc:
             raise StoryImageError(str(exc)) from exc
-        except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+        except (
+            TimeoutError,
+            socket.timeout,
+            http.client.HTTPException,
+            OSError,
+        ) as exc:
             raise StoryImageError(str(exc)) from exc
+        finally:
+            if conn is not None:
+                conn.close()
     raise StoryImageError(f"too many redirects for {url}")
 
 

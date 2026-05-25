@@ -112,13 +112,13 @@ class DailyLoggingConfigTest(unittest.TestCase):
         )
         self.assertIn('$(env_line HNREADER_LOG_DIR "$HNREADER_LOG_DIR")', launcher)
         self.assertIn(
-            'run_root mkdir -p "$db_dir" "$HNREADER_LOG_DIR" "$ENV_DIR"',
+            'local runtime_dirs=("$db_dir" "$HNREADER_LOG_DIR" "$ENV_DIR" "$APP_HOME" "$HNREADER_CODEX_HOME")',
             launcher,
         )
-        self.assertGreaterEqual(
-            launcher.count("ReadWritePaths=${db_dir} ${HNREADER_LOG_DIR}"),
-            2,
-        )
+        self.assertIn('run_root mkdir -p "${runtime_dirs[@]}"', launcher)
+        self.assertIn('runtime_read_write_paths() {', launcher)
+        self.assertIn('local paths=("$db_dir" "$HNREADER_LOG_DIR" "$APP_HOME" "$HNREADER_CODEX_HOME")', launcher)
+        self.assertGreaterEqual(launcher.count("ReadWritePaths=${read_write_paths}"), 2)
         self.assertIn('_rw_property_args rw_args "$db_dir" "$HNREADER_LOG_DIR"', launcher)
 
     def test_launcher_guards_recursive_chown_runtime_dirs(self) -> None:

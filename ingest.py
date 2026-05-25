@@ -54,6 +54,9 @@ HN_FEEDS: Sequence[str] = ("top", "new", "best", "ask", "show")
 GDELT_FEED = "global"
 FEEDS: Sequence[str] = HN_FEEDS
 PUBLISH_FEEDS: Sequence[str] = (*HN_FEEDS, GDELT_FEED)
+_GDELT_LAST_FETCH_META = "last_gdelt_fetch_at"
+_GDELT_LAST_ATTEMPT_META = "last_gdelt_fetch_attempt_at"
+_GDELT_RATE_LIMIT_UNTIL_META = "gdelt_rate_limit_until"
 # Higher-priority feed wins when one item appears in several rankings.
 _FEED_PRIORITY: Sequence[str] = ("ask", "show", "top", "best", "new")
 _ENRICH_AI_USAGE_PURPOSES: Sequence[str] = ("story", "story-batch")
@@ -624,14 +627,39 @@ def _gdelt_fetch_enabled(force: bool) -> bool:
     return bool(force or settings.GDELT_ENABLED)
 
 
-def _gdelt_fetch_throttled(conn) -> tuple[bool, int]:
+def _gdelt_fetch_throttled(conn) -> tuple[bool, int, str]:
     now = repository.now_seconds()
-    last = repository.get_meta_int(conn, "last_gdelt_fetch_at")
-    if last is None:
-        return False, 0
+    rate_limit_until = repository.get_meta_int(conn, _GDELT_RATE_LIMIT_UNTIL_META)
+    if rate_limit_until is not None and now < int(rate_limit_until):
+        return True, max(0, int(rate_limit_until) - now), "rate_limit_cooldown"
+    last_values = [
+        value
+        for value in (
+            repository.get_meta_int(conn, _GDELT_LAST_ATTEMPT_META),
+            repository.get_meta_int(conn, _GDELT_LAST_FETCH_META),
+        )
+        if value is not None
+    ]
+    if not last_values:
+        return False, 0, ""
+    last = max(int(value) for value in last_values)
     elapsed = max(0, now - int(last))
     min_interval = max(0, int(settings.GDELT_MIN_FETCH_INTERVAL_SECONDS))
-    return elapsed < min_interval, max(0, min_interval - elapsed)
+    return elapsed < min_interval, max(0, min_interval - elapsed), "throttled"
+
+
+def _gdelt_rate_limit_cooldown_seconds(exc: GdeltRateLimitError) -> int:
+    cooldown = max(
+        int(settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS),
+        int(settings.GDELT_MIN_FETCH_INTERVAL_SECONDS),
+    )
+    if exc.retry_after_seconds is None:
+        return max(0, cooldown)
+    hint = max(0.0, float(exc.retry_after_seconds))
+    rounded_hint = int(hint)
+    if hint > rounded_hint:
+        rounded_hint += 1
+    return max(0, cooldown, rounded_hint)
 
 
 def run_gdelt_fetcher_once(
@@ -680,12 +708,20 @@ def run_gdelt_fetcher_once(
                 summary["reason"] = "disabled"
                 return summary
 
-            throttled, retry_after = _gdelt_fetch_throttled(conn)
-            if throttled and not force and not summary["purged_old"]:
+            throttled, retry_after, throttle_reason = _gdelt_fetch_throttled(conn)
+            if throttled and (
+                throttle_reason == "rate_limit_cooldown"
+                or (not force and not summary["purged_old"])
+            ):
                 summary["skipped"] = True
-                summary["reason"] = "throttled"
+                summary["reason"] = throttle_reason
                 summary["retry_after_seconds"] = retry_after
                 return summary
+            repository.set_meta(
+                conn,
+                _GDELT_LAST_ATTEMPT_META,
+                str(repository.now_seconds()),
+            )
     finally:
         conn.close()
 
@@ -707,11 +743,23 @@ def run_gdelt_fetcher_once(
             format_=settings.GDELT_FORMAT,
         )
     except GdeltRateLimitError as exc:
+        cooldown = _gdelt_rate_limit_cooldown_seconds(exc)
         summary["rate_limited"] = True
         summary["skipped"] = True
         summary["reason"] = "rate_limited"
+        summary["retry_after_seconds"] = cooldown
         if exc.retry_after_seconds is not None:
-            summary["retry_after_seconds"] = exc.retry_after_seconds
+            summary["upstream_retry_after_seconds"] = exc.retry_after_seconds
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(
+                    conn,
+                    _GDELT_RATE_LIMIT_UNTIL_META,
+                    str(repository.now_seconds() + cooldown),
+                )
+        finally:
+            conn.close()
         log.warning("GDELT fetch rate limited: %s", exc)
         return summary
     except GdeltFetchError as exc:
@@ -822,7 +870,8 @@ def run_gdelt_fetcher_once(
                     f"source_ranking_hash:{GDELT_FEED}",
                     repository.hash_int_sequence(stored_ids),
                 )
-            repository.set_meta(conn, "last_gdelt_fetch_at", str(fetched_at))
+            repository.set_meta(conn, _GDELT_RATE_LIMIT_UNTIL_META, "0")
+            repository.set_meta(conn, _GDELT_LAST_FETCH_META, str(fetched_at))
             summary["candidate_count"] = repository.candidate_count(conn, run_id)
             summary["successful_round"] = bool(stored_ids)
     finally:

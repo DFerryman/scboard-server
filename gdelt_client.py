@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
 from . import settings
@@ -58,7 +60,14 @@ def _retry_after_seconds(exc: urllib.error.HTTPError) -> Optional[float]:
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        return None
+        try:
+            retry_at = parsedate_to_datetime(str(raw))
+        except (TypeError, ValueError):
+            return None
+        try:
+            value = retry_at.timestamp() - time.time()
+        except (OverflowError, OSError, ValueError):
+            return None
     return value if value >= 0 else None
 
 

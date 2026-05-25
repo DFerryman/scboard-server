@@ -1061,6 +1061,14 @@ class SettingsValidation(unittest.TestCase):
             launcher,
         )
         self.assertIn(
+            'HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS="${HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS:-21600}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_GDELT_RATE_LIMIT_COOLDOWN_SECONDS="${HNREADER_GDELT_RATE_LIMIT_COOLDOWN_SECONDS:-86400}"',
+            launcher,
+        )
+        self.assertIn(
             'HNREADER_STORY_IMAGE_UPLOAD_BATCH_SIZE="${HNREADER_STORY_IMAGE_UPLOAD_BATCH_SIZE:-20}"',
             launcher,
         )
@@ -2105,6 +2113,26 @@ class _FakeGdelt:
         return list(self.articles)
 
 
+class _RateLimitedGdelt:
+    def __init__(self, retry_after_seconds=None):
+        self.retry_after_seconds = retry_after_seconds
+        self.calls = 0
+
+    def fetch_articles(self, **_kwargs):
+        from .gdelt_client import GdeltRateLimitError
+
+        self.calls += 1
+        raise GdeltRateLimitError(
+            "GDELT API returned HTTP 429",
+            retry_after_seconds=self.retry_after_seconds,
+        )
+
+
+class _UnexpectedGdeltCall:
+    def fetch_articles(self, **_kwargs):
+        raise AssertionError("GDELT should be locally throttled before HTTP")
+
+
 class _TitleSafety:
     def review_articles(self, rows):
         out = {}
@@ -2217,6 +2245,80 @@ class GdeltIntegration(_SqliteCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["source"], "gdelt")
         self.assertEqual(row["enrich_status"], "pending")
+
+    def test_gdelt_fetcher_throttles_after_recent_attempt(self):
+        old_enabled = settings.GDELT_ENABLED
+        old_interval = settings.GDELT_MIN_FETCH_INTERVAL_SECONDS
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(
+                    conn,
+                    "last_gdelt_fetch_attempt_at",
+                    str(repository.now_seconds()),
+                )
+        finally:
+            conn.close()
+
+        try:
+            settings.GDELT_ENABLED = True  # type: ignore[assignment]
+            settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = 60 * 60  # type: ignore[assignment]
+            summary = ingest_module.run_gdelt_fetcher_once(
+                client=_UnexpectedGdeltCall(),
+                run_id="gdelt-recent-attempt",
+            )
+        finally:
+            settings.GDELT_ENABLED = old_enabled  # type: ignore[assignment]
+            settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
+
+        self.assertTrue(summary["skipped"], summary)
+        self.assertEqual(summary["reason"], "throttled")
+        self.assertGreater(int(summary["retry_after_seconds"]), 0)
+
+    def test_gdelt_rate_limit_sets_hard_cooldown_even_for_force(self):
+        old_enabled = settings.GDELT_ENABLED
+        old_interval = settings.GDELT_MIN_FETCH_INTERVAL_SECONDS
+        old_cooldown = settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS
+        limited_client = _RateLimitedGdelt(retry_after_seconds=17)
+        try:
+            settings.GDELT_ENABLED = True  # type: ignore[assignment]
+            settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = 0  # type: ignore[assignment]
+            settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = 123  # type: ignore[assignment]
+            before = repository.now_seconds()
+            summary = ingest_module.run_gdelt_fetcher_once(
+                client=limited_client,
+                run_id="gdelt-429",
+                force=True,
+            )
+            retry_summary = ingest_module.run_gdelt_fetcher_once(
+                client=_UnexpectedGdeltCall(),
+                run_id="gdelt-429-local-cooldown",
+                force=True,
+            )
+        finally:
+            settings.GDELT_ENABLED = old_enabled  # type: ignore[assignment]
+            settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
+            settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = old_cooldown  # type: ignore[assignment]
+
+        self.assertEqual(limited_client.calls, 1)
+        self.assertTrue(summary["rate_limited"], summary)
+        self.assertEqual(summary["reason"], "rate_limited")
+        self.assertEqual(summary["retry_after_seconds"], 123)
+        self.assertEqual(summary["upstream_retry_after_seconds"], 17)
+        self.assertTrue(retry_summary["skipped"], retry_summary)
+        self.assertEqual(retry_summary["reason"], "rate_limit_cooldown")
+        self.assertGreater(int(retry_summary["retry_after_seconds"]), 0)
+
+        conn = db.connect()
+        try:
+            rate_limit_until = repository.get_meta_int(conn, "gdelt_rate_limit_until")
+            last_attempt = repository.get_meta_int(conn, "last_gdelt_fetch_attempt_at")
+        finally:
+            conn.close()
+        self.assertIsNotNone(rate_limit_until)
+        assert rate_limit_until is not None
+        self.assertGreaterEqual(rate_limit_until, before + 123)
+        self.assertIsNotNone(last_attempt)
 
     def test_gdelt_safety_reviewer_keyword_fallback_blocks_disallowed_topics(self):
         old_codex_enabled = settings.CODEX_ENABLED
@@ -17968,6 +18070,106 @@ class StoryImagePipelineTests(_SqliteCase):
             Image.MAX_IMAGE_PIXELS = old_limit
 
         self.assertEqual(observed_limits, [987_654_321])
+
+    def test_pinned_http_connection_connects_to_validated_ip(self):
+        from . import story_images
+
+        class FakeSocket:
+            def close(self):
+                pass
+
+        fake_socket = FakeSocket()
+        conn = story_images._PinnedHTTPConnection(
+            "cdn.example",
+            pinned_ip="93.184.216.34",
+            port=80,
+            timeout=4,
+        )
+        with patch.object(
+            story_images.socket,
+            "create_connection",
+            return_value=fake_socket,
+        ) as create_connection:
+            try:
+                conn.connect()
+            finally:
+                conn.close()
+
+        create_connection.assert_called_once_with(
+            ("93.184.216.34", 80),
+            4,
+            conn.source_address,
+        )
+
+    def test_fetch_limited_uses_pinned_ip_after_url_validation(self):
+        from . import story_images
+
+        class FakeResp:
+            status = 200
+            headers = {"content-length": "2", "content-type": "image/png"}
+
+            def getheaders(self):
+                return list(self.headers.items())
+
+            def read(self, _size=-1):
+                return b"ok"
+
+        class FakeConnection:
+            instances = []
+
+            def __init__(self, host, *, pinned_ip, port, timeout):
+                self.host = host
+                self.pinned_ip = pinned_ip
+                self.port = port
+                self.timeout = timeout
+                self.closed = False
+                self.request_args = None
+                FakeConnection.instances.append(self)
+
+            def request(self, method, target, headers):
+                self.request_args = (method, target, headers)
+
+            def getresponse(self):
+                return FakeResp()
+
+            def close(self):
+                self.closed = True
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            self.assertEqual(host, "cdn.example")
+            self.assertEqual(port, 80)
+            return [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    6,
+                    "",
+                    ("93.184.216.34", 80),
+                )
+            ]
+
+        with patch.object(story_images.socket, "getaddrinfo", side_effect=fake_getaddrinfo), \
+             patch.object(story_images, "_PinnedHTTPConnection", FakeConnection):
+            final_url, body, headers = story_images._fetch_limited(
+                "http://cdn.example/path?q=1",
+                accept="image/png",
+                max_bytes=16,
+                timeout=3,
+            )
+
+        self.assertEqual(final_url, "http://cdn.example/path?q=1")
+        self.assertEqual(body, b"ok")
+        self.assertEqual(headers["content-type"], "image/png")
+        self.assertEqual(len(FakeConnection.instances), 1)
+        conn = FakeConnection.instances[0]
+        self.assertEqual(conn.host, "cdn.example")
+        self.assertEqual(conn.pinned_ip, "93.184.216.34")
+        self.assertEqual(conn.port, 80)
+        self.assertEqual(conn.timeout, 3)
+        self.assertTrue(conn.closed)
+        self.assertEqual(conn.request_args[0], "GET")
+        self.assertEqual(conn.request_args[1], "/path?q=1")
+        self.assertEqual(conn.request_args[2]["Host"], "cdn.example")
 
     def test_process_story_images_uploads_and_records_asset(self):
         from . import story_images

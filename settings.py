@@ -1695,15 +1695,35 @@ GDELT_REQUEST_TIMEOUT_SECONDS = _require_float_range(
     min_value=0.1,
     max_value=120.0,
 )
-GDELT_MIN_FETCH_INTERVAL_SECONDS = _require_int_range(
+# Public GDELT DOC endpoints are shared and rate-limited. Keep these as hard
+# floors so stale deployment env files cannot accidentally restore a fast poll.
+_GDELT_CONFIGURED_MIN_FETCH_INTERVAL_SECONDS = _require_int_range(
     "HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS",
     _env_int(
         "HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS",
-        30 * 60,
+        6 * 60 * 60,
         fallback="HACKERMINI_GDELT_MIN_FETCH_INTERVAL_SECONDS",
     ),
     min_value=0,
     max_value=24 * 60 * 60,
+)
+GDELT_MIN_FETCH_INTERVAL_SECONDS = max(
+    _GDELT_CONFIGURED_MIN_FETCH_INTERVAL_SECONDS,
+    6 * 60 * 60,
+)
+_GDELT_CONFIGURED_RATE_LIMIT_COOLDOWN_SECONDS = _require_int_range(
+    "HNREADER_GDELT_RATE_LIMIT_COOLDOWN_SECONDS",
+    _env_int(
+        "HNREADER_GDELT_RATE_LIMIT_COOLDOWN_SECONDS",
+        24 * 60 * 60,
+        fallback="HACKERMINI_GDELT_RATE_LIMIT_COOLDOWN_SECONDS",
+    ),
+    min_value=0,
+    max_value=7 * 24 * 60 * 60,
+)
+GDELT_RATE_LIMIT_COOLDOWN_SECONDS = max(
+    _GDELT_CONFIGURED_RATE_LIMIT_COOLDOWN_SECONDS,
+    24 * 60 * 60,
 )
 
 # ---------- App version ----------
