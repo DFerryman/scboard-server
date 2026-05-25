@@ -1661,7 +1661,8 @@ GDELT_QUERY = _env_str(
     "HNREADER_GDELT_QUERY",
     (
         '(technology OR "artificial intelligence" OR cybersecurity OR science '
-        "OR climate OR economy OR startup OR semiconductor)"
+        "OR economy OR markets OR policy OR regulation OR geopolitics OR "
+        'climate OR energy OR "supply chain" OR semiconductor OR startup)'
     ),
     fallback="HACKERMINI_GDELT_QUERY",
 ).strip()

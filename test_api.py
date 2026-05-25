@@ -1036,7 +1036,10 @@ class SettingsValidation(unittest.TestCase):
             .default,
             50,
         )
-        self.assertNotIn("HNREADER_INGEST_INTERVAL_SECONDS=", launcher)
+        self.assertIn(
+            'HNREADER_INGEST_INTERVAL_SECONDS="${HNREADER_INGEST_INTERVAL_SECONDS:-3600}"',
+            launcher,
+        )
         self.assertIn(
             'HNREADER_INGEST_INTERVAL_MIN_SECONDS="${HNREADER_INGEST_INTERVAL_MIN_SECONDS:-900}"',
             launcher,
@@ -1047,6 +1050,14 @@ class SettingsValidation(unittest.TestCase):
         )
         self.assertIn(
             'HNREADER_CLOUD_PUSH_BATCH_SIZE="${HNREADER_CLOUD_PUSH_BATCH_SIZE:-50}"',
+            launcher,
+        )
+        self.assertIn(
+            'DEFAULT_GDELT_QUERY=\'(technology OR "artificial intelligence" OR cybersecurity OR science OR economy OR markets OR policy OR regulation OR geopolitics OR climate OR energy OR "supply chain" OR semiconductor OR startup)\'',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_GDELT_MAX_RECORDS="${HNREADER_GDELT_MAX_RECORDS:-50}"',
             launcher,
         )
         self.assertIn(
@@ -2354,6 +2365,56 @@ class GdeltIntegration(_SqliteCase):
         self.assertEqual(summary["gdelt_stories_deleted"], 1)
         self.assertIsNone(story)
         self.assertGreater(int(catalog_version), 1)
+
+    def test_cleanup_story_cap_counts_gdelt_rows(self):
+        from .cleanup import run_cleanup_once
+
+        old_cap = settings.STORY_STORE_MAX_ROWS
+        today = repository.today_in_digest_tz()
+        now = repository.now_seconds()
+        rows = []
+        for rank in range(1, 4):
+            row = gdelt_normalizer.normalize_article(
+                self._article(
+                    f"Global story {rank}",
+                    f"https://world.example/cap-{rank}",
+                    self._seendate_for_digest_date(today),
+                ),
+                rank=rank,
+                total=3,
+                fetched_at=now,
+            )
+            self.assertIsNotNone(row)
+            assert row is not None
+            rows.append(row)
+
+        try:
+            settings.STORY_STORE_MAX_ROWS = 2  # type: ignore[assignment]
+            conn = db.connect()
+            try:
+                with db.transaction(conn):
+                    for row in rows:
+                        repository.insert_story_pending(conn, row)
+                    repository.set_meta(conn, "last_full_fetch_at", str(now))
+            finally:
+                conn.close()
+
+            summary = run_cleanup_once()
+        finally:
+            settings.STORY_STORE_MAX_ROWS = old_cap  # type: ignore[assignment]
+
+        self.assertEqual(summary["overflow_stories_deleted"], 1)
+        conn = db.connect()
+        try:
+            remaining_ids = [
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM stories ORDER BY score DESC"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+        self.assertEqual(remaining_ids, [int(rows[0]["id"]), int(rows[1]["id"])])
 
 
 # ---------- Full ingest publish behavior ----------
