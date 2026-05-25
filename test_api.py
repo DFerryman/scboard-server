@@ -1053,7 +1053,7 @@ class SettingsValidation(unittest.TestCase):
             launcher,
         )
         self.assertIn(
-            'DEFAULT_GDELT_QUERY=\'(technology OR "artificial intelligence" OR cybersecurity OR science OR economy OR markets OR policy OR regulation OR geopolitics OR climate OR energy OR "supply chain" OR semiconductor OR startup)\'',
+            'DEFAULT_GDELT_QUERY=\'(technology OR "artificial intelligence" OR cybersecurity OR science OR economy OR markets OR policy OR regulation OR geopolitics OR climate OR energy OR "supply chain" OR semiconductor OR startup) sourcelang:english\'',
             launcher,
         )
         self.assertIn(
@@ -1220,7 +1220,6 @@ class EmptyDbContract(_SqliteCase):
             StoryType.BEST,
             StoryType.ASK,
             StoryType.SHOW,
-            StoryType.JOB,
         ):
             body = _h_stories(story_type, 1, 5)
             self.assertEqual(body.list, [])
@@ -1825,7 +1824,7 @@ class FetcherBehavior(_SqliteCase):
     def test_fetch_inserts_and_stages_rankings_without_publishing(self):
         run_id = "fetch-stage"
         summary = run_fetcher_once(client=self._client(), run_id=run_id)
-        self.assertEqual(summary["stories_inserted"], 5)
+        self.assertEqual(summary["stories_inserted"], 4)
         self.assertTrue(summary["successful_round"])
 
         body = _h_stories(StoryType.TOP, 1, 50)
@@ -1833,7 +1832,7 @@ class FetcherBehavior(_SqliteCase):
 
         conn = db.connect()
         try:
-            self.assertEqual(set(repository.candidate_story_ids(conn, run_id)), {101, 102, 201, 301, 401})
+            self.assertEqual(set(repository.candidate_story_ids(conn, run_id)), {101, 102, 201, 301})
         finally:
             conn.close()
 
@@ -1852,9 +1851,41 @@ class FetcherBehavior(_SqliteCase):
         self.assertEqual(ask.type, StoryType.ASK)
 
         job_body = _h_stories(StoryType.JOB, 1, 50)
-        job = job_body.list[0]
-        self.assertEqual(job.score, 0)
-        self.assertEqual(job.descendants, 0)
+        self.assertEqual(job_body.list, [])
+
+    def test_publish_clears_retired_job_rankings(self):
+        job_row = normalize_item(
+            {
+                "id": 401,
+                "type": "job",
+                "title": "Hiring",
+                "url": "https://jobs.example.com",
+                "by": "co",
+                "time": 1700000400,
+            },
+            source_feed="job",
+        )
+        self.assertIsNotNone(job_row)
+        assert job_row is not None
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.insert_story_pending(conn, job_row)
+                repository.replace_feed_ranking(conn, "job", [401])
+        finally:
+            conn.close()
+
+        summary = self._run_full_round(self._client())
+        self.assertEqual(summary["status"], "completed")
+
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM rankings WHERE feed='job'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(int(row["c"] if row else 0), 0)
 
     def test_poll_is_skipped_not_violating_kind_check(self):
         client = self._client(rankings={"top": [101, 102, 999]})
@@ -2124,6 +2155,7 @@ class GdeltIntegration(_SqliteCase):
         self.assertLess(row["id"], 3_000_000_000)
         self.assertEqual(row["hn_time"], expected_ts)
         self.assertEqual(row["domain"], "news.example")
+        self.assertEqual(row["score"], 0)
         self.assertIn("Earthquake update", row["raw_json"])
 
     def test_gdelt_fetcher_stages_global_today_and_safety_filters(self):
@@ -2366,6 +2398,125 @@ class GdeltIntegration(_SqliteCase):
         self.assertIsNone(story)
         self.assertGreater(int(catalog_version), 1)
 
+    def test_cleanup_preserves_digest_referenced_old_gdelt(self):
+        from .cleanup import run_cleanup_once
+
+        yesterday = repository.digest_date_minus_days(1)
+        old_url = "https://world.example/digest-gdelt"
+        sid = gdelt_normalizer.stable_gdelt_story_id(old_url)
+        row = gdelt_normalizer.normalize_article(
+            self._article(
+                "Digest global story",
+                old_url,
+                self._seendate_for_digest_date(yesterday),
+            ),
+            rank=1,
+            total=1,
+        )
+        self.assertIsNotNone(row)
+        assert row is not None
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.insert_story_pending(conn, row)
+                repository.write_enriched_story(
+                    conn,
+                    sid,
+                    title_zh="昨日全球新闻",
+                    topic="science-culture",
+                    ai_summary="这是一条昨日全球新闻摘要。",
+                    discussion_themes=[],
+                    insights=[],
+                    terms=[],
+                    comments_fetched_descendants=0,
+                )
+                repository.replace_feed_ranking(conn, "global", [sid])
+                repository.upsert_digest(conn, yesterday, "昨日摘要", [sid])
+                repository.set_meta(conn, "last_full_fetch_at", str(repository.now_seconds()))
+                repository.set_meta(conn, "catalog_version", "1")
+        finally:
+            conn.close()
+
+        summary = run_cleanup_once()
+
+        conn = db.connect()
+        try:
+            story = conn.execute("SELECT 1 FROM stories WHERE id=?", (sid,)).fetchone()
+            global_ids = repository.feed_story_ids(conn, "global")
+            _, _, digest_stories = repository.get_digest(conn, yesterday)
+        finally:
+            conn.close()
+        self.assertEqual(summary["gdelt_stories_deleted"], 1)
+        self.assertIsNotNone(story)
+        self.assertEqual(global_ids, [])
+        self.assertEqual([story.id for story in digest_stories], [sid])
+
+    def test_gdelt_fetcher_bypasses_throttle_after_purging_old_global(self):
+        old_enabled = settings.GDELT_ENABLED
+        old_interval = settings.GDELT_MIN_FETCH_INTERVAL_SECONDS
+        today = repository.today_in_digest_tz()
+        yesterday = repository.digest_date_minus_days(1)
+        old_url = "https://world.example/old-throttled"
+        new_url = "https://world.example/new-after-purge"
+        old_row = gdelt_normalizer.normalize_article(
+            self._article(
+                "Old global story",
+                old_url,
+                self._seendate_for_digest_date(yesterday),
+            ),
+            rank=1,
+            total=1,
+        )
+        self.assertIsNotNone(old_row)
+        assert old_row is not None
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.insert_story_pending(conn, old_row)
+                repository.replace_feed_ranking(
+                    conn,
+                    "global",
+                    [int(old_row["id"])],
+                )
+                repository.set_meta(
+                    conn,
+                    "last_gdelt_fetch_at",
+                    str(repository.now_seconds()),
+                )
+        finally:
+            conn.close()
+
+        try:
+            settings.GDELT_ENABLED = True  # type: ignore[assignment]
+            settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = 30 * 60  # type: ignore[assignment]
+            summary = ingest_module.run_gdelt_fetcher_once(
+                client=_FakeGdelt(
+                    [
+                        self._article(
+                            "New global story",
+                            new_url,
+                            self._seendate_for_digest_date(today),
+                        )
+                    ]
+                ),
+                run_id="gdelt-refill",
+                safety_reviewer=_TitleSafety(),
+            )
+        finally:
+            settings.GDELT_ENABLED = old_enabled  # type: ignore[assignment]
+            settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
+
+        new_id = gdelt_normalizer.stable_gdelt_story_id(new_url)
+        self.assertFalse(summary["skipped"], summary)
+        self.assertEqual(summary["purged_old"], 1)
+        self.assertTrue(summary["successful_round"], summary)
+        conn = db.connect()
+        try:
+            candidates = repository.candidate_story_ids(conn, "gdelt-refill")
+        finally:
+            conn.close()
+        self.assertEqual(candidates, [new_id])
+
     def test_cleanup_story_cap_counts_gdelt_rows(self):
         from .cleanup import run_cleanup_once
 
@@ -2414,7 +2565,8 @@ class GdeltIntegration(_SqliteCase):
             ]
         finally:
             conn.close()
-        self.assertEqual(remaining_ids, [int(rows[0]["id"]), int(rows[1]["id"])])
+        self.assertEqual(len(remaining_ids), 2)
+        self.assertTrue(set(remaining_ids).issubset({int(row["id"]) for row in rows}))
 
 
 # ---------- Full ingest publish behavior ----------
@@ -2999,6 +3151,55 @@ class CloudSyncReadModel(_SqliteCase):
                 now,
             ),
         )
+
+    def test_build_read_model_omits_retired_job_feed(self):
+        from . import cloud_sync
+
+        today = repository.today_in_digest_tz()
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                repository.set_meta(conn, "catalog_version", "1")
+                self._insert_done_story(conn, 701, repository.now_seconds(), topic="ai")
+                conn.execute(
+                    """
+                    UPDATE stories
+                    SET kind='job',
+                        title_zh=?,
+                        ai_summary=?
+                    WHERE id=701
+                    """,
+                    (
+                        "\u9057\u7559\u5de5\u4f5c\u6545\u4e8b",
+                        "\u8fd9\u662f\u4e00\u6761\u9057\u7559\u5de5\u4f5c\u6458\u8981\u3002",
+                    ),
+                )
+                repository.replace_feed_ranking(conn, "job", [701])
+                repository.upsert_digest(conn, today, "intro", [701])
+        finally:
+            conn.close()
+
+        out_dir = Path(self.tmpdir) / "read-model-retired-job"
+        cloud_sync.build_read_model(out_dir, include_dashboard=False)
+
+        story_docs = [
+            json.loads(line)
+            for line in (out_dir / "stories.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        digest_docs = [
+            json.loads(line)
+            for line in (out_dir / "digests.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        meta = json.loads((out_dir / "meta.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("job", meta["feedCounts"])
+        self.assertEqual([doc["id"] for doc in story_docs], [701])
+        self.assertEqual(story_docs[0]["defaultType"], "top")
+        self.assertEqual(story_docs[0]["feedRanks"], {})
+        self.assertFalse(story_docs[0]["inAnyRanking"])
+        self.assertEqual(digest_docs[0]["stories"][0]["type"], "top")
 
     def test_insights_candidate_query_excludes_stories_before_window(self):
         from . import insights

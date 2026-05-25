@@ -1575,7 +1575,7 @@ _SYSTEM_PROMPT = (
     "- topicId: string, required. Choose exactly one id from the fixed topic "
     "catalog provided below. Do NOT create, rename, translate, merge, or "
     "invent topics. Do NOT classify by feed/source section "
-    "(top/new/best/ask/show/job/global). Use general only when no fixed topic truly "
+    "(top/new/best/ask/show/global). Use general only when no fixed topic truly "
     "fits.\n"
     "- topicName: string, required for backward compatibility. Use the fixed "
     "catalog name for the chosen topicId; the server ignores AI-created "

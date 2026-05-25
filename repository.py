@@ -40,6 +40,10 @@ from .topics import (
     topic_name_from_id,
 )
 
+ACTIVE_FEEDS: Sequence[str] = ("top", "new", "best", "ask", "show", "global")
+RETIRED_FEEDS: Sequence[str] = ("job",)
+_ACTIVE_FEED_PLACEHOLDERS = ",".join("?" for _ in ACTIVE_FEEDS)
+
 
 # ---------- time helpers ----------
 
@@ -236,13 +240,13 @@ def get_meta_int(conn: sqlite3.Connection, key: str) -> Optional[int]:
 
 def _story_type_from(row: sqlite3.Row, feed: Optional[str]) -> StoryType:
     """Plan §5: feed wins if given; otherwise map kind, defaulting story->top."""
-    if feed:
+    if feed and feed not in RETIRED_FEEDS:
         try:
             return StoryType(feed)
         except ValueError:
             pass
     kind = row["kind"]
-    if kind in ("ask", "show", "job"):
+    if kind in ("ask", "show"):
         return StoryType(kind)
     return StoryType.TOP
 
@@ -408,7 +412,7 @@ def ensure_topic(
 def list_topics(conn: sqlite3.Connection, *, limit: Optional[int] = None) -> List[TopicEntry]:
     effective_limit = None if limit is None else max(0, int(limit))
     rows = conn.execute(
-        """
+        f"""
         SELECT
             s.topic AS id,
             COALESCE(t.name, '') AS name,
@@ -418,10 +422,12 @@ def list_topics(conn: sqlite3.Connection, *, limit: Optional[int] = None) -> Lis
         JOIN rankings r ON r.story_id=s.id
         LEFT JOIN topics t ON t.id=s.topic
         WHERE s.enrich_status='done'
+          AND r.feed IN ({_ACTIVE_FEED_PLACEHOLDERS})
           AND COALESCE(s.topic, '') != ''
         GROUP BY s.topic, t.name
         HAVING c > 0
         """,
+        ACTIVE_FEEDS,
     ).fetchall()
     buckets: Dict[str, Dict[str, int]] = {}
     for row in rows:
@@ -491,6 +497,8 @@ def get_story(conn: sqlite3.Connection, story_id: int) -> Optional[Story]:
 def list_feed_stories(
     conn: sqlite3.Connection, feed: str, page: int, page_size: int
 ) -> Tuple[List[Story], int, bool]:
+    if feed in RETIRED_FEEDS:
+        return [], 0, False
     offset = (page - 1) * page_size
     total_row = conn.execute(
         "SELECT COUNT(*) AS c FROM rankings r "
@@ -522,14 +530,19 @@ def source_topic_ids_for_canonical(
         return []
     canonical_id, _ = fixed_topic
     rows = conn.execute(
-        """
+        f"""
         SELECT DISTINCT s.topic AS id, COALESCE(t.name, '') AS name
         FROM stories s
         LEFT JOIN topics t ON t.id=s.topic
         WHERE s.enrich_status='done'
           AND COALESCE(s.topic, '') != ''
-          AND EXISTS (SELECT 1 FROM rankings r WHERE r.story_id=s.id)
-        """
+          AND EXISTS (
+              SELECT 1 FROM rankings r
+              WHERE r.story_id=s.id
+                AND r.feed IN ({_ACTIVE_FEED_PLACEHOLDERS})
+          )
+        """,
+        ACTIVE_FEEDS,
     ).fetchall()
     source_ids: set[str] = set()
     for row in rows:
@@ -555,9 +568,13 @@ def list_topic_stories(
         FROM stories s
         WHERE s.topic IN ({placeholders})
           AND s.enrich_status='done'
-          AND EXISTS (SELECT 1 FROM rankings r WHERE r.story_id=s.id)
+          AND EXISTS (
+              SELECT 1 FROM rankings r
+              WHERE r.story_id=s.id
+                AND r.feed IN ({_ACTIVE_FEED_PLACEHOLDERS})
+          )
         """,
-        source_topic_ids,
+        [*source_topic_ids, *ACTIVE_FEEDS],
     ).fetchone()
     total = int(total_row["c"]) if total_row else 0
     rows = conn.execute(
@@ -567,7 +584,11 @@ def list_topic_stories(
         LEFT JOIN topics t ON t.id=s.topic
         WHERE s.topic IN ({placeholders})
           AND s.enrich_status='done'
-          AND EXISTS (SELECT 1 FROM rankings r WHERE r.story_id=s.id)
+          AND EXISTS (
+              SELECT 1 FROM rankings r
+              WHERE r.story_id=s.id
+                AND r.feed IN ({_ACTIVE_FEED_PLACEHOLDERS})
+          )
         ORDER BY
           CASE
             WHEN s.enriched_at IS NOT NULL THEN COALESCE(s.enriched_score, s.score, 0)
@@ -580,7 +601,7 @@ def list_topic_stories(
           s.id ASC
         LIMIT ? OFFSET ?
         """,
-        [*source_topic_ids, page_size, offset],
+        [*source_topic_ids, *ACTIVE_FEEDS, page_size, offset],
     ).fetchall()
     stories = [row_to_story(r) for r in rows]
     has_more = offset + len(rows) < total
@@ -598,9 +619,13 @@ def topic_count(conn: sqlite3.Connection, topic_id: str) -> int:
         FROM stories s
         WHERE s.topic IN ({placeholders})
           AND s.enrich_status='done'
-          AND EXISTS (SELECT 1 FROM rankings r WHERE r.story_id=s.id)
+          AND EXISTS (
+              SELECT 1 FROM rankings r
+              WHERE r.story_id=s.id
+                AND r.feed IN ({_ACTIVE_FEED_PLACEHOLDERS})
+          )
         """,
-        source_topic_ids,
+        [*source_topic_ids, *ACTIVE_FEEDS],
     ).fetchone()
     return int(row["c"]) if row else 0
 
@@ -1132,8 +1157,19 @@ def publish_ranking_candidates(
                 }
             return summary
 
+    retired_removed = 0
+    for retired_feed in RETIRED_FEEDS:
+        cursor = conn.execute("DELETE FROM rankings WHERE feed=?", (retired_feed,))
+        removed = cursor.rowcount or 0
+        if removed:
+            retired_removed += removed
+            set_meta(conn, f"visible_ranking_hash:{retired_feed}", hash_int_sequence([]))
+            set_meta(conn, f"last_refresh_at:{retired_feed}", str(now_seconds()))
+    if retired_removed:
+        summary["retired_feeds_removed"] = retired_removed
+
     any_feed_written = False
-    changed = False
+    changed = bool(retired_removed)
     for feed in feeds:
         staged_rows = conn.execute(
             """
@@ -1209,6 +1245,8 @@ def publish_ranking_candidates(
 
 
 def feed_story_ids(conn: sqlite3.Connection, feed: str) -> List[int]:
+    if feed in RETIRED_FEEDS:
+        return []
     rows = conn.execute(
         "SELECT story_id FROM rankings WHERE feed=? ORDER BY rank ASC",
         (feed,),
@@ -1217,7 +1255,10 @@ def feed_story_ids(conn: sqlite3.Connection, feed: str) -> List[int]:
 
 
 def all_ranked_story_ids(conn: sqlite3.Connection) -> List[int]:
-    rows = conn.execute("SELECT DISTINCT story_id FROM rankings").fetchall()
+    rows = conn.execute(
+        f"SELECT DISTINCT story_id FROM rankings WHERE feed IN ({_ACTIVE_FEED_PLACEHOLDERS})",
+        ACTIVE_FEEDS,
+    ).fetchall()
     return [int(r["story_id"]) for r in rows]
 
 
@@ -1748,7 +1789,7 @@ def get_pipeline_metrics(conn: sqlite3.Connection) -> dict:
     total = pending + enriching + done + failed
     failure_rate = ((failed + pending_imminent) / total) if total else 0.0
 
-    feeds = ("top", "new", "best", "ask", "show", "job")
+    feeds = ("top", "new", "best", "ask", "show", "global")
     last_refresh_at = {
         feed: get_meta_int(conn, f"last_refresh_at:{feed}") for feed in feeds
     }
@@ -2699,9 +2740,10 @@ def insight_feed_ranks_for_story_ids(
             SELECT story_id, feed, rank
             FROM rankings
             WHERE story_id {clause}
+              AND feed IN ({_ACTIVE_FEED_PLACEHOLDERS})
             ORDER BY story_id ASC, rank ASC
             """,
-            tuple(params),
+            (*params, *ACTIVE_FEEDS),
         ).fetchall()
     for row in rows:
         out.setdefault(int(row["story_id"]), {})[str(row["feed"])] = int(row["rank"])
@@ -3092,12 +3134,22 @@ def evict_story_overflow(
     return cursor.rowcount or 0
 
 
-def purge_old_gdelt_stories(conn: sqlite3.Connection, today_date: str) -> int:
-    """Delete GDELT rows that are outside today's digest timezone date."""
+def purge_old_gdelt_stories(
+    conn: sqlite3.Connection,
+    today_date: str,
+    *,
+    archive_cutoff_date: Optional[str] = None,
+) -> int:
+    """Remove old GDELT rows from global ranking and delete unprotected rows.
+
+    GDELT's ``global`` feed is intentionally today-only, but a yesterday GDELT
+    story may still be reader-visible through a retained digest. Preserve those
+    rows and only remove their global ranking edge.
+    """
     rows = conn.execute(
         "SELECT id, hn_time FROM stories WHERE source='gdelt'"
     ).fetchall()
-    ids: List[int] = []
+    old_ids: List[int] = []
     for row in rows:
         sid = int(row["id"])
         try:
@@ -3105,17 +3157,34 @@ def purge_old_gdelt_stories(conn: sqlite3.Connection, today_date: str) -> int:
         except (TypeError, ValueError):
             hn_time = 0
         if hn_time <= 0 or date_in_digest_tz(hn_time) != today_date:
-            ids.append(sid)
-    if not ids:
+            old_ids.append(sid)
+    if not old_ids:
         return 0
+
+    cutoff = archive_cutoff_date or digest_date_minus_days(settings.DIGEST_RETENTION_DAYS)
+    protected = set(digest_referenced_story_ids(conn, cutoff))
+    protected_old_ids = [sid for sid in old_ids if sid in protected]
+    delete_ids = [sid for sid in old_ids if sid not in protected]
+
+    changed = 0
+    if protected_old_ids:
+        with id_in_clause(conn, protected_old_ids) as (clause, params):
+            cursor = conn.execute(
+                f"DELETE FROM rankings WHERE feed='global' AND story_id {clause}",
+                params,
+            )
+            changed += cursor.rowcount or 0
+    if not delete_ids:
+        return changed
     mark_story_images_pending_delete(
         conn,
-        ids,
+        delete_ids,
         delete_after=now_seconds() + int(settings.STORY_IMAGE_DELETE_GRACE_SECONDS),
     )
-    with id_in_clause(conn, ids) as (clause, params):
+    with id_in_clause(conn, delete_ids) as (clause, params):
         cursor = conn.execute(f"DELETE FROM stories WHERE id {clause}", params)
-    return cursor.rowcount or 0
+    changed += cursor.rowcount or 0
+    return changed
 
 
 def delete_run_pending_orphans(

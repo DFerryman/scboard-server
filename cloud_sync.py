@@ -39,7 +39,8 @@ from .topics import resolve_fixed_source_topic, topic_name_from_id
 log = logging.getLogger(__name__)
 
 
-FEED_TYPES = ("top", "new", "best", "ask", "show", "job", "global")
+FEED_TYPES = ("top", "new", "best", "ask", "show", "global")
+_FEED_TYPE_PLACEHOLDERS = ",".join("?" for _ in FEED_TYPES)
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 AI_READY_STORY_SQL = """
     s.enrich_status='done'
@@ -116,7 +117,7 @@ def _last_successful_cloud_sync_finished_at(conn) -> Optional[int]:
 
 def _story_default_type(kind: str) -> str:
     """Mirror repository._story_type_from when no feed context is given."""
-    if kind in ("ask", "show", "job"):
+    if kind in ("ask", "show"):
         return kind
     return "top"
 
@@ -203,7 +204,8 @@ def _story_is_ai_ready(story: Story) -> bool:
 
 def _collect_feed_ranks(conn) -> Dict[int, Dict[str, int]]:
     rows = conn.execute(
-        "SELECT feed, rank, story_id FROM rankings"
+        f"SELECT feed, rank, story_id FROM rankings WHERE feed IN ({_FEED_TYPE_PLACEHOLDERS})",
+        FEED_TYPES,
     ).fetchall()
     out: Dict[int, Dict[str, int]] = {}
     for r in rows:
@@ -230,7 +232,8 @@ def _all_visible_story_ids(
     in_rankings = {
         int(r["id"]) for r in conn.execute(
             "SELECT DISTINCT s.id FROM rankings r JOIN stories s ON s.id=r.story_id "
-            f"WHERE {AI_READY_STORY_SQL}"
+            f"WHERE r.feed IN ({_FEED_TYPE_PLACEHOLDERS}) AND {AI_READY_STORY_SQL}",
+            FEED_TYPES,
         ).fetchall()
     }
     in_digests: set[int] = set()
@@ -298,11 +301,12 @@ def _list_ai_ready_topics(conn, visible_ids: Iterable[int]) -> List[TopicEntry]:
             JOIN rankings r ON r.story_id=s.id
             LEFT JOIN topics t ON t.id=s.topic
             WHERE s.id {clause}
+              AND r.feed IN ({_FEED_TYPE_PLACEHOLDERS})
               AND COALESCE(s.topic, '') != ''
             GROUP BY s.topic, t.name
             HAVING c > 0
             """,
-            params,
+            [*params, *FEED_TYPES],
         ).fetchall()
     for row in rows:
         fixed_topic = resolve_fixed_source_topic(

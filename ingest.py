@@ -50,12 +50,12 @@ from .logging_config import configure_logging
 log = logging.getLogger("server.ingest")
 
 
-HN_FEEDS: Sequence[str] = ("top", "new", "best", "ask", "show", "job")
+HN_FEEDS: Sequence[str] = ("top", "new", "best", "ask", "show")
 GDELT_FEED = "global"
 FEEDS: Sequence[str] = HN_FEEDS
 PUBLISH_FEEDS: Sequence[str] = (*HN_FEEDS, GDELT_FEED)
 # Higher-priority feed wins when one item appears in several rankings.
-_FEED_PRIORITY: Sequence[str] = ("job", "ask", "show", "top", "best", "new")
+_FEED_PRIORITY: Sequence[str] = ("ask", "show", "top", "best", "new")
 _ENRICH_AI_USAGE_PURPOSES: Sequence[str] = ("story", "story-batch")
 _CJK_CHARS = "\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
 _LATIN_SOURCE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+-]{2,}")
@@ -681,7 +681,7 @@ def run_gdelt_fetcher_once(
                 return summary
 
             throttled, retry_after = _gdelt_fetch_throttled(conn)
-            if throttled and not force:
+            if throttled and not force and not summary["purged_old"]:
                 summary["skipped"] = True
                 summary["reason"] = "throttled"
                 summary["retry_after_seconds"] = retry_after

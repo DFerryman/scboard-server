@@ -159,7 +159,7 @@ HNREADER_HN_RETRY_ATTEMPTS="${HNREADER_HN_RETRY_ATTEMPTS:-3}"
 
 # ---------- GDELT DOC API ----------
 
-DEFAULT_GDELT_QUERY='(technology OR "artificial intelligence" OR cybersecurity OR science OR economy OR markets OR policy OR regulation OR geopolitics OR climate OR energy OR "supply chain" OR semiconductor OR startup)'
+DEFAULT_GDELT_QUERY='(technology OR "artificial intelligence" OR cybersecurity OR science OR economy OR markets OR policy OR regulation OR geopolitics OR climate OR energy OR "supply chain" OR semiconductor OR startup) sourcelang:english'
 HNREADER_GDELT_ENABLED="${HNREADER_GDELT_ENABLED:-false}"
 HNREADER_GDELT_DOC_API_URL="${HNREADER_GDELT_DOC_API_URL:-https://api.gdeltproject.org/api/v2/doc/doc}"
 HNREADER_GDELT_QUERY="${HNREADER_GDELT_QUERY:-$DEFAULT_GDELT_QUERY}"

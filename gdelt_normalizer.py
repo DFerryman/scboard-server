@@ -80,7 +80,9 @@ def normalize_article(
     hn_time = parse_gdelt_seendate(article.get("seendate"), fallback=now)
     domain = _safe_str(article.get("domain")) or extract_domain(url)
     by = _safe_str(article.get("sourcecountry")) or "GDELT"
-    score = max(1, int(total) - max(1, int(rank)) + 1)
+    # DOC ArticleList has an official result order, but no per-article score.
+    # Keep score at 0 so clients do not display a fabricated HN-style metric.
+    score = 0
 
     return {
         "id": stable_gdelt_story_id(url),
