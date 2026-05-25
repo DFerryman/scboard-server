@@ -5299,7 +5299,7 @@ class CloudSyncReadModel(_SqliteCase):
             codex.calls[0]["output_schema"],
             insights_agents._INSIGHTS_OUTPUT_SCHEMAS["insights-signals"],
         )
-        self.assertEqual(codex.calls[0]["reasoning_effort"], "xhigh")
+        self.assertEqual(codex.calls[0]["reasoning_effort"], "medium")
 
         client.complete_json(
             purpose="insights-evidence",

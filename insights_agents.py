@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 
 
 _CODEX_INSIGHTS_COMPRESSION_REASONING_EFFORT = "medium"
-_CODEX_INSIGHTS_ANALYSIS_REASONING_EFFORT = "xhigh"
+_CODEX_INSIGHTS_ANALYSIS_REASONING_EFFORT = "medium"
 _CODEX_INSIGHTS_ANALYSIS_PURPOSES = frozenset(
     (
         "insights-signals",
