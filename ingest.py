@@ -58,6 +58,8 @@ PUBLISH_FEEDS: Sequence[str] = (*HN_FEEDS, GDELT_FEED)
 _GDELT_LAST_FETCH_META = "last_gdelt_fetch_at"
 _GDELT_LAST_ATTEMPT_META = "last_gdelt_fetch_attempt_at"
 _GDELT_RATE_LIMIT_UNTIL_META = "gdelt_rate_limit_until"
+_GDELT_RATE_LIMIT_DEFAULT_RETRY_SECONDS = 2 * 60
+_GDELT_RATE_LIMIT_MAX_RETRY_SECONDS = 120
 # Higher-priority feed wins when one item appears in several rankings.
 _FEED_PRIORITY: Sequence[str] = ("ask", "show", "top", "best", "new")
 _ENRICH_AI_USAGE_PURPOSES: Sequence[str] = ("story", "story-batch")
@@ -857,19 +859,71 @@ def _gdelt_fetch_throttled(conn) -> tuple[bool, int, str]:
     return elapsed < min_interval, max(0, min_interval - elapsed), "throttled"
 
 
-def _gdelt_rate_limit_cooldown_seconds(exc: GdeltRateLimitError) -> int:
+def _gdelt_rate_limit_hint_seconds(exc: GdeltRateLimitError) -> Optional[int]:
     if exc.retry_after_seconds is not None:
         try:
             hint = float(exc.retry_after_seconds)
         except (TypeError, ValueError, OverflowError):
-            hint = -1.0
+            return None
         if math.isfinite(hint) and hint >= 0:
             return int(math.ceil(hint))
-    return max(
-        0,
-        int(settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS),
-        int(settings.GDELT_MIN_FETCH_INTERVAL_SECONDS),
+    return None
+
+
+def _gdelt_rate_limit_retry_delay_seconds(exc: GdeltRateLimitError) -> int:
+    hint = _gdelt_rate_limit_hint_seconds(exc)
+    if hint is None:
+        hint = _GDELT_RATE_LIMIT_DEFAULT_RETRY_SECONDS
+    return max(0, min(int(hint), _GDELT_RATE_LIMIT_MAX_RETRY_SECONDS))
+
+
+def _gdelt_rate_limit_cooldown_seconds(exc: GdeltRateLimitError) -> int:
+    hint = _gdelt_rate_limit_hint_seconds(exc)
+    if hint is not None:
+        return max(0, int(hint))
+    return max(0, int(settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS))
+
+
+def _gdelt_fetch_articles_once(client) -> List[Dict[str, Any]]:
+    return client.fetch_articles(
+        query=settings.GDELT_QUERY,
+        timespan=settings.GDELT_TIMESPAN,
+        maxrecords=settings.GDELT_MAX_RECORDS,
+        sort=settings.GDELT_SORT,
+        mode=settings.GDELT_MODE,
+        format_=settings.GDELT_FORMAT,
     )
+
+
+def _sleep_before_gdelt_rate_limit_retry(
+    delay_seconds: int,
+    deadline_at: Optional[float],
+) -> bool:
+    if delay_seconds <= 0:
+        return True
+    if deadline_at is not None and time.time() + delay_seconds >= deadline_at:
+        return False
+    log.warning(
+        "GDELT fetch rate limited; waiting %s seconds before one retry",
+        delay_seconds,
+    )
+    time.sleep(delay_seconds)
+    return True
+
+
+def _record_gdelt_rate_limit_until(cooldown: int) -> int:
+    rate_limit_until = repository.now_seconds() + cooldown
+    conn = db.connect()
+    try:
+        with db.transaction(conn):
+            repository.set_meta(
+                conn,
+                _GDELT_RATE_LIMIT_UNTIL_META,
+                str(rate_limit_until),
+            )
+    finally:
+        conn.close()
+    return rate_limit_until
 
 
 def run_gdelt_fetcher_once(
@@ -950,17 +1004,28 @@ def run_gdelt_fetcher_once(
         client = GdeltClient()
 
     try:
-        articles = client.fetch_articles(
-            query=settings.GDELT_QUERY,
-            timespan=settings.GDELT_TIMESPAN,
-            maxrecords=settings.GDELT_MAX_RECORDS,
-            sort=settings.GDELT_SORT,
-            mode=settings.GDELT_MODE,
-            format_=settings.GDELT_FORMAT,
-        )
+        try:
+            articles = _gdelt_fetch_articles_once(client)
+        except GdeltRateLimitError as exc:
+            retry_delay = _gdelt_rate_limit_retry_delay_seconds(exc)
+            summary["rate_limit_retry_after_seconds"] = retry_delay
+            if exc.retry_after_seconds is not None:
+                summary["upstream_retry_after_seconds"] = exc.retry_after_seconds
+            if not _sleep_before_gdelt_rate_limit_retry(retry_delay, deadline_at):
+                cooldown = _gdelt_rate_limit_cooldown_seconds(exc)
+                rate_limit_until = _record_gdelt_rate_limit_until(cooldown)
+                summary["timed_out"] = True
+                summary["skipped"] = True
+                summary["rate_limited"] = True
+                summary["reason"] = "rate_limit_retry_deadline"
+                summary["retry_after_seconds"] = cooldown
+                summary["rate_limit_until"] = rate_limit_until
+                return summary
+            summary["rate_limit_retried"] = True
+            articles = _gdelt_fetch_articles_once(client)
     except GdeltRateLimitError as exc:
         cooldown = _gdelt_rate_limit_cooldown_seconds(exc)
-        rate_limit_until = repository.now_seconds() + cooldown
+        rate_limit_until = _record_gdelt_rate_limit_until(cooldown)
         summary["rate_limited"] = True
         summary["skipped"] = True
         summary["reason"] = "rate_limited"
@@ -968,16 +1033,6 @@ def run_gdelt_fetcher_once(
         summary["rate_limit_until"] = rate_limit_until
         if exc.retry_after_seconds is not None:
             summary["upstream_retry_after_seconds"] = exc.retry_after_seconds
-        conn = db.connect()
-        try:
-            with db.transaction(conn):
-                repository.set_meta(
-                    conn,
-                    _GDELT_RATE_LIMIT_UNTIL_META,
-                    str(rate_limit_until),
-                )
-        finally:
-            conn.close()
         log.warning(
             "GDELT fetch rate limited: retry_after_seconds=%s "
             "rate_limit_until=%s upstream_retry_after_seconds=%s error=%s",
