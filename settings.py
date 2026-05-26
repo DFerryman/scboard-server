@@ -1784,7 +1784,7 @@ INGEST_INTERVAL_MIN_SECONDS = _require_int_range(
     (
         _ingest_interval_min_env
         if _ingest_interval_min_env is not None
-        else 45 * 60
+        else 90 * 60
     ),
     min_value=1,
     max_value=24 * 60 * 60,
@@ -1798,7 +1798,7 @@ INGEST_INTERVAL_MAX_SECONDS = _require_int_range(
     (
         _ingest_interval_max_env
         if _ingest_interval_max_env is not None
-        else 60 * 60
+        else 150 * 60
     ),
     min_value=1,
     max_value=24 * 60 * 60,
@@ -1808,6 +1808,39 @@ _require_at_least(
     INGEST_INTERVAL_MAX_SECONDS,
     "HNREADER_INGEST_INTERVAL_MIN_SECONDS",
     INGEST_INTERVAL_MIN_SECONDS,
+)
+INGEST_NIGHT_PAUSE_ENABLED = _env_bool(
+    "HNREADER_INGEST_NIGHT_PAUSE_ENABLED",
+    True,
+    fallback="HACKERMINI_INGEST_NIGHT_PAUSE_ENABLED",
+)
+INGEST_NIGHT_PAUSE_TIMEZONE = _require_timezone(
+    "HNREADER_INGEST_NIGHT_PAUSE_TIMEZONE",
+    _env_str(
+        "HNREADER_INGEST_NIGHT_PAUSE_TIMEZONE",
+        "Asia/Shanghai",
+        fallback="HACKERMINI_INGEST_NIGHT_PAUSE_TIMEZONE",
+    ),
+)
+INGEST_NIGHT_PAUSE_START_MINUTE = _require_int_range(
+    "HNREADER_INGEST_NIGHT_PAUSE_START_MINUTE",
+    _env_int(
+        "HNREADER_INGEST_NIGHT_PAUSE_START_MINUTE",
+        0,
+        fallback="HACKERMINI_INGEST_NIGHT_PAUSE_START_MINUTE",
+    ),
+    min_value=0,
+    max_value=(24 * 60) - 1,
+)
+INGEST_NIGHT_PAUSE_END_MINUTE = _require_int_range(
+    "HNREADER_INGEST_NIGHT_PAUSE_END_MINUTE",
+    _env_int(
+        "HNREADER_INGEST_NIGHT_PAUSE_END_MINUTE",
+        8 * 60,
+        fallback="HACKERMINI_INGEST_NIGHT_PAUSE_END_MINUTE",
+    ),
+    min_value=0,
+    max_value=24 * 60,
 )
 INGEST_ROUND_TIMEOUT_SECONDS = _require_int_range(
     "HNREADER_INGEST_ROUND_TIMEOUT_SECONDS",

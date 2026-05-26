@@ -8,6 +8,7 @@ Run from project root::
 from __future__ import annotations
 
 import calendar
+import datetime as dt
 import http.client
 import io
 import json
@@ -1041,11 +1042,27 @@ class SettingsValidation(unittest.TestCase):
             launcher,
         )
         self.assertIn(
-            'HNREADER_INGEST_INTERVAL_MIN_SECONDS="${HNREADER_INGEST_INTERVAL_MIN_SECONDS:-2700}"',
+            'HNREADER_INGEST_INTERVAL_MIN_SECONDS="${HNREADER_INGEST_INTERVAL_MIN_SECONDS:-5400}"',
             launcher,
         )
         self.assertIn(
-            'HNREADER_INGEST_INTERVAL_MAX_SECONDS="${HNREADER_INGEST_INTERVAL_MAX_SECONDS:-3600}"',
+            'HNREADER_INGEST_INTERVAL_MAX_SECONDS="${HNREADER_INGEST_INTERVAL_MAX_SECONDS:-9000}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_INGEST_NIGHT_PAUSE_ENABLED="${HNREADER_INGEST_NIGHT_PAUSE_ENABLED:-true}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_INGEST_NIGHT_PAUSE_TIMEZONE="${HNREADER_INGEST_NIGHT_PAUSE_TIMEZONE:-Asia/Shanghai}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_INGEST_NIGHT_PAUSE_START_MINUTE="${HNREADER_INGEST_NIGHT_PAUSE_START_MINUTE:-0}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_INGEST_NIGHT_PAUSE_END_MINUTE="${HNREADER_INGEST_NIGHT_PAUSE_END_MINUTE:-480}"',
             launcher,
         )
         self.assertIn(
@@ -14338,6 +14355,87 @@ class SupervisorChildFailureCleanup(_SqliteCase):
         self.assertIn("loop-run", cmd)
         self.assertEqual(sleep_durations, [6.0])
         self.assertEqual(order, ["popen", "wait", "sleep"])
+
+    def test_ingest_night_pause_remaining_seconds_uses_shanghai_window(self):
+        old_enabled = settings.INGEST_NIGHT_PAUSE_ENABLED
+        old_timezone = settings.INGEST_NIGHT_PAUSE_TIMEZONE
+        old_start = settings.INGEST_NIGHT_PAUSE_START_MINUTE
+        old_end = settings.INGEST_NIGHT_PAUSE_END_MINUTE
+        try:
+            settings.INGEST_NIGHT_PAUSE_ENABLED = True  # type: ignore[assignment]
+            settings.INGEST_NIGHT_PAUSE_TIMEZONE = "Asia/Shanghai"  # type: ignore[assignment]
+            settings.INGEST_NIGHT_PAUSE_START_MINUTE = 0  # type: ignore[assignment]
+            settings.INGEST_NIGHT_PAUSE_END_MINUTE = 480  # type: ignore[assignment]
+
+            at_0100 = dt.datetime(2026, 5, 25, 17, 0, tzinfo=dt.timezone.utc)
+            at_0800 = dt.datetime(2026, 5, 26, 0, 0, tzinfo=dt.timezone.utc)
+
+            self.assertEqual(
+                ingest_module._ingest_night_pause_remaining_seconds(at_0100),
+                7 * 60 * 60,
+            )
+            self.assertEqual(
+                ingest_module._ingest_night_pause_remaining_seconds(at_0800),
+                0.0,
+            )
+        finally:
+            settings.INGEST_NIGHT_PAUSE_ENABLED = old_enabled  # type: ignore[assignment]
+            settings.INGEST_NIGHT_PAUSE_TIMEZONE = old_timezone  # type: ignore[assignment]
+            settings.INGEST_NIGHT_PAUSE_START_MINUTE = old_start  # type: ignore[assignment]
+            settings.INGEST_NIGHT_PAUSE_END_MINUTE = old_end  # type: ignore[assignment]
+
+    def test_supervisor_loop_sleeps_without_child_during_night_pause(self):
+        class DummyLock:
+            def __init__(self):
+                self.exited = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                self.exited = True
+
+        lock = DummyLock()
+        sleep_durations = []
+
+        def stop_during_pause(duration):
+            sleep_durations.append(duration)
+            raise ingest_module._SupervisorShutdown(
+                getattr(signal, "SIGTERM", 15)
+            )
+
+        with patch.object(
+            ingest_module, "_SupervisorInstanceLock", return_value=lock
+        ), patch.object(
+            ingest_module, "_install_supervisor_shutdown_handlers", return_value={}
+        ), patch.object(
+            ingest_module, "_restore_supervisor_shutdown_handlers"
+        ), patch.object(
+            ingest_module, "_clear_stop_flag"
+        ), patch.object(
+            ingest_module, "_check_stop_flag"
+        ), patch.object(
+            ingest_module, "_recover_abandoned_running_runs", return_value=[]
+        ), patch.object(
+            ingest_module,
+            "_ingest_night_pause_remaining_seconds",
+            return_value=1800.0,
+        ), patch.object(
+            ingest_module.subprocess, "Popen"
+        ) as popen, patch.object(
+            ingest_module, "_sleep_or_stop", side_effect=stop_during_pause
+        ):
+            rc = ingest_module.run_supervisor_loop(
+                interval_seconds=1,
+                round_timeout_seconds=3,
+                digest_reserved_seconds=0,
+                verbose=False,
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(lock.exited)
+        self.assertEqual(sleep_durations, [1800.0])
+        popen.assert_not_called()
 
     def test_supervisor_child_module_follows_current_package_name(self):
         class DummyLock:

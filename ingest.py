@@ -19,6 +19,7 @@ Maintenance::
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import inspect
 import json
@@ -36,6 +37,11 @@ from collections.abc import Mapping as AbcMapping, Sequence as AbcSequence
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from threading import Lock
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python 3.9+ has zoneinfo built in
+    ZoneInfo = None  # type: ignore[assignment]
 
 from . import db, gdelt_normalizer, normalizer, repository, settings
 from .ai_agent import (
@@ -4517,6 +4523,52 @@ def _sample_ingest_interval_seconds(interval_min: int, interval_max: int) -> flo
     return float(random.randint(interval_min, interval_max))
 
 
+def _ingest_pause_timezone() -> dt.tzinfo:
+    if ZoneInfo is None:
+        return dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+    return ZoneInfo(settings.INGEST_NIGHT_PAUSE_TIMEZONE)
+
+
+def _ingest_night_pause_remaining_seconds(
+    now: Optional[dt.datetime] = None,
+) -> float:
+    if not settings.INGEST_NIGHT_PAUSE_ENABLED:
+        return 0.0
+
+    start_minute = int(settings.INGEST_NIGHT_PAUSE_START_MINUTE)
+    end_minute = int(settings.INGEST_NIGHT_PAUSE_END_MINUTE)
+    if start_minute == end_minute:
+        return 0.0
+
+    tz = _ingest_pause_timezone()
+    current = now or dt.datetime.now(tz=dt.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.timezone.utc)
+    local_now = current.astimezone(tz)
+    current_minute = (local_now.hour * 60) + local_now.minute
+
+    if start_minute < end_minute:
+        in_pause = start_minute <= current_minute < end_minute
+        end_day = local_now.date()
+    else:
+        in_pause = current_minute >= start_minute or current_minute < end_minute
+        end_day = (
+            local_now.date()
+            if current_minute < end_minute
+            else local_now.date() + dt.timedelta(days=1)
+        )
+    if not in_pause:
+        return 0.0
+
+    if end_minute >= 24 * 60:
+        end_day = end_day + dt.timedelta(days=1)
+        end_time = dt.time(hour=0, minute=0)
+    else:
+        end_time = dt.time(hour=end_minute // 60, minute=end_minute % 60)
+    end_at = dt.datetime.combine(end_day, end_time, tzinfo=tz)
+    return max(0.0, (end_at - local_now).total_seconds())
+
+
 def _current_ingest_module_name() -> str:
     package = (__package__ or "").strip()
     if package:
@@ -4564,6 +4616,28 @@ def run_supervisor_loop(
         consecutive_failures = 0
         while True:
             _check_stop_flag()
+            pause_for = _ingest_night_pause_remaining_seconds()
+            if pause_for > 0:
+                log.info(
+                    "night pause active; sleeping %.1fs timezone=%s start_minute=%s end_minute=%s",
+                    pause_for,
+                    settings.INGEST_NIGHT_PAUSE_TIMEZONE,
+                    settings.INGEST_NIGHT_PAUSE_START_MINUTE,
+                    settings.INGEST_NIGHT_PAUSE_END_MINUTE,
+                )
+                try:
+                    _sleep_or_stop(pause_for)
+                except _SupervisorShutdown as exc:
+                    log.info(
+                        "supervisor received %s during night pause; exiting loop",
+                        _signal_name(exc.signum),
+                    )
+                    return 0
+                except KeyboardInterrupt:
+                    log.info("interrupted during night pause; exiting loop")
+                    return 0
+                continue
+
             run_id = _new_run_id()
             cmd = [
                 sys.executable,
