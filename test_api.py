@@ -1041,11 +1041,11 @@ class SettingsValidation(unittest.TestCase):
             launcher,
         )
         self.assertIn(
-            'HNREADER_INGEST_INTERVAL_MIN_SECONDS="${HNREADER_INGEST_INTERVAL_MIN_SECONDS:-900}"',
+            'HNREADER_INGEST_INTERVAL_MIN_SECONDS="${HNREADER_INGEST_INTERVAL_MIN_SECONDS:-2700}"',
             launcher,
         )
         self.assertIn(
-            'HNREADER_INGEST_INTERVAL_MAX_SECONDS="${HNREADER_INGEST_INTERVAL_MAX_SECONDS:-2700}"',
+            'HNREADER_INGEST_INTERVAL_MAX_SECONDS="${HNREADER_INGEST_INTERVAL_MAX_SECONDS:-3600}"',
             launcher,
         )
         self.assertIn(

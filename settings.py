@@ -1784,7 +1784,7 @@ INGEST_INTERVAL_MIN_SECONDS = _require_int_range(
     (
         _ingest_interval_min_env
         if _ingest_interval_min_env is not None
-        else 15 * 60
+        else 45 * 60
     ),
     min_value=1,
     max_value=24 * 60 * 60,
@@ -1798,7 +1798,7 @@ INGEST_INTERVAL_MAX_SECONDS = _require_int_range(
     (
         _ingest_interval_max_env
         if _ingest_interval_max_env is not None
-        else 45 * 60
+        else 60 * 60
     ),
     min_value=1,
     max_value=24 * 60 * 60,
