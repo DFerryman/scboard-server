@@ -67,6 +67,11 @@ CREATE TABLE IF NOT EXISTS stories (
   image_status TEXT NOT NULL DEFAULT '',
   image_checked_at INTEGER NOT NULL DEFAULT 0,
   image_error TEXT NOT NULL DEFAULT '',
+  publish_safety_hash TEXT NOT NULL DEFAULT '',
+  publish_safety_status TEXT NOT NULL DEFAULT ''
+    CHECK (publish_safety_status IN ('', 'approved', 'rejected')),
+  publish_safety_checked_at INTEGER NOT NULL DEFAULT 0,
+  publish_safety_reason TEXT NOT NULL DEFAULT '',
   comments_fetched_descendants INTEGER NOT NULL DEFAULT 0,
   needs_reenrich INTEGER NOT NULL DEFAULT 0,
   reenrich_started_at INTEGER,
@@ -344,6 +349,23 @@ STORY_COLUMN_MIGRATIONS = {
     "image_error": (
         "ALTER TABLE stories ADD COLUMN "
         "image_error TEXT NOT NULL DEFAULT ''"
+    ),
+    "publish_safety_hash": (
+        "ALTER TABLE stories ADD COLUMN "
+        "publish_safety_hash TEXT NOT NULL DEFAULT ''"
+    ),
+    "publish_safety_status": (
+        "ALTER TABLE stories ADD COLUMN "
+        "publish_safety_status TEXT NOT NULL DEFAULT '' "
+        "CHECK (publish_safety_status IN ('', 'approved', 'rejected'))"
+    ),
+    "publish_safety_checked_at": (
+        "ALTER TABLE stories ADD COLUMN "
+        "publish_safety_checked_at INTEGER NOT NULL DEFAULT 0"
+    ),
+    "publish_safety_reason": (
+        "ALTER TABLE stories ADD COLUMN "
+        "publish_safety_reason TEXT NOT NULL DEFAULT ''"
     ),
 }
 

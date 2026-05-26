@@ -2093,6 +2093,112 @@ class FetcherBehavior(_SqliteCase):
         finally:
             conn.close()
 
+    def test_publish_intake_safety_skips_cached_approved_candidates(self):
+        run_id = "publish-safety-cache"
+        story_ids = [911, 912]
+
+        def _story_row(sid):
+            row = normalize_item(
+                {
+                    "id": sid,
+                    "type": "story",
+                    "title": f"Cached story {sid}",
+                    "url": f"https://example.com/{sid}",
+                    "by": "author",
+                    "score": 10,
+                    "descendants": 0,
+                    "time": 1700000000 + sid,
+                },
+                source_feed="top",
+            )
+            assert row is not None
+            return row
+
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                for sid in story_ids:
+                    repository.insert_story_pending(conn, _story_row(sid))
+                repository.replace_ranking_candidates(conn, run_id, "top", story_ids)
+        finally:
+            conn.close()
+
+        class AllowingReviewer:
+            def __init__(self):
+                self.calls = 0
+
+            def review_articles(self, rows):
+                self.calls += 1
+                return {
+                    int(row["id"]): {"allowed": True, "reason": "ok"}
+                    for row in rows
+                }
+
+        reviewer = AllowingReviewer()
+        first = ingest_module._run_publish_intake_safety_guard(
+            run_id,
+            safety_reviewer=reviewer,
+        )
+        self.assertEqual(first["reviewed"], 2)
+        self.assertEqual(reviewer.calls, 1)
+
+        class FailingReviewer:
+            def review_articles(self, rows):
+                raise AssertionError("cached rows should not be reviewed again")
+
+        second = ingest_module._run_publish_intake_safety_guard(
+            run_id,
+            safety_reviewer=FailingReviewer(),
+        )
+        self.assertEqual(second["reviewed"], 0)
+        self.assertEqual(second["cached_allowed"], 2)
+        self.assertFalse(second["failed"], second)
+
+    def test_fetch_intake_safety_primes_publish_safety_cache(self):
+        run_id = "fetch-primes-publish-safety"
+
+        class AllowingReviewer:
+            def review_articles(self, rows):
+                return {
+                    int(row["id"]): {"allowed": True, "reason": "ok"}
+                    for row in rows
+                }
+
+        client = _FakeHn(
+            {"top": [921], "new": [], "best": [], "ask": [], "show": [], "job": []},
+            {
+                921: {
+                    "id": 921,
+                    "type": "story",
+                    "title": "Already checked",
+                    "url": "https://example.com/921",
+                    "by": "author",
+                    "score": 10,
+                    "descendants": 0,
+                    "time": 1700000921,
+                }
+            },
+        )
+        fetch_summary = run_fetcher_once(
+            client=client,
+            run_id=run_id,
+            safety_reviewer=AllowingReviewer(),
+        )
+        self.assertTrue(fetch_summary["successful_round"], fetch_summary)
+
+        class FailingReviewer:
+            def review_articles(self, rows):
+                raise AssertionError("fetch-approved rows should be cached")
+
+        publish_summary = ingest_module._run_publish_intake_safety_guard(
+            run_id,
+            safety_reviewer=FailingReviewer(),
+        )
+        self.assertEqual(publish_summary["total_candidates"], 1)
+        self.assertEqual(publish_summary["reviewed"], 0)
+        self.assertEqual(publish_summary["cached_allowed"], 1)
+        self.assertFalse(publish_summary["failed"], publish_summary)
+
     def test_no_change_round_does_not_bump_catalog_version(self):
         client = self._client()
         run_fetcher_once(client=client)
@@ -3225,6 +3331,98 @@ class GdeltIntegration(_SqliteCase):
 # ---------- Full ingest publish behavior ----------
 
 class IngestRoundBehavior(_SqliteCase):
+    def test_publish_safety_runs_once_before_incremental_checkpoints(self):
+        from . import insights as insights_module
+
+        rankings = {
+            "top": [101, 102, 103, 104],
+            "new": [],
+            "best": [],
+            "ask": [],
+            "show": [],
+            "job": [],
+        }
+        items = {
+            sid: {
+                "id": sid,
+                "type": "story",
+                "title": f"Story {sid}",
+                "url": f"https://x/{sid}",
+                "by": "x",
+                "score": sid,
+                "descendants": 0,
+                "time": 1700000000 + sid,
+            }
+            for sid in rankings["top"]
+        }
+        safety_calls = []
+
+        def fake_publish_safety(run_id):
+            safety_calls.append(run_id)
+            return {
+                "reviewed": len(rankings["top"]),
+                "rejected": 0,
+                "rejected_ids": [],
+                "failed": False,
+                "ranking_candidates_deleted": 0,
+                "rankings_deleted": 0,
+                "digests_updated": 0,
+                "insights_deleted": 0,
+            }
+
+        class AllowSafety:
+            def review_articles(self, rows):
+                return {
+                    int(row["id"]): {"allowed": True, "reason": "ok"}
+                    for row in rows
+                }
+
+        old_workers = settings.ENRICH_WORKER_COUNT
+        old_limit = settings.ENRICH_SESSION_STORY_LIMIT
+        old_gdelt = settings.GDELT_ENABLED
+        old_images = settings.STORY_IMAGES_ENABLED
+        old_codex = settings.CODEX_ENABLED
+        try:
+            settings.ENRICH_WORKER_COUNT = 2  # type: ignore[assignment]
+            settings.ENRICH_SESSION_STORY_LIMIT = 1  # type: ignore[assignment]
+            settings.GDELT_ENABLED = False  # type: ignore[assignment]
+            settings.STORY_IMAGES_ENABLED = False  # type: ignore[assignment]
+            settings.CODEX_ENABLED = False  # type: ignore[assignment]
+            with patch.object(
+                ingest_module,
+                "_run_publish_intake_safety_guard",
+                side_effect=fake_publish_safety,
+            ), patch.object(
+                ai_agent_module,
+                "build_intake_safety_reviewer",
+                return_value=AllowSafety(),
+            ), patch.object(
+                insights_module,
+                "run_insights_once",
+                return_value={"status": "skipped", "reason": "test"},
+            ):
+                summary = run_ingest_round(
+                    run_id="publish-safety-once",
+                    client=_FakeHn(rankings, items),
+                    ai_agent=FallbackAiAgent(),
+                    run_cleanup=False,
+                )
+        finally:
+            settings.ENRICH_WORKER_COUNT = old_workers  # type: ignore[assignment]
+            settings.ENRICH_SESSION_STORY_LIMIT = old_limit  # type: ignore[assignment]
+            settings.GDELT_ENABLED = old_gdelt  # type: ignore[assignment]
+            settings.STORY_IMAGES_ENABLED = old_images  # type: ignore[assignment]
+            settings.CODEX_ENABLED = old_codex  # type: ignore[assignment]
+
+        self.assertEqual(summary["status"], "completed", summary)
+        self.assertGreater(len(summary["enrich"]["publish_checkpoints"]), 1)
+        self.assertEqual(safety_calls, ["publish-safety-once"])
+        for checkpoint in summary["enrich"]["publish_checkpoints"]:
+            self.assertEqual(
+                checkpoint["publish_safety"],
+                {"skipped": True, "reason": "already_checked_for_run"},
+            )
+
     def test_compact_round_summary_includes_insights(self):
         compact = ingest_module._compact_round_summary_for_log(
             {

@@ -19,6 +19,7 @@ Maintenance::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import inspect
 import json
 import logging
@@ -92,6 +93,7 @@ _MAX_AI_QUALITY_ISSUES = 8
 # ``story``. We never downgrade an existing more-specific kind.
 _KIND_PRIORITY = {"story": 0, "ask": 1, "show": 1, "job": 2}
 _INTAKE_SAFETY_LOG_REJECTION_LIMIT = 8
+_PUBLISH_SAFETY_HASH_VERSION = "publish-safety-v1"
 
 
 def _kind_can_supersede(current: str, new: str) -> bool:
@@ -521,6 +523,74 @@ def _publish_safety_story_rows(conn, run_id: str) -> List[Any]:
     ).fetchall()
 
 
+def _publish_safety_hash(row: Mapping[str, Any]) -> str:
+    payload = {
+        "version": _PUBLISH_SAFETY_HASH_VERSION,
+        "title": _row_value(row, "title_en", "") or "",
+        "url": _row_value(row, "url", "") or "",
+        "domain": _row_value(row, "domain", "") or "",
+        "source": _row_value(row, "by", "") or "",
+        "rawText": str(_row_value(row, "raw_text", "") or ""),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _cached_publish_safety_decision(
+    row: Mapping[str, Any],
+    fingerprint: str,
+) -> Optional[Dict[str, Any]]:
+    if str(_row_value(row, "publish_safety_hash", "") or "") != fingerprint:
+        return None
+    status = str(_row_value(row, "publish_safety_status", "") or "")
+    if status == "approved":
+        return {"allowed": True, "reason": "cached approved"}
+    if status == "rejected":
+        return {
+            "allowed": False,
+            "reason": str(_row_value(row, "publish_safety_reason", "") or "")
+            or "cached rejected",
+        }
+    return None
+
+
+def _store_publish_safety_decisions(
+    conn,
+    rows: Sequence[Mapping[str, Any]],
+    decisions: Mapping[int, Mapping[str, Any]],
+    fingerprints: Mapping[int, str],
+) -> None:
+    now = repository.now_seconds()
+    for row in rows:
+        try:
+            sid = int(_row_value(row, "id", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        fingerprint = fingerprints.get(sid)
+        if not fingerprint:
+            continue
+        decision = decisions.get(sid) or {}
+        allowed = bool(decision.get("allowed"))
+        reason = str(decision.get("reason") or "")
+        conn.execute(
+            """
+            UPDATE stories
+            SET publish_safety_hash=?,
+                publish_safety_status=?,
+                publish_safety_checked_at=?,
+                publish_safety_reason=?
+            WHERE id=?
+            """,
+            (
+                fingerprint,
+                "approved" if allowed else "rejected",
+                now,
+                reason,
+                sid,
+            ),
+        )
+
+
 def _rejected_intake_safety_ids(
     rows: Sequence[Mapping[str, Any]],
     decisions: Mapping[int, Mapping[str, Any]],
@@ -590,7 +660,10 @@ def _run_publish_intake_safety_guard(
         conn.close()
 
     summary: Dict[str, Any] = {
-        "reviewed": len(rows),
+        "total_candidates": len(rows),
+        "reviewed": 0,
+        "cached_allowed": 0,
+        "cached_rejected": 0,
         "rejected": 0,
         "rejected_ids": [],
         "failed": False,
@@ -602,18 +675,56 @@ def _run_publish_intake_safety_guard(
     if not rows:
         return summary
 
-    try:
-        if safety_reviewer is None:
-            from .ai_agent import build_intake_safety_reviewer
+    fingerprints: Dict[int, str] = {}
+    rows_to_review: List[Any] = []
+    decisions: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        try:
+            sid = int(_row_value(row, "id", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if sid <= 0:
+            continue
+        fingerprint = _publish_safety_hash(row)
+        fingerprints[sid] = fingerprint
+        cached = _cached_publish_safety_decision(row, fingerprint)
+        if cached is None:
+            rows_to_review.append(row)
+            continue
+        decisions[sid] = cached
+        if bool(cached.get("allowed")):
+            summary["cached_allowed"] += 1
+        else:
+            summary["cached_rejected"] += 1
 
-            safety_reviewer = build_intake_safety_reviewer()
-        decisions = safety_reviewer.review_articles(rows)
-        _log_intake_safety_summary("PUBLISH", rows, decisions)
+    try:
+        if rows_to_review:
+            if safety_reviewer is None:
+                from .ai_agent import build_intake_safety_reviewer
+
+                safety_reviewer = build_intake_safety_reviewer()
+            reviewed_decisions = safety_reviewer.review_articles(rows_to_review)
+            _log_intake_safety_summary("PUBLISH", rows_to_review, reviewed_decisions)
+            decisions.update(reviewed_decisions)
+            summary["reviewed"] = len(rows_to_review)
     except Exception as exc:  # noqa: BLE001
         summary["failed"] = True
         summary["error"] = f"{type(exc).__name__}: {exc}"
         log.warning("publish intake safety review failed closed: %s", exc)
         return summary
+
+    if rows_to_review:
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                _store_publish_safety_decisions(
+                    conn,
+                    rows_to_review,
+                    decisions,
+                    fingerprints,
+                )
+        finally:
+            conn.close()
 
     rejected_ids = _rejected_intake_safety_ids(rows, decisions)
     summary["rejected"] = len(rejected_ids)
@@ -778,6 +889,12 @@ def run_fetcher_once(
                     ):
                         repository.update_story_kind(conn, sid, new_kind)
                     summary["stories_updated"] += 1
+                _store_publish_safety_decisions(
+                    conn,
+                    [normalized],
+                    {sid: decision},
+                    {sid: _publish_safety_hash(normalized)},
+                )
             displayable_ids.add(sid)
     finally:
         conn.close()
@@ -1144,6 +1261,14 @@ def run_gdelt_fetcher_once(
                         source="gdelt",
                     )
                     summary["stories_updated"] += 1
+                decision = decisions.get(sid)
+                if decision and bool(decision.get("allowed")):
+                    _store_publish_safety_decisions(
+                        conn,
+                        [row],
+                        {sid: decision},
+                        {sid: _publish_safety_hash(row)},
+                    )
             repository.replace_ranking_candidates(conn, run_id, GDELT_FEED, stored_ids)
             if stored_ids:
                 repository.set_meta(
@@ -2415,24 +2540,30 @@ def _publish_ranking_checkpoint(
     run_id: str,
     *,
     preserve_existing: bool,
+    run_publish_safety: bool = True,
 ) -> Dict[str, Any]:
-    publish_safety = _run_publish_intake_safety_guard(run_id)
-    if publish_safety.get("failed"):
-        log.warning(
-            "publisher checkpoint skipped after intake safety failure: %s",
-            publish_safety,
-        )
-        return {
-            "changed": False,
-            "feeds": {},
-            "published_count": 0,
-            "ready_count": 0,
-            "preserve_existing": bool(preserve_existing),
-            "skipped_stale_run": False,
-            "skipped": True,
-            "safety_failed": True,
-            "publish_safety": publish_safety,
-        }
+    publish_safety: Dict[str, Any] = {
+        "skipped": True,
+        "reason": "already_checked_for_run",
+    }
+    if run_publish_safety:
+        publish_safety = _run_publish_intake_safety_guard(run_id)
+        if publish_safety.get("failed"):
+            log.warning(
+                "publisher checkpoint skipped after intake safety failure: %s",
+                publish_safety,
+            )
+            return {
+                "changed": False,
+                "feeds": {},
+                "published_count": 0,
+                "ready_count": 0,
+                "preserve_existing": bool(preserve_existing),
+                "skipped_stale_run": False,
+                "skipped": True,
+                "safety_failed": True,
+                "publish_safety": publish_safety,
+            }
     conn = db.connect()
     try:
         with db.transaction(conn):
@@ -2491,6 +2622,7 @@ def run_enricher_once(
     target_ids: Optional[Sequence[int]] = None,
     bump_visible_version: bool = True,
     publish_run_id: Optional[str] = None,
+    publish_checkpoint_safety: bool = True,
     publish_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
@@ -2576,6 +2708,7 @@ def run_enricher_once(
                     publish_summary = _publish_ranking_checkpoint(
                         publish_run_id,
                         preserve_existing=True,
+                        run_publish_safety=publish_checkpoint_safety,
                     )
                     summary["publish_checkpoints"].append(publish_summary)
                     if publish_callback is not None:
@@ -3631,6 +3764,44 @@ def run_ingest_round(
                 summary["error"] = error
                 return summary
 
+        publish_safety_summary = _run_publish_intake_safety_guard(run_id)
+        summary["publish_safety"] = publish_safety_summary
+        log.info("publisher intake safety: %s", publish_safety_summary)
+        if publish_safety_summary.get("failed"):
+            error = "publish intake safety review failed"
+            cleanup = _discard_run(run_id, release_inflight=True)
+            _finish_run(run_id, "failed", error=error)
+            _alert(
+                "publish_safety_failed",
+                "HN ingest publish intake safety failed",
+                error,
+                run_id=run_id,
+                extra=_round_alert_extra(
+                    started_at=started,
+                    candidate_count=candidate_count,
+                    target_ids=target_ids,
+                    extra={
+                        "publish_safety": json.dumps(
+                            publish_safety_summary,
+                            ensure_ascii=False,
+                        ),
+                        **cleanup,
+                    },
+                ),
+            )
+            summary["status"] = "failed"
+            summary["error"] = error
+            collect_image_pipeline(wait=False)
+            return summary
+        rejected_publish_ids = {
+            int(sid) for sid in publish_safety_summary.get("rejected_ids", []) or []
+        }
+        if rejected_publish_ids:
+            target_ids = [
+                int(sid) for sid in target_ids if int(sid) not in rejected_publish_ids
+            ]
+            candidate_count = len(target_ids)
+
         conn = db.connect()
         try:
             with db.transaction(conn):
@@ -3679,40 +3850,11 @@ def run_ingest_round(
             target_ids=target_ids,
             bump_visible_version=False,
             publish_run_id=run_id,
+            publish_checkpoint_safety=False,
             progress_callback=_on_enrich_progress,
         )
         summary["enrich"] = enrich_summary
         log.info("enricher: %s", _compact_enrich_for_log(enrich_summary))
-
-        publish_safety_summary = _run_publish_intake_safety_guard(run_id)
-        summary["publish_safety"] = publish_safety_summary
-        log.info("publisher intake safety: %s", publish_safety_summary)
-        if publish_safety_summary.get("failed"):
-            error = "publish intake safety review failed"
-            cleanup = _discard_run(run_id, release_inflight=True)
-            _finish_run(run_id, "failed", error=error)
-            _alert(
-                "publish_safety_failed",
-                "HN ingest publish intake safety failed",
-                error,
-                run_id=run_id,
-                extra=_round_alert_extra(
-                    started_at=started,
-                    candidate_count=candidate_count,
-                    target_ids=target_ids,
-                    extra={
-                        "publish_safety": json.dumps(
-                            publish_safety_summary,
-                            ensure_ascii=False,
-                        ),
-                        **cleanup,
-                    },
-                ),
-            )
-            summary["status"] = "failed"
-            summary["error"] = error
-            collect_image_pipeline(wait=False)
-            return summary
 
         conn = db.connect()
         try:
