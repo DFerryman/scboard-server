@@ -1813,7 +1813,7 @@ INGEST_ROUND_TIMEOUT_SECONDS = _require_int_range(
     "HNREADER_INGEST_ROUND_TIMEOUT_SECONDS",
     _env_int(
         "HNREADER_INGEST_ROUND_TIMEOUT_SECONDS",
-        28 * 60,
+        10800,
         fallback="HACKERMINI_INGEST_ROUND_TIMEOUT_SECONDS",
     ),
     min_value=30,
