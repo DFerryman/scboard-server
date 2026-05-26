@@ -20,7 +20,7 @@ from .codex_cli import CodexCliError, CodexCliJsonClient, merge_usage_summaries
 log = logging.getLogger(__name__)
 
 
-_CODEX_INSIGHTS_COMPRESSION_REASONING_EFFORT = "medium"
+_CODEX_INSIGHTS_COMPRESSION_REASONING_EFFORT = "low"
 _CODEX_INSIGHTS_ANALYSIS_REASONING_EFFORT = "medium"
 _CODEX_INSIGHTS_ANALYSIS_PURPOSES = frozenset(
     (

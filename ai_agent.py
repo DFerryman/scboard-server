@@ -70,6 +70,7 @@ _MAX_AI_USAGE_TOKENS = 10_000_000
 # automatically runs two stories per batch instead of three.
 _ENRICH_OUTPUT_TOKENS_PER_STORY = 3200
 _CODEX_INGEST_REASONING_EFFORT = "medium"
+_CODEX_DIGEST_SELECTION_REASONING_EFFORT = "low"
 
 
 _STORY_OUTPUT_SCHEMA: Dict[str, Any] = {
@@ -2382,7 +2383,7 @@ class CodexFirstAiAgent(AiAgent):
                 ),
                 user_content=user_content,
                 output_schema=_DIGEST_SELECTION_OUTPUT_SCHEMA,
-                reasoning_effort=_CODEX_INGEST_REASONING_EFFORT,
+                reasoning_effort=_CODEX_DIGEST_SELECTION_REASONING_EFFORT,
             )
             return validate_digest_selection(
                 raw,

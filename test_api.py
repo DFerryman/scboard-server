@@ -5511,7 +5511,7 @@ class CloudSyncReadModel(_SqliteCase):
             codex.calls[1]["output_schema"],
             insights_agents._INSIGHTS_OUTPUT_SCHEMAS["insights-evidence"],
         )
-        self.assertEqual(codex.calls[1]["reasoning_effort"], "medium")
+        self.assertEqual(codex.calls[1]["reasoning_effort"], "low")
 
         class FailingCodex(FakeCodex):
             def complete_json(self, **kwargs):
@@ -12578,7 +12578,7 @@ class CodexFirstAiAgentTests(unittest.TestCase):
         self.assertEqual(fallback.selection_calls, 0)
         self.assertEqual(fallback.intro_calls, 0)
         self.assertEqual([call["purpose"] for call in codex.calls], ["digest-selection", "digest"])
-        self.assertEqual(codex.calls[0]["reasoning_effort"], "medium")
+        self.assertEqual(codex.calls[0]["reasoning_effort"], "low")
         self.assertEqual(codex.calls[1]["reasoning_effort"], "medium")
         self.assertEqual(
             codex.calls[0]["output_schema"],
