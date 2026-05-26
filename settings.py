@@ -1681,7 +1681,7 @@ GDELT_SORT = _env_str(
 ).strip() or "DateDesc"
 GDELT_MAX_RECORDS = _require_int_range(
     "HNREADER_GDELT_MAX_RECORDS",
-    _env_int("HNREADER_GDELT_MAX_RECORDS", 100, fallback="HACKERMINI_GDELT_MAX_RECORDS"),
+    _env_int("HNREADER_GDELT_MAX_RECORDS", 75, fallback="HACKERMINI_GDELT_MAX_RECORDS"),
     min_value=1,
     max_value=250,
 )
@@ -1701,7 +1701,7 @@ _GDELT_CONFIGURED_MIN_FETCH_INTERVAL_SECONDS = _require_int_range(
     "HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS",
     _env_int(
         "HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS",
-        5 * 60,
+        60 * 60,
         fallback="HACKERMINI_GDELT_MIN_FETCH_INTERVAL_SECONDS",
     ),
     min_value=0,
@@ -1709,13 +1709,23 @@ _GDELT_CONFIGURED_MIN_FETCH_INTERVAL_SECONDS = _require_int_range(
 )
 GDELT_MIN_FETCH_INTERVAL_SECONDS = max(
     _GDELT_CONFIGURED_MIN_FETCH_INTERVAL_SECONDS,
-    5 * 60,
+    60 * 60,
+)
+GDELT_MIN_FETCH_JITTER_SECONDS = _require_int_range(
+    "HNREADER_GDELT_MIN_FETCH_JITTER_SECONDS",
+    _env_int(
+        "HNREADER_GDELT_MIN_FETCH_JITTER_SECONDS",
+        10 * 60,
+        fallback="HACKERMINI_GDELT_MIN_FETCH_JITTER_SECONDS",
+    ),
+    min_value=0,
+    max_value=24 * 60 * 60,
 )
 _GDELT_CONFIGURED_RATE_LIMIT_COOLDOWN_SECONDS = _require_int_range(
     "HNREADER_GDELT_RATE_LIMIT_COOLDOWN_SECONDS",
     _env_int(
         "HNREADER_GDELT_RATE_LIMIT_COOLDOWN_SECONDS",
-        15 * 60,
+        60 * 60,
         fallback="HACKERMINI_GDELT_RATE_LIMIT_COOLDOWN_SECONDS",
     ),
     min_value=0,

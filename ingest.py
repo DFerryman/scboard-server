@@ -65,8 +65,6 @@ PUBLISH_FEEDS: Sequence[str] = (*HN_FEEDS, GDELT_FEED)
 _GDELT_LAST_FETCH_META = "last_gdelt_fetch_at"
 _GDELT_LAST_ATTEMPT_META = "last_gdelt_fetch_attempt_at"
 _GDELT_RATE_LIMIT_UNTIL_META = "gdelt_rate_limit_until"
-_GDELT_RATE_LIMIT_DEFAULT_RETRY_SECONDS = 2 * 60
-_GDELT_RATE_LIMIT_MAX_RETRY_SECONDS = 120
 # Higher-priority feed wins when one item appears in several rankings.
 _FEED_PRIORITY: Sequence[str] = ("ask", "show", "top", "best", "new")
 _ENRICH_AI_USAGE_PURPOSES: Sequence[str] = ("story", "story-batch")
@@ -955,6 +953,14 @@ def _gdelt_fetch_enabled(force: bool) -> bool:
     return bool(force or settings.GDELT_ENABLED)
 
 
+def _gdelt_fetch_jitter_seconds(last_attempt_or_fetch: int) -> int:
+    jitter = max(0, int(getattr(settings, "GDELT_MIN_FETCH_JITTER_SECONDS", 0)))
+    if jitter <= 0:
+        return 0
+    material = f"gdelt-fetch-jitter:{last_attempt_or_fetch}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(material).digest()[:4], "big") % (jitter + 1)
+
+
 def _gdelt_fetch_throttled(conn) -> tuple[bool, int, str]:
     now = repository.now_seconds()
     rate_limit_until = repository.get_meta_int(conn, _GDELT_RATE_LIMIT_UNTIL_META)
@@ -979,6 +985,7 @@ def _gdelt_fetch_throttled(conn) -> tuple[bool, int, str]:
     last = max(int(value) for value in last_values)
     elapsed = max(0, now - int(last))
     min_interval = max(0, int(settings.GDELT_MIN_FETCH_INTERVAL_SECONDS))
+    min_interval += _gdelt_fetch_jitter_seconds(last)
     return elapsed < min_interval, max(0, min_interval - elapsed), "throttled"
 
 
@@ -991,13 +998,6 @@ def _gdelt_rate_limit_hint_seconds(exc: GdeltRateLimitError) -> Optional[int]:
         if math.isfinite(hint) and hint >= 0:
             return int(math.ceil(hint))
     return None
-
-
-def _gdelt_rate_limit_retry_delay_seconds(exc: GdeltRateLimitError) -> int:
-    hint = _gdelt_rate_limit_hint_seconds(exc)
-    if hint is None:
-        hint = _GDELT_RATE_LIMIT_DEFAULT_RETRY_SECONDS
-    return max(0, min(int(hint), _GDELT_RATE_LIMIT_MAX_RETRY_SECONDS))
 
 
 def _gdelt_rate_limit_cooldown_seconds(exc: GdeltRateLimitError) -> int:
@@ -1016,22 +1016,6 @@ def _gdelt_fetch_articles_once(client) -> List[Dict[str, Any]]:
         mode=settings.GDELT_MODE,
         format_=settings.GDELT_FORMAT,
     )
-
-
-def _sleep_before_gdelt_rate_limit_retry(
-    delay_seconds: int,
-    deadline_at: Optional[float],
-) -> bool:
-    if delay_seconds <= 0:
-        return True
-    if deadline_at is not None and time.time() + delay_seconds >= deadline_at:
-        return False
-    log.warning(
-        "GDELT fetch rate limited; waiting %s seconds before one retry",
-        delay_seconds,
-    )
-    time.sleep(delay_seconds)
-    return True
 
 
 def _record_gdelt_rate_limit_until(cooldown: int) -> int:
@@ -1127,25 +1111,7 @@ def run_gdelt_fetcher_once(
         client = GdeltClient()
 
     try:
-        try:
-            articles = _gdelt_fetch_articles_once(client)
-        except GdeltRateLimitError as exc:
-            retry_delay = _gdelt_rate_limit_retry_delay_seconds(exc)
-            summary["rate_limit_retry_after_seconds"] = retry_delay
-            if exc.retry_after_seconds is not None:
-                summary["upstream_retry_after_seconds"] = exc.retry_after_seconds
-            if not _sleep_before_gdelt_rate_limit_retry(retry_delay, deadline_at):
-                cooldown = _gdelt_rate_limit_cooldown_seconds(exc)
-                rate_limit_until = _record_gdelt_rate_limit_until(cooldown)
-                summary["timed_out"] = True
-                summary["skipped"] = True
-                summary["rate_limited"] = True
-                summary["reason"] = "rate_limit_retry_deadline"
-                summary["retry_after_seconds"] = cooldown
-                summary["rate_limit_until"] = rate_limit_until
-                return summary
-            summary["rate_limit_retried"] = True
-            articles = _gdelt_fetch_articles_once(client)
+        articles = _gdelt_fetch_articles_once(client)
     except GdeltRateLimitError as exc:
         cooldown = _gdelt_rate_limit_cooldown_seconds(exc)
         rate_limit_until = _record_gdelt_rate_limit_until(cooldown)

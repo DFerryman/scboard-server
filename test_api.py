@@ -1074,15 +1074,19 @@ class SettingsValidation(unittest.TestCase):
             launcher,
         )
         self.assertIn(
-            'HNREADER_GDELT_MAX_RECORDS="${HNREADER_GDELT_MAX_RECORDS:-100}"',
+            'HNREADER_GDELT_MAX_RECORDS="${HNREADER_GDELT_MAX_RECORDS:-75}"',
             launcher,
         )
         self.assertIn(
-            'HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS="${HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS:-300}"',
+            'HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS="${HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS:-3600}"',
             launcher,
         )
         self.assertIn(
-            'HNREADER_GDELT_RATE_LIMIT_COOLDOWN_SECONDS="${HNREADER_GDELT_RATE_LIMIT_COOLDOWN_SECONDS:-900}"',
+            'HNREADER_GDELT_MIN_FETCH_JITTER_SECONDS="${HNREADER_GDELT_MIN_FETCH_JITTER_SECONDS:-600}"',
+            launcher,
+        )
+        self.assertIn(
+            'HNREADER_GDELT_RATE_LIMIT_COOLDOWN_SECONDS="${HNREADER_GDELT_RATE_LIMIT_COOLDOWN_SECONDS:-3600}"',
             launcher,
         )
         self.assertIn(
@@ -2603,12 +2607,10 @@ class GdeltIntegration(_SqliteCase):
         self.assertEqual(summary["reason"], "throttled")
         self.assertGreater(int(summary["retry_after_seconds"]), 0)
 
-    def test_gdelt_rate_limit_retries_once_before_local_cooldown(self):
+    def test_gdelt_rate_limit_enters_local_cooldown_without_retry(self):
         old_enabled = settings.GDELT_ENABLED
         old_interval = settings.GDELT_MIN_FETCH_INTERVAL_SECONDS
         old_cooldown = settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS
-        old_sleep = ingest_module.time.sleep
-        sleeps: list[int] = []
         today = repository.today_in_digest_tz()
         limited_client = _RateLimitedThenGdelt(
             retry_after_seconds=17,
@@ -2624,7 +2626,6 @@ class GdeltIntegration(_SqliteCase):
             settings.GDELT_ENABLED = True  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = 0  # type: ignore[assignment]
             settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = 120  # type: ignore[assignment]
-            ingest_module.time.sleep = sleeps.append  # type: ignore[assignment]
             summary = ingest_module.run_gdelt_fetcher_once(
                 client=limited_client,
                 run_id="gdelt-429-then-ok",
@@ -2632,32 +2633,27 @@ class GdeltIntegration(_SqliteCase):
                 force=True,
             )
         finally:
-            ingest_module.time.sleep = old_sleep  # type: ignore[assignment]
             settings.GDELT_ENABLED = old_enabled  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
             settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = old_cooldown  # type: ignore[assignment]
 
-        self.assertEqual(limited_client.calls, 2)
-        self.assertEqual(sleeps, [17])
-        self.assertFalse(summary["skipped"], summary)
-        self.assertFalse(summary["rate_limited"], summary)
-        self.assertTrue(summary["successful_round"], summary)
-        self.assertEqual(summary["stories_inserted"], 1)
-        self.assertTrue(summary["rate_limit_retried"], summary)
-        self.assertEqual(summary["rate_limit_retry_after_seconds"], 17)
+        self.assertEqual(limited_client.calls, 1)
+        self.assertTrue(summary["skipped"], summary)
+        self.assertTrue(summary["rate_limited"], summary)
+        self.assertFalse(summary["successful_round"], summary)
+        self.assertEqual(summary["stories_inserted"], 0)
+        self.assertNotIn("rate_limit_retried", summary)
+        self.assertEqual(summary["retry_after_seconds"], 17)
 
     def test_gdelt_rate_limit_honors_retry_after_even_for_force(self):
         old_enabled = settings.GDELT_ENABLED
         old_interval = settings.GDELT_MIN_FETCH_INTERVAL_SECONDS
         old_cooldown = settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS
-        old_sleep = ingest_module.time.sleep
-        sleeps: list[int] = []
         limited_client = _RateLimitedGdelt(retry_after_seconds=17)
         try:
             settings.GDELT_ENABLED = True  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = 0  # type: ignore[assignment]
             settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = 123  # type: ignore[assignment]
-            ingest_module.time.sleep = sleeps.append  # type: ignore[assignment]
             before = repository.now_seconds()
             summary = ingest_module.run_gdelt_fetcher_once(
                 client=limited_client,
@@ -2670,13 +2666,11 @@ class GdeltIntegration(_SqliteCase):
                 force=True,
             )
         finally:
-            ingest_module.time.sleep = old_sleep  # type: ignore[assignment]
             settings.GDELT_ENABLED = old_enabled  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
             settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = old_cooldown  # type: ignore[assignment]
 
-        self.assertEqual(limited_client.calls, 2)
-        self.assertEqual(sleeps, [17])
+        self.assertEqual(limited_client.calls, 1)
         self.assertTrue(summary["rate_limited"], summary)
         self.assertEqual(summary["reason"], "rate_limited")
         self.assertEqual(summary["retry_after_seconds"], 17)
@@ -2718,14 +2712,11 @@ class GdeltIntegration(_SqliteCase):
         old_enabled = settings.GDELT_ENABLED
         old_interval = settings.GDELT_MIN_FETCH_INTERVAL_SECONDS
         old_cooldown = settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS
-        old_sleep = ingest_module.time.sleep
-        sleeps: list[int] = []
         limited_client = _RateLimitedGdelt(retry_after_seconds="not-a-number")
         try:
             settings.GDELT_ENABLED = True  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = 0  # type: ignore[assignment]
             settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = 900  # type: ignore[assignment]
-            ingest_module.time.sleep = sleeps.append  # type: ignore[assignment]
             before = repository.now_seconds()
             summary = ingest_module.run_gdelt_fetcher_once(
                 client=limited_client,
@@ -2733,13 +2724,11 @@ class GdeltIntegration(_SqliteCase):
                 force=True,
             )
         finally:
-            ingest_module.time.sleep = old_sleep  # type: ignore[assignment]
             settings.GDELT_ENABLED = old_enabled  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
             settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = old_cooldown  # type: ignore[assignment]
 
-        self.assertEqual(limited_client.calls, 2)
-        self.assertEqual(sleeps, [120])
+        self.assertEqual(limited_client.calls, 1)
         self.assertTrue(summary["rate_limited"], summary)
         self.assertEqual(summary["reason"], "rate_limited")
         self.assertEqual(summary["retry_after_seconds"], 900)
