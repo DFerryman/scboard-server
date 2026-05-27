@@ -2421,9 +2421,11 @@ class _FakeGdelt:
     def __init__(self, articles):
         self.articles = list(articles)
         self.kwargs = None
+        self.calls = []
 
     def fetch_articles(self, **kwargs):
         self.kwargs = dict(kwargs)
+        self.calls.append(dict(kwargs))
         return list(self.articles)
 
 
@@ -2577,6 +2579,69 @@ class GdeltIntegration(_SqliteCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["source"], "gdelt")
         self.assertEqual(row["enrich_status"], "pending")
+
+    def test_gdelt_fetcher_supports_multi_query_fetch_and_dedupes(self):
+        old_queries = settings.GDELT_QUERIES
+        old_query = settings.GDELT_QUERY
+        old_max_records = settings.GDELT_MAX_RECORDS
+        today = repository.today_in_digest_tz()
+        duplicate_url = "https://world.example/shared"
+        per_query_articles = {
+            "technology sourcelang:english": [
+                self._article(
+                    "Technology story",
+                    duplicate_url,
+                    self._seendate_for_digest_date(today),
+                )
+            ],
+            "science sourcelang:english": [
+                self._article(
+                    "Science story",
+                    duplicate_url,
+                    self._seendate_for_digest_date(today),
+                ),
+                self._article(
+                    "Science unique",
+                    "https://world.example/science",
+                    self._seendate_for_digest_date(today),
+                ),
+            ],
+        }
+
+        class MultiQueryGdelt:
+            def __init__(self):
+                self.calls = []
+
+            def fetch_articles(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                return list(per_query_articles[str(kwargs["query"])])
+
+        client = MultiQueryGdelt()
+        try:
+            settings.GDELT_QUERIES = tuple(per_query_articles)  # type: ignore[assignment]
+            settings.GDELT_QUERY = "unused sourcelang:english"  # type: ignore[assignment]
+            settings.GDELT_MAX_RECORDS = 75  # type: ignore[assignment]
+            summary = ingest_module.run_gdelt_fetcher_once(
+                client=client,
+                run_id="gdelt-multi-query",
+                safety_reviewer=_TitleSafety(),
+                force=True,
+            )
+        finally:
+            settings.GDELT_QUERIES = old_queries  # type: ignore[assignment]
+            settings.GDELT_QUERY = old_query  # type: ignore[assignment]
+            settings.GDELT_MAX_RECORDS = old_max_records  # type: ignore[assignment]
+
+        self.assertTrue(summary["successful_round"], summary)
+        self.assertEqual(summary["articles_fetched"], 2)
+        self.assertEqual(summary["stories_inserted"], 2)
+        self.assertEqual(
+            [(call["query"], call["maxrecords"]) for call in client.calls],
+            [
+                ("technology sourcelang:english", 38),
+                ("science sourcelang:english", 38),
+            ],
+        )
 
     def test_gdelt_fetcher_throttles_after_recent_attempt(self):
         old_enabled = settings.GDELT_ENABLED

@@ -1008,14 +1008,29 @@ def _gdelt_rate_limit_cooldown_seconds(exc: GdeltRateLimitError) -> int:
 
 
 def _gdelt_fetch_articles_once(client) -> List[Dict[str, Any]]:
-    return client.fetch_articles(
-        query=settings.GDELT_QUERY,
-        timespan=settings.GDELT_TIMESPAN,
-        maxrecords=settings.GDELT_MAX_RECORDS,
-        sort=settings.GDELT_SORT,
-        mode=settings.GDELT_MODE,
-        format_=settings.GDELT_FORMAT,
+    queries = tuple(settings.GDELT_QUERIES) or (settings.GDELT_QUERY,)
+    per_query_maxrecords = max(
+        1,
+        int(math.ceil(float(settings.GDELT_MAX_RECORDS) / max(1, len(queries)))),
     )
+    articles: List[Dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for query in queries:
+        for article in client.fetch_articles(
+            query=query,
+            timespan=settings.GDELT_TIMESPAN,
+            maxrecords=per_query_maxrecords,
+            sort=settings.GDELT_SORT,
+            mode=settings.GDELT_MODE,
+            format_=settings.GDELT_FORMAT,
+        ):
+            url = str(article.get("url") or "").strip()
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            articles.append(article)
+    return articles
 
 
 def _record_gdelt_rate_limit_until(cooldown: int) -> int:

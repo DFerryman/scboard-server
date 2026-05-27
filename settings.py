@@ -1659,14 +1659,21 @@ GDELT_DOC_API_URL = _env_str(
 ).strip()
 GDELT_QUERY = _env_str(
     "HNREADER_GDELT_QUERY",
-    (
-        '(technology OR "artificial intelligence" OR cybersecurity OR science '
-        "OR economy OR markets OR policy OR regulation OR geopolitics OR "
-        'climate OR energy OR "supply chain" OR semiconductor OR startup) '
-        "sourcelang:english"
-    ),
+    "(technology OR science OR economy OR policy) sourcelang:english",
     fallback="HACKERMINI_GDELT_QUERY",
 ).strip()
+GDELT_QUERIES = tuple(
+    part.strip()
+    for part in _env_str(
+        "HNREADER_GDELT_QUERIES",
+        (
+            "technology sourcelang:english||science sourcelang:english||"
+            "economy sourcelang:english||policy sourcelang:english"
+        ),
+        fallback="HACKERMINI_GDELT_QUERIES",
+    ).split("||")
+    if part.strip()
+)
 GDELT_MODE = _env_str(
     "HNREADER_GDELT_MODE", "ArtList", fallback="HACKERMINI_GDELT_MODE"
 ).strip() or "ArtList"
