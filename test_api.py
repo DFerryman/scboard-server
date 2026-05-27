@@ -2481,6 +2481,15 @@ class _TitleSafety:
 
 
 class GdeltIntegration(_SqliteCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self._old_gdelt_query_delay = settings.GDELT_QUERY_DELAY_SECONDS
+        settings.GDELT_QUERY_DELAY_SECONDS = 0  # type: ignore[assignment]
+
+    def tearDown(self) -> None:
+        settings.GDELT_QUERY_DELAY_SECONDS = self._old_gdelt_query_delay  # type: ignore[assignment]
+        super().tearDown()
+
     def _seendate_for_digest_date(self, date: str) -> str:
         start, _ = repository.digest_date_epoch_bounds(date)
         return time.strftime("%Y%m%d%H%M%S", time.gmtime(start + 3600))
@@ -2643,6 +2652,61 @@ class GdeltIntegration(_SqliteCase):
             ],
         )
 
+    def test_gdelt_multi_query_rate_limit_is_per_query(self):
+        old_queries = settings.GDELT_QUERIES
+        old_query = settings.GDELT_QUERY
+        old_max_records = settings.GDELT_MAX_RECORDS
+        old_cooldown = settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS
+        today = repository.today_in_digest_tz()
+        queries = ("technology sourcelang:english", "science sourcelang:english")
+        outer = self
+
+        class PartiallyLimitedGdelt:
+            def __init__(self):
+                self.calls = []
+
+            def fetch_articles(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                if kwargs["query"] == queries[0]:
+                    from .gdelt_client import GdeltRateLimitError
+
+                    raise GdeltRateLimitError(
+                        "GDELT API returned HTTP 429",
+                        retry_after_seconds=17,
+                    )
+                return [
+                    outer._article(
+                        "Science survives query cooldown",
+                        "https://world.example/science-survives",
+                        outer._seendate_for_digest_date(today),
+                    )
+                ]
+
+        client = PartiallyLimitedGdelt()
+        try:
+            settings.GDELT_QUERIES = queries  # type: ignore[assignment]
+            settings.GDELT_QUERY = "unused sourcelang:english"  # type: ignore[assignment]
+            settings.GDELT_MAX_RECORDS = 75  # type: ignore[assignment]
+            settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = 120  # type: ignore[assignment]
+            summary = ingest_module.run_gdelt_fetcher_once(
+                client=client,
+                run_id="gdelt-query-rate-limit",
+                safety_reviewer=_TitleSafety(),
+                force=True,
+            )
+        finally:
+            settings.GDELT_QUERIES = old_queries  # type: ignore[assignment]
+            settings.GDELT_QUERY = old_query  # type: ignore[assignment]
+            settings.GDELT_MAX_RECORDS = old_max_records  # type: ignore[assignment]
+            settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = old_cooldown  # type: ignore[assignment]
+
+        self.assertTrue(summary["successful_round"], summary)
+        self.assertFalse(summary["rate_limited"], summary)
+        self.assertEqual(summary["stories_inserted"], 1)
+        self.assertEqual([call["query"] for call in client.calls], list(queries))
+        self.assertEqual(summary["query_results"][0]["reason"], "rate_limited")
+        self.assertEqual(summary["query_results"][1]["articles_added"], 1)
+
     def test_gdelt_fetcher_throttles_after_recent_attempt(self):
         old_enabled = settings.GDELT_ENABLED
         old_interval = settings.GDELT_MIN_FETCH_INTERVAL_SECONDS
@@ -2676,6 +2740,7 @@ class GdeltIntegration(_SqliteCase):
         old_enabled = settings.GDELT_ENABLED
         old_interval = settings.GDELT_MIN_FETCH_INTERVAL_SECONDS
         old_cooldown = settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS
+        old_queries = settings.GDELT_QUERIES
         today = repository.today_in_digest_tz()
         limited_client = _RateLimitedThenGdelt(
             retry_after_seconds=17,
@@ -2691,6 +2756,7 @@ class GdeltIntegration(_SqliteCase):
             settings.GDELT_ENABLED = True  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = 0  # type: ignore[assignment]
             settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = 120  # type: ignore[assignment]
+            settings.GDELT_QUERIES = ()  # type: ignore[assignment]
             summary = ingest_module.run_gdelt_fetcher_once(
                 client=limited_client,
                 run_id="gdelt-429-then-ok",
@@ -2701,6 +2767,7 @@ class GdeltIntegration(_SqliteCase):
             settings.GDELT_ENABLED = old_enabled  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
             settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = old_cooldown  # type: ignore[assignment]
+            settings.GDELT_QUERIES = old_queries  # type: ignore[assignment]
 
         self.assertEqual(limited_client.calls, 1)
         self.assertTrue(summary["skipped"], summary)
@@ -2714,11 +2781,13 @@ class GdeltIntegration(_SqliteCase):
         old_enabled = settings.GDELT_ENABLED
         old_interval = settings.GDELT_MIN_FETCH_INTERVAL_SECONDS
         old_cooldown = settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS
+        old_queries = settings.GDELT_QUERIES
         limited_client = _RateLimitedGdelt(retry_after_seconds=17)
         try:
             settings.GDELT_ENABLED = True  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = 0  # type: ignore[assignment]
             settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = 123  # type: ignore[assignment]
+            settings.GDELT_QUERIES = ()  # type: ignore[assignment]
             before = repository.now_seconds()
             summary = ingest_module.run_gdelt_fetcher_once(
                 client=limited_client,
@@ -2734,6 +2803,7 @@ class GdeltIntegration(_SqliteCase):
             settings.GDELT_ENABLED = old_enabled  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
             settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = old_cooldown  # type: ignore[assignment]
+            settings.GDELT_QUERIES = old_queries  # type: ignore[assignment]
 
         self.assertEqual(limited_client.calls, 1)
         self.assertTrue(summary["rate_limited"], summary)
@@ -2777,11 +2847,13 @@ class GdeltIntegration(_SqliteCase):
         old_enabled = settings.GDELT_ENABLED
         old_interval = settings.GDELT_MIN_FETCH_INTERVAL_SECONDS
         old_cooldown = settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS
+        old_queries = settings.GDELT_QUERIES
         limited_client = _RateLimitedGdelt(retry_after_seconds="not-a-number")
         try:
             settings.GDELT_ENABLED = True  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = 0  # type: ignore[assignment]
             settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = 900  # type: ignore[assignment]
+            settings.GDELT_QUERIES = ()  # type: ignore[assignment]
             before = repository.now_seconds()
             summary = ingest_module.run_gdelt_fetcher_once(
                 client=limited_client,
@@ -2792,6 +2864,7 @@ class GdeltIntegration(_SqliteCase):
             settings.GDELT_ENABLED = old_enabled  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
             settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS = old_cooldown  # type: ignore[assignment]
+            settings.GDELT_QUERIES = old_queries  # type: ignore[assignment]
 
         self.assertEqual(limited_client.calls, 1)
         self.assertTrue(summary["rate_limited"], summary)

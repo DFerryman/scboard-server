@@ -1702,6 +1702,16 @@ GDELT_REQUEST_TIMEOUT_SECONDS = _require_float_range(
     min_value=0.1,
     max_value=120.0,
 )
+GDELT_QUERY_DELAY_SECONDS = _require_float_range(
+    "HNREADER_GDELT_QUERY_DELAY_SECONDS",
+    _env_float(
+        "HNREADER_GDELT_QUERY_DELAY_SECONDS",
+        120.0,
+        fallback="HACKERMINI_GDELT_QUERY_DELAY_SECONDS",
+    ),
+    min_value=0.0,
+    max_value=3600.0,
+)
 # Public GDELT DOC endpoints are shared and rate-limited. Keep a small local
 # floor so stale deployment env files cannot accidentally restore a hot loop.
 _GDELT_CONFIGURED_MIN_FETCH_INTERVAL_SECONDS = _require_int_range(

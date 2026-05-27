@@ -65,6 +65,7 @@ PUBLISH_FEEDS: Sequence[str] = (*HN_FEEDS, GDELT_FEED)
 _GDELT_LAST_FETCH_META = "last_gdelt_fetch_at"
 _GDELT_LAST_ATTEMPT_META = "last_gdelt_fetch_attempt_at"
 _GDELT_RATE_LIMIT_UNTIL_META = "gdelt_rate_limit_until"
+_GDELT_QUERY_RATE_LIMIT_UNTIL_META_PREFIX = "gdelt_query_rate_limit_until:"
 # Higher-priority feed wins when one item appears in several rankings.
 _FEED_PRIORITY: Sequence[str] = ("ask", "show", "top", "best", "new")
 _ENRICH_AI_USAGE_PURPOSES: Sequence[str] = ("story", "story-batch")
@@ -1007,30 +1008,145 @@ def _gdelt_rate_limit_cooldown_seconds(exc: GdeltRateLimitError) -> int:
     return max(0, int(settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS))
 
 
-def _gdelt_fetch_articles_once(client) -> List[Dict[str, Any]]:
+def _gdelt_query_rate_limit_meta_key(query: str) -> str:
+    digest = hashlib.sha1(str(query).encode("utf-8")).hexdigest()[:16]
+    return f"{_GDELT_QUERY_RATE_LIMIT_UNTIL_META_PREFIX}{digest}"
+
+
+def _gdelt_query_rate_limit_until(query: str) -> Optional[int]:
+    conn = db.connect()
+    try:
+        return repository.get_meta_int(conn, _gdelt_query_rate_limit_meta_key(query))
+    finally:
+        conn.close()
+
+
+def _record_gdelt_query_rate_limit_until(query: str, cooldown: int) -> int:
+    rate_limit_until = repository.now_seconds() + cooldown
+    conn = db.connect()
+    try:
+        with db.transaction(conn):
+            repository.set_meta(
+                conn,
+                _gdelt_query_rate_limit_meta_key(query),
+                str(rate_limit_until),
+            )
+    finally:
+        conn.close()
+    return rate_limit_until
+
+
+def _clear_gdelt_query_rate_limit(query: str) -> None:
+    conn = db.connect()
+    try:
+        with db.transaction(conn):
+            repository.set_meta(conn, _gdelt_query_rate_limit_meta_key(query), "0")
+    finally:
+        conn.close()
+
+
+def _gdelt_fetch_articles_once(
+    client,
+    *,
+    deadline_at: Optional[float] = None,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     queries = tuple(settings.GDELT_QUERIES) or (settings.GDELT_QUERY,)
     per_query_maxrecords = max(
         1,
         int(math.ceil(float(settings.GDELT_MAX_RECORDS) / max(1, len(queries)))),
     )
     articles: List[Dict[str, Any]] = []
+    query_results: List[Dict[str, Any]] = []
     seen_urls: set[str] = set()
-    for query in queries:
-        for article in client.fetch_articles(
-            query=query,
-            timespan=settings.GDELT_TIMESPAN,
-            maxrecords=per_query_maxrecords,
-            sort=settings.GDELT_SORT,
-            mode=settings.GDELT_MODE,
-            format_=settings.GDELT_FORMAT,
-        ):
+    for index, query in enumerate(queries):
+        if _deadline_reached(deadline_at):
+            query_results.append({"query": query, "skipped": True, "reason": "deadline"})
+            break
+        now = repository.now_seconds()
+        rate_limit_until = _gdelt_query_rate_limit_until(query)
+        if rate_limit_until is not None and int(rate_limit_until) > now:
+            query_results.append(
+                {
+                    "query": query,
+                    "skipped": True,
+                    "reason": "rate_limit_cooldown",
+                    "retry_after_seconds": int(rate_limit_until) - now,
+                    "rate_limit_until": int(rate_limit_until),
+                }
+            )
+            continue
+        try:
+            fetched = client.fetch_articles(
+                query=query,
+                timespan=settings.GDELT_TIMESPAN,
+                maxrecords=per_query_maxrecords,
+                sort=settings.GDELT_SORT,
+                mode=settings.GDELT_MODE,
+                format_=settings.GDELT_FORMAT,
+            )
+        except GdeltRateLimitError as exc:
+            if len(queries) == 1:
+                raise
+            cooldown = _gdelt_rate_limit_cooldown_seconds(exc)
+            rate_limit_until = _record_gdelt_query_rate_limit_until(query, cooldown)
+            query_results.append(
+                {
+                    "query": query,
+                    "skipped": True,
+                    "reason": "rate_limited",
+                    "retry_after_seconds": cooldown,
+                    "rate_limit_until": rate_limit_until,
+                    "upstream_retry_after_seconds": exc.retry_after_seconds,
+                    "error": str(exc),
+                }
+            )
+            log.warning(
+                "GDELT query rate limited: query=%r retry_after_seconds=%s "
+                "rate_limit_until=%s upstream_retry_after_seconds=%s error=%s",
+                query,
+                cooldown,
+                rate_limit_until,
+                exc.retry_after_seconds,
+                exc,
+            )
+            continue
+        except GdeltFetchError as exc:
+            if len(queries) == 1:
+                raise
+            query_results.append(
+                {
+                    "query": query,
+                    "skipped": True,
+                    "reason": "fetch_error",
+                    "error": str(exc),
+                }
+            )
+            log.warning("GDELT query fetch failed: query=%r error=%s", query, exc)
+            continue
+        _clear_gdelt_query_rate_limit(query)
+        fetched_count = len(fetched)
+        added_count = 0
+        for article in fetched:
             url = str(article.get("url") or "").strip()
             if url and url in seen_urls:
                 continue
             if url:
                 seen_urls.add(url)
             articles.append(article)
-    return articles
+            added_count += 1
+        query_results.append(
+            {
+                "query": query,
+                "skipped": False,
+                "maxrecords": per_query_maxrecords,
+                "articles_fetched": fetched_count,
+                "articles_added": added_count,
+            }
+        )
+        delay = float(settings.GDELT_QUERY_DELAY_SECONDS)
+        if delay > 0 and index < len(queries) - 1 and not _deadline_reached(deadline_at):
+            time.sleep(delay)
+    return articles, query_results
 
 
 def _record_gdelt_rate_limit_until(cooldown: int) -> int:
@@ -1126,7 +1242,11 @@ def run_gdelt_fetcher_once(
         client = GdeltClient()
 
     try:
-        articles = _gdelt_fetch_articles_once(client)
+        articles, query_results = _gdelt_fetch_articles_once(
+            client,
+            deadline_at=deadline_at,
+        )
+        summary["query_results"] = query_results
     except GdeltRateLimitError as exc:
         cooldown = _gdelt_rate_limit_cooldown_seconds(exc)
         rate_limit_until = _record_gdelt_rate_limit_until(cooldown)
@@ -1160,6 +1280,30 @@ def run_gdelt_fetcher_once(
         return summary
 
     summary["articles_fetched"] = len(articles)
+    if not articles:
+        query_results = summary.get("query_results") or []
+        if query_results and all(
+            str(item.get("reason") or "") in {"rate_limited", "rate_limit_cooldown"}
+            for item in query_results
+            if isinstance(item, dict)
+        ):
+            summary["rate_limited"] = True
+            summary["skipped"] = True
+            summary["reason"] = "rate_limited"
+            retry_after_values = [
+                int(item["retry_after_seconds"])
+                for item in query_results
+                if isinstance(item, dict) and item.get("retry_after_seconds") is not None
+            ]
+            if retry_after_values:
+                summary["retry_after_seconds"] = min(retry_after_values)
+        elif query_results and all(
+            bool(item.get("skipped")) for item in query_results if isinstance(item, dict)
+        ):
+            summary["skipped"] = True
+            summary["reason"] = "fetch_error"
+        if summary["skipped"]:
+            return summary
     if _deadline_reached(deadline_at):
         summary["timed_out"] = True
         summary["reason"] = "deadline_after_gdelt_fetch"
