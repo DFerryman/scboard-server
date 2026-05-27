@@ -2710,12 +2710,15 @@ class GdeltIntegration(_SqliteCase):
     def test_gdelt_fetcher_throttles_after_recent_attempt(self):
         old_enabled = settings.GDELT_ENABLED
         old_interval = settings.GDELT_MIN_FETCH_INTERVAL_SECONDS
+        old_queries = settings.GDELT_QUERIES
+        old_query = settings.GDELT_QUERY
+        query = "technology sourcelang:english"
         conn = db.connect()
         try:
             with db.transaction(conn):
                 repository.set_meta(
                     conn,
-                    "last_gdelt_fetch_attempt_at",
+                    ingest_module._gdelt_query_last_attempt_meta_key(query),
                     str(repository.now_seconds()),
                 )
         finally:
@@ -2723,6 +2726,8 @@ class GdeltIntegration(_SqliteCase):
 
         try:
             settings.GDELT_ENABLED = True  # type: ignore[assignment]
+            settings.GDELT_QUERIES = (query,)  # type: ignore[assignment]
+            settings.GDELT_QUERY = "unused sourcelang:english"  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = 60 * 60  # type: ignore[assignment]
             summary = ingest_module.run_gdelt_fetcher_once(
                 client=_UnexpectedGdeltCall(),
@@ -2730,11 +2735,15 @@ class GdeltIntegration(_SqliteCase):
             )
         finally:
             settings.GDELT_ENABLED = old_enabled  # type: ignore[assignment]
+            settings.GDELT_QUERIES = old_queries  # type: ignore[assignment]
+            settings.GDELT_QUERY = old_query  # type: ignore[assignment]
             settings.GDELT_MIN_FETCH_INTERVAL_SECONDS = old_interval  # type: ignore[assignment]
 
         self.assertTrue(summary["skipped"], summary)
         self.assertEqual(summary["reason"], "throttled")
         self.assertGreater(int(summary["retry_after_seconds"]), 0)
+        self.assertEqual(summary["query_results"][0]["query"], query)
+        self.assertEqual(summary["query_results"][0]["reason"], "throttled")
 
     def test_gdelt_rate_limit_enters_local_cooldown_without_retry(self):
         old_enabled = settings.GDELT_ENABLED

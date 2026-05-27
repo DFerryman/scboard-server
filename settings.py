@@ -1712,8 +1712,8 @@ GDELT_QUERY_DELAY_SECONDS = _require_float_range(
     min_value=0.0,
     max_value=3600.0,
 )
-# Public GDELT DOC endpoints are shared and rate-limited. Keep a small local
-# floor so stale deployment env files cannot accidentally restore a hot loop.
+# Public GDELT DOC endpoints are shared and rate-limited. This interval is
+# applied per configured query so one cooled-down batch does not block the rest.
 _GDELT_CONFIGURED_MIN_FETCH_INTERVAL_SECONDS = _require_int_range(
     "HNREADER_GDELT_MIN_FETCH_INTERVAL_SECONDS",
     _env_int(
@@ -1724,10 +1724,7 @@ _GDELT_CONFIGURED_MIN_FETCH_INTERVAL_SECONDS = _require_int_range(
     min_value=0,
     max_value=24 * 60 * 60,
 )
-GDELT_MIN_FETCH_INTERVAL_SECONDS = max(
-    _GDELT_CONFIGURED_MIN_FETCH_INTERVAL_SECONDS,
-    60 * 60,
-)
+GDELT_MIN_FETCH_INTERVAL_SECONDS = _GDELT_CONFIGURED_MIN_FETCH_INTERVAL_SECONDS
 GDELT_MIN_FETCH_JITTER_SECONDS = _require_int_range(
     "HNREADER_GDELT_MIN_FETCH_JITTER_SECONDS",
     _env_int(

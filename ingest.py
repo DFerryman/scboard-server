@@ -66,6 +66,8 @@ _GDELT_LAST_FETCH_META = "last_gdelt_fetch_at"
 _GDELT_LAST_ATTEMPT_META = "last_gdelt_fetch_attempt_at"
 _GDELT_RATE_LIMIT_UNTIL_META = "gdelt_rate_limit_until"
 _GDELT_QUERY_RATE_LIMIT_UNTIL_META_PREFIX = "gdelt_query_rate_limit_until:"
+_GDELT_QUERY_LAST_FETCH_META_PREFIX = "last_gdelt_query_fetch_at:"
+_GDELT_QUERY_LAST_ATTEMPT_META_PREFIX = "last_gdelt_query_fetch_attempt_at:"
 # Higher-priority feed wins when one item appears in several rankings.
 _FEED_PRIORITY: Sequence[str] = ("ask", "show", "top", "best", "new")
 _ENRICH_AI_USAGE_PURPOSES: Sequence[str] = ("story", "story-batch")
@@ -965,17 +967,19 @@ def _gdelt_fetch_jitter_seconds(last_attempt_or_fetch: int) -> int:
 def _gdelt_fetch_throttled(conn) -> tuple[bool, int, str]:
     now = repository.now_seconds()
     rate_limit_until = repository.get_meta_int(conn, _GDELT_RATE_LIMIT_UNTIL_META)
-    last_attempt = repository.get_meta_int(conn, _GDELT_LAST_ATTEMPT_META)
-    last_fetch = repository.get_meta_int(conn, _GDELT_LAST_FETCH_META)
     if rate_limit_until is not None:
         rate_limit_until = int(rate_limit_until)
         if now < rate_limit_until:
             return True, max(0, rate_limit_until - now), "rate_limit_cooldown"
-        if rate_limit_until > 0 and not any(
-            value is not None and int(value) >= rate_limit_until
-            for value in (last_attempt, last_fetch)
-        ):
-            return False, 0, ""
+    return False, 0, ""
+
+
+def _gdelt_local_interval_throttled(
+    *,
+    now: int,
+    last_attempt: Optional[int],
+    last_fetch: Optional[int],
+) -> tuple[bool, int, str]:
     last_values = [
         value
         for value in (last_attempt, last_fetch)
@@ -1008,9 +1012,21 @@ def _gdelt_rate_limit_cooldown_seconds(exc: GdeltRateLimitError) -> int:
     return max(0, int(settings.GDELT_RATE_LIMIT_COOLDOWN_SECONDS))
 
 
-def _gdelt_query_rate_limit_meta_key(query: str) -> str:
+def _gdelt_query_meta_key(prefix: str, query: str) -> str:
     digest = hashlib.sha1(str(query).encode("utf-8")).hexdigest()[:16]
-    return f"{_GDELT_QUERY_RATE_LIMIT_UNTIL_META_PREFIX}{digest}"
+    return f"{prefix}{digest}"
+
+
+def _gdelt_query_rate_limit_meta_key(query: str) -> str:
+    return _gdelt_query_meta_key(_GDELT_QUERY_RATE_LIMIT_UNTIL_META_PREFIX, query)
+
+
+def _gdelt_query_last_attempt_meta_key(query: str) -> str:
+    return _gdelt_query_meta_key(_GDELT_QUERY_LAST_ATTEMPT_META_PREFIX, query)
+
+
+def _gdelt_query_last_fetch_meta_key(query: str) -> str:
+    return _gdelt_query_meta_key(_GDELT_QUERY_LAST_FETCH_META_PREFIX, query)
 
 
 def _gdelt_query_rate_limit_until(query: str) -> Optional[int]:
@@ -1045,6 +1061,53 @@ def _clear_gdelt_query_rate_limit(query: str) -> None:
         conn.close()
 
 
+def _gdelt_query_throttled(query: str) -> tuple[bool, int, str]:
+    now = repository.now_seconds()
+    conn = db.connect()
+    try:
+        last_attempt = repository.get_meta_int(
+            conn,
+            _gdelt_query_last_attempt_meta_key(query),
+        )
+        last_fetch = repository.get_meta_int(
+            conn,
+            _gdelt_query_last_fetch_meta_key(query),
+        )
+    finally:
+        conn.close()
+    return _gdelt_local_interval_throttled(
+        now=now,
+        last_attempt=last_attempt,
+        last_fetch=last_fetch,
+    )
+
+
+def _record_gdelt_query_attempt(query: str) -> None:
+    conn = db.connect()
+    try:
+        with db.transaction(conn):
+            repository.set_meta(
+                conn,
+                _gdelt_query_last_attempt_meta_key(query),
+                str(repository.now_seconds()),
+            )
+    finally:
+        conn.close()
+
+
+def _record_gdelt_query_fetch(query: str, fetched_at: int) -> None:
+    conn = db.connect()
+    try:
+        with db.transaction(conn):
+            repository.set_meta(
+                conn,
+                _gdelt_query_last_fetch_meta_key(query),
+                str(fetched_at),
+            )
+    finally:
+        conn.close()
+
+
 def _gdelt_fetch_articles_once(
     client,
     *,
@@ -1075,6 +1138,18 @@ def _gdelt_fetch_articles_once(
                 }
             )
             continue
+        throttled, retry_after, throttle_reason = _gdelt_query_throttled(query)
+        if throttled:
+            query_results.append(
+                {
+                    "query": query,
+                    "skipped": True,
+                    "reason": throttle_reason,
+                    "retry_after_seconds": retry_after,
+                }
+            )
+            continue
+        _record_gdelt_query_attempt(query)
         try:
             fetched = client.fetch_articles(
                 query=query,
@@ -1134,6 +1209,7 @@ def _gdelt_fetch_articles_once(
                 seen_urls.add(url)
             articles.append(article)
             added_count += 1
+        _record_gdelt_query_fetch(query, repository.now_seconds())
         query_results.append(
             {
                 "query": query,
@@ -1290,6 +1366,20 @@ def run_gdelt_fetcher_once(
             summary["rate_limited"] = True
             summary["skipped"] = True
             summary["reason"] = "rate_limited"
+            retry_after_values = [
+                int(item["retry_after_seconds"])
+                for item in query_results
+                if isinstance(item, dict) and item.get("retry_after_seconds") is not None
+            ]
+            if retry_after_values:
+                summary["retry_after_seconds"] = min(retry_after_values)
+        elif query_results and all(
+            str(item.get("reason") or "") == "throttled"
+            for item in query_results
+            if isinstance(item, dict)
+        ):
+            summary["skipped"] = True
+            summary["reason"] = "throttled"
             retry_after_values = [
                 int(item["retry_after_seconds"])
                 for item in query_results
