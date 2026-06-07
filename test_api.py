@@ -12840,6 +12840,63 @@ class CodexFirstAiAgentTests(unittest.TestCase):
         finally:
             settings.CODEX_ENABLED = old_enabled  # type: ignore[assignment]
 
+    def test_codex_cli_auth_failure_cooldown_skips_next_process_launch(self):
+        from .codex_cli import CodexCliError, CodexCliJsonClient
+
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr=(
+                    "ERROR codex_api::endpoint::responses_websocket: "
+                    "failed to connect to websocket: HTTP error: 401 Unauthorized\n"
+                    "ERROR codex_login::auth::manager: Failed to refresh token: "
+                    "Your access token could not be refreshed because your refresh "
+                    "token was already used. Please log out and sign in again."
+                ),
+            )
+
+        old_enabled = settings.CODEX_ENABLED
+        old_cooldown = settings.CODEX_AUTH_FAILURE_COOLDOWN_SECONDS
+        try:
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            settings.CODEX_AUTH_FAILURE_COOLDOWN_SECONDS = 3600.0  # type: ignore[assignment]
+            CodexCliJsonClient._auth_failure_until = 0.0
+            CodexCliJsonClient._auth_failure_detail = ""
+            with patch(
+                "server.codex_cli.resolve_codex_executable",
+                return_value="resolved-codex",
+            ):
+                with patch("server.codex_cli.subprocess.run", side_effect=fake_run):
+                    client = CodexCliJsonClient()
+                    with self.assertRaisesRegex(CodexCliError, "401 Unauthorized"):
+                        client.complete_json(
+                            purpose="test",
+                            system_prompt="system",
+                            user_content="user",
+                            output_schema={"type": "object"},
+                        )
+                    with self.assertRaisesRegex(
+                        CodexCliError,
+                        "temporarily disabled after auth failure",
+                    ):
+                        client.complete_json(
+                            purpose="test",
+                            system_prompt="system",
+                            user_content="user",
+                            output_schema={"type": "object"},
+                        )
+        finally:
+            CodexCliJsonClient._auth_failure_until = 0.0
+            CodexCliJsonClient._auth_failure_detail = ""
+            settings.CODEX_ENABLED = old_enabled  # type: ignore[assignment]
+            settings.CODEX_AUTH_FAILURE_COOLDOWN_SECONDS = old_cooldown  # type: ignore[assignment]
+
+        self.assertEqual(len(calls), 1)
+
     def test_codex_cli_discovery_checks_common_current_user_locations(self):
         from .codex_cli import resolve_codex_executable
 

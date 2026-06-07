@@ -21,7 +21,10 @@ systemd service user's existing Codex login/subscription and runs with
 local files. The launcher gives Codex a writable service-user home via
 `HNREADER_CODEX_HOME` and checks `codex --version` as that user before writing
 the units. If Codex fails at request time, the server falls back to the existing
-OpenAI-compatible AI config path unchanged.
+OpenAI-compatible AI config path unchanged. Authentication failures such as a
+stale ChatGPT/Codex login are cooled down by
+`HNREADER_CODEX_AUTH_FAILURE_COOLDOWN_SECONDS` so one bad token does not cause
+every concurrent AI step to relaunch Codex.
 
 During the guided setup you will be asked for:
 
@@ -30,8 +33,8 @@ During the guided setup you will be asked for:
   user can start the local CLI.
 - Optional Codex overrides in `.env.local`: `HNREADER_CODEX_CLI_PATH`,
   `HNREADER_CODEX_HOME`, `HNREADER_CODEX_EXTRA_PATH`, `HNREADER_CODEX_MODEL`,
-  and `HNREADER_CODEX_ENABLED=false` when you intentionally want fallback-only
-  AI.
+  `HNREADER_CODEX_AUTH_FAILURE_COOLDOWN_SECONDS`, and
+  `HNREADER_CODEX_ENABLED=false` when you intentionally want fallback-only AI.
 - WeChat `pushSync` HTTP trigger URL and `PUSH_SECRET`.
 - Optional admin alert email settings.
 - Optional UFW setup. It allows only OpenSSH; this server exposes no HTTP port.

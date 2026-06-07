@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
@@ -18,6 +19,13 @@ class CodexCliError(RuntimeError):
     """Raised when the local Codex CLI path cannot produce valid JSON."""
 
 
+_CODEX_AUTH_FAILURE_MARKERS = (
+    "401 Unauthorized",
+    "Failed to refresh token",
+    "Please log out and sign in again",
+    "access token could not be refreshed",
+    "refresh token was already used",
+)
 _CODEX_REASONING_EFFORTS = frozenset(("minimal", "low", "medium", "high", "xhigh"))
 
 
@@ -31,6 +39,10 @@ def _normalize_reasoning_effort(value: Optional[str]) -> Optional[str]:
             f"invalid Codex reasoning effort {value!r}; expected one of: {allowed}"
         )
     return effort
+
+
+def _looks_like_auth_failure(detail: str) -> bool:
+    return any(marker in str(detail or "") for marker in _CODEX_AUTH_FAILURE_MARKERS)
 
 
 def _is_executable_file(path: Path) -> bool:
@@ -481,6 +493,10 @@ def merge_usage_summaries(*summaries: Mapping[str, Any]) -> Dict[str, Any]:
 class CodexCliJsonClient:
     """Run ``codex exec`` as a local, read-only structured-output engine."""
 
+    _auth_failure_lock = Lock()
+    _auth_failure_until = 0.0
+    _auth_failure_detail = ""
+
     def __init__(
         self,
         *,
@@ -499,6 +515,35 @@ class CodexCliJsonClient:
         )
         self._usage_lock = Lock()
         self._usage_records: list[Dict[str, Any]] = []
+
+    @classmethod
+    def _auth_failure_cooldown_remaining(cls) -> float:
+        with cls._auth_failure_lock:
+            return max(0.0, cls._auth_failure_until - time.monotonic())
+
+    @classmethod
+    def _auth_failure_error(cls) -> Optional[CodexCliError]:
+        with cls._auth_failure_lock:
+            remaining = cls._auth_failure_until - time.monotonic()
+            detail = cls._auth_failure_detail
+        if remaining <= 0:
+            return None
+        return CodexCliError(
+            "Codex CLI temporarily disabled after auth failure; "
+            f"retrying in {remaining:.0f}s: {detail}"
+        )
+
+    @classmethod
+    def _mark_auth_failure(cls, detail: str) -> None:
+        cooldown = max(0.0, float(settings.CODEX_AUTH_FAILURE_COOLDOWN_SECONDS))
+        if cooldown <= 0:
+            return
+        clipped = str(detail or "").strip()
+        if len(clipped) > 500:
+            clipped = clipped[-500:]
+        with cls._auth_failure_lock:
+            cls._auth_failure_until = time.monotonic() + cooldown
+            cls._auth_failure_detail = clipped
 
     def usage_checkpoint(self) -> int:
         with self._usage_lock:
@@ -540,6 +585,9 @@ class CodexCliJsonClient:
     ) -> Dict[str, Any]:
         if not settings.CODEX_ENABLED:
             raise CodexCliError("Codex CLI is disabled")
+        auth_error = self._auth_failure_error()
+        if auth_error is not None:
+            raise auth_error
         effort = _normalize_reasoning_effort(reasoning_effort)
         executable = resolve_codex_executable(
             self.executable,
@@ -615,6 +663,8 @@ class CodexCliJsonClient:
                 detail = (completed.stderr or completed.stdout or "").strip()
                 if len(detail) > 2000:
                     detail = detail[-2000:]
+                if _looks_like_auth_failure(detail):
+                    self._mark_auth_failure(detail)
                 raise CodexCliError(
                     f"Codex CLI exited with {completed.returncode}: {detail}"
                 )
