@@ -496,6 +496,7 @@ class CodexCliJsonClient:
     _auth_failure_lock = Lock()
     _auth_failure_until = 0.0
     _auth_failure_detail = ""
+    _exec_lock = Lock()
 
     def __init__(
         self,
@@ -589,6 +590,27 @@ class CodexCliJsonClient:
         if auth_error is not None:
             raise auth_error
         effort = _normalize_reasoning_effort(reasoning_effort)
+        with self._exec_lock:
+            auth_error = self._auth_failure_error()
+            if auth_error is not None:
+                raise auth_error
+            return self._complete_json_locked(
+                purpose=purpose,
+                system_prompt=system_prompt,
+                user_content=user_content,
+                output_schema=output_schema,
+                reasoning_effort=effort,
+            )
+
+    def _complete_json_locked(
+        self,
+        *,
+        purpose: str,
+        system_prompt: str,
+        user_content: str,
+        output_schema: Mapping[str, Any],
+        reasoning_effort: Optional[str],
+    ) -> Dict[str, Any]:
         executable = resolve_codex_executable(
             self.executable,
             extra_path=self.extra_path,
@@ -625,8 +647,13 @@ class CodexCliJsonClient:
                 "-c",
                 "features.hooks=false",
             ]
-            if effort:
-                args.extend(["-c", f"model_reasoning_effort={json.dumps(effort)}"])
+            if reasoning_effort:
+                args.extend(
+                    [
+                        "-c",
+                        f"model_reasoning_effort={json.dumps(reasoning_effort)}",
+                    ]
+                )
             if settings.CODEX_IGNORE_USER_CONFIG:
                 args.append("--ignore-user-config")
             if self.model:

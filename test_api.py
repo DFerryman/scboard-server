@@ -12897,6 +12897,74 @@ class CodexFirstAiAgentTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
 
+    def test_codex_cli_invocations_are_serialized(self):
+        from .codex_cli import CodexCliJsonClient
+
+        entered = Event()
+        release = Event()
+        calls = []
+        concurrent_entries = []
+        in_run = 0
+        run_lock = Lock()
+
+        def fake_run(args, **kwargs):
+            nonlocal in_run
+            with run_lock:
+                in_run += 1
+                concurrent_entries.append(in_run)
+            calls.append((args, kwargs))
+            entered.set()
+            release.wait(timeout=5)
+            with run_lock:
+                in_run -= 1
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    '{"type":"item.completed","item":{"type":"agent_message",'
+                    '"text":"{\\"ok\\":true}"}}\n'
+                ),
+                stderr="",
+            )
+
+        old_enabled = settings.CODEX_ENABLED
+        try:
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            CodexCliJsonClient._auth_failure_until = 0.0
+            CodexCliJsonClient._auth_failure_detail = ""
+            client = CodexCliJsonClient()
+
+            def run_call():
+                return client.complete_json(
+                    purpose="test",
+                    system_prompt="system",
+                    user_content="user",
+                    output_schema={"type": "object"},
+                )
+
+            with patch(
+                "server.codex_cli.resolve_codex_executable",
+                return_value="resolved-codex",
+            ):
+                with patch("server.codex_cli.subprocess.run", side_effect=fake_run):
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        first = pool.submit(run_call)
+                        self.assertTrue(entered.wait(timeout=5))
+                        second = pool.submit(run_call)
+                        time.sleep(0.05)
+                        self.assertEqual(len(calls), 1)
+                        release.set()
+                        self.assertEqual(first.result(timeout=5), {"ok": True})
+                        self.assertEqual(second.result(timeout=5), {"ok": True})
+        finally:
+            release.set()
+            CodexCliJsonClient._auth_failure_until = 0.0
+            CodexCliJsonClient._auth_failure_detail = ""
+            settings.CODEX_ENABLED = old_enabled  # type: ignore[assignment]
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(concurrent_entries)
+        self.assertLessEqual(max(concurrent_entries), 1)
+
     def test_codex_cli_discovery_checks_common_current_user_locations(self):
         from .codex_cli import resolve_codex_executable
 

@@ -24,7 +24,10 @@ the units. If Codex fails at request time, the server falls back to the existing
 OpenAI-compatible AI config path unchanged. Authentication failures such as a
 stale ChatGPT/Codex login are cooled down by
 `HNREADER_CODEX_AUTH_FAILURE_COOLDOWN_SECONDS` so one bad token does not cause
-every concurrent AI step to relaunch Codex.
+every concurrent AI step to relaunch Codex. The server also serializes Codex
+CLI subprocesses because Codex stores machine-local user credentials and state
+under `$CODEX_HOME`; concurrent service jobs should not race over the same
+login cache.
 
 During the guided setup you will be asked for:
 
