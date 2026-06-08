@@ -352,6 +352,16 @@ ENRICH_BATCH_SIZE = _require_int_range(
     min_value=1,
     max_value=100,
 )
+AI_QUALITY_REVIEW_BATCH_SIZE = _require_int_range(
+    "HNREADER_AI_QUALITY_REVIEW_BATCH_SIZE",
+    _env_int(
+        "HNREADER_AI_QUALITY_REVIEW_BATCH_SIZE",
+        4,
+        fallback="HACKERMINI_AI_QUALITY_REVIEW_BATCH_SIZE",
+    ),
+    min_value=1,
+    max_value=20,
+)
 ENRICH_WORKER_COUNT = _require_int_range(
     "HNREADER_ENRICH_WORKER_COUNT",
     _env_int(

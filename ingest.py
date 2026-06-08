@@ -364,6 +364,20 @@ def _apply_ai_output_quality_review(
             "AI output quality review failed; suspicious result was not "
             f"approved: {type(exc).__name__}: {exc}"
         )
+    return _apply_ai_output_quality_decision(
+        story_row,
+        processed,
+        issues,
+        decision,
+    )
+
+
+def _apply_ai_output_quality_decision(
+    story_row: Mapping[str, Any],
+    processed: Mapping[str, Any],
+    issues: Sequence[str],
+    decision: Any,
+) -> tuple[Optional[Dict[str, Any]], str]:
     if not isinstance(decision, AbcMapping):
         return None, (
             "AI output quality review failed; suspicious result was not "
@@ -405,6 +419,144 @@ def _apply_ai_output_quality_review(
         + "; heuristic findings: "
         + "; ".join(issues)
     )
+
+
+def _apply_single_quality_review_request(
+    request: Mapping[str, Any],
+    quality_reviewer,
+) -> tuple[Optional[Dict[str, Any]], str]:
+    return _apply_ai_output_quality_review(
+        request["story_row"],
+        request["processed"],
+        quality_reviewer=quality_reviewer,
+    )
+
+
+def _batch_quality_review_decisions_by_id(
+    decisions: Any,
+    requests: Sequence[Mapping[str, Any]],
+) -> Dict[int, Mapping[str, Any]]:
+    if not isinstance(decisions, AbcSequence) or isinstance(decisions, (str, bytes)):
+        raise ValueError(
+            f"batch reviewer returned {type(decisions).__name__}, expected sequence"
+        )
+    expected = {int(request["story_row"]["id"]) for request in requests}
+    out: Dict[int, Mapping[str, Any]] = {}
+    for decision in decisions:
+        if not isinstance(decision, AbcMapping):
+            raise ValueError(
+                f"batch reviewer returned {type(decision).__name__} item"
+            )
+        try:
+            sid = int(decision.get("id"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("batch reviewer returned item without integer id") from exc
+        if sid not in expected:
+            raise ValueError(f"batch reviewer returned unexpected story id {sid}")
+        if sid in out:
+            raise ValueError(f"batch reviewer returned duplicate story id {sid}")
+        out[sid] = decision
+    missing = sorted(expected - set(out))
+    if missing:
+        raise ValueError(f"batch reviewer omitted story ids {missing}")
+    return out
+
+
+def _apply_quality_review_request_batch(
+    requests: Sequence[Mapping[str, Any]],
+    quality_reviewer,
+) -> tuple[Dict[int, Dict[str, Any]], Dict[int, str]]:
+    reviewed: Dict[int, Dict[str, Any]] = {}
+    errors: Dict[int, str] = {}
+    if not requests:
+        return reviewed, errors
+
+    batch_method = getattr(quality_reviewer, "review_story_outputs_batch", None)
+    use_batch = callable(batch_method) and len(requests) > 1
+    if not use_batch:
+        for request in requests:
+            sid = int(request["story_row"]["id"])
+            processed, error = _apply_single_quality_review_request(
+                request,
+                quality_reviewer,
+            )
+            if error:
+                errors[sid] = error
+            else:
+                reviewed[sid] = processed or dict(request["processed"])
+        return reviewed, errors
+
+    try:
+        decisions = batch_method(requests)
+        decisions_by_id = _batch_quality_review_decisions_by_id(decisions, requests)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "AI output quality batch review failed for %d stories; falling back to single reviews: %s: %s",
+            len(requests),
+            type(exc).__name__,
+            exc,
+        )
+        for request in requests:
+            sid = int(request["story_row"]["id"])
+            processed, error = _apply_single_quality_review_request(
+                request,
+                quality_reviewer,
+            )
+            if error:
+                errors[sid] = error
+            else:
+                reviewed[sid] = processed or dict(request["processed"])
+        return reviewed, errors
+
+    for request in requests:
+        story_row = request["story_row"]
+        sid = int(story_row["id"])
+        processed, error = _apply_ai_output_quality_decision(
+            story_row,
+            request["processed"],
+            request["issues"],
+            decisions_by_id[sid],
+        )
+        if error:
+            errors[sid] = error
+        else:
+            reviewed[sid] = processed or dict(request["processed"])
+    return reviewed, errors
+
+
+def _apply_ai_output_quality_reviews(
+    items: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
+    *,
+    quality_reviewer,
+) -> tuple[Dict[int, Dict[str, Any]], Dict[int, str]]:
+    reviewed: Dict[int, Dict[str, Any]] = {}
+    errors: Dict[int, str] = {}
+    review_requests: List[Dict[str, Any]] = []
+    for item, processed in items:
+        story_row = item["story"]
+        sid = int(story_row["id"])
+        issues = _ai_output_quality_issues(story_row, processed)
+        if not issues:
+            reviewed[sid] = dict(processed)
+            continue
+        review_requests.append(
+            {
+                "story_row": story_row,
+                "processed": processed,
+                "issues": issues,
+            }
+        )
+
+    batch_size = max(1, int(settings.AI_QUALITY_REVIEW_BATCH_SIZE))
+    for index in range(0, len(review_requests), batch_size):
+        batch = review_requests[index : index + batch_size]
+        batch_reviewed, batch_errors = _apply_quality_review_request_batch(
+            batch,
+            quality_reviewer,
+        )
+        reviewed.update(batch_reviewed)
+        errors.update(batch_errors)
+    return reviewed, errors
 
 
 # ---------- Fetcher ----------
@@ -2304,18 +2456,22 @@ def _process_work_items(
     resolved_results: Dict[int, Dict[str, Any]] = {}
     missing_items: List[Dict[str, Any]] = []
     quality_failed_results: List[tuple[Dict[str, Any], str]] = []
+    quality_review_items: List[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
     for item in work_items:
         sid = int(item["story"]["id"])
         processed = processed_by_id.get(sid)
         if processed is None:
             missing_items.append(item)
             continue
+        quality_review_items.append((item, processed))
 
-        reviewed, quality_error = _apply_ai_output_quality_review(
-            item["story"],
-            processed,
-            quality_reviewer=quality_reviewer,
-        )
+    reviewed_by_id, quality_errors = _apply_ai_output_quality_reviews(
+        quality_review_items,
+        quality_reviewer=quality_reviewer,
+    )
+    for item, processed in quality_review_items:
+        sid = int(item["story"]["id"])
+        quality_error = quality_errors.get(sid, "")
         if quality_error:
             log.warning(
                 "ai batch item %d quality review failed closed without single retry: %s",
@@ -2325,7 +2481,19 @@ def _process_work_items(
             quality_failed_results.append((item, quality_error))
         else:
             resolved_items.append(item)
-            resolved_results[sid] = reviewed or processed
+            resolved_results[sid] = reviewed_by_id.get(sid) or dict(processed)
+
+    for item, _processed in quality_review_items:
+        sid = int(item["story"]["id"])
+        if sid in reviewed_by_id or sid in quality_errors:
+            continue
+        quality_error = "AI output quality review returned no result"
+        log.warning(
+            "ai batch item %d quality review failed closed without single retry: %s",
+            sid,
+            quality_error,
+        )
+        quality_failed_results.append((item, quality_error))
 
     if resolved_items:
         with db.transaction(conn):

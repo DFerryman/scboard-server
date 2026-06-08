@@ -9249,6 +9249,147 @@ class EnricherBehavior(_SqliteCase):
         self.assertEqual([r["title_zh"] for r in rows], ["唐纳德·克努斯《字母 S》（1980）", "干净故事"])
         self.assertEqual({r["enrich_status"] for r in rows}, {"done"})
 
+    def test_batch_quality_review_groups_suspicious_items(self):
+        ids = [713, 714, 715]
+        rankings = {"top": ids, "new": [], "best": [], "ask": [], "show": [], "job": []}
+        items = {
+            713: {
+                "id": 713,
+                "type": "story",
+                "title": "The Letter S, by Donald Knuth (1980) [pdf]",
+                "url": "https://example.com/knuth.pdf",
+                "by": "x",
+                "score": 1,
+                "descendants": 0,
+                "time": 1700000000,
+            },
+            714: {
+                "id": 714,
+                "type": "story",
+                "title": "A small database note",
+                "url": "https://example.com/db",
+                "by": "x",
+                "score": 1,
+                "descendants": 0,
+                "time": 1700000000,
+            },
+            715: {
+                "id": 715,
+                "type": "story",
+                "title": "Clean Story",
+                "url": "https://example.com/clean",
+                "by": "x",
+                "score": 1,
+                "descendants": 0,
+                "time": 1700000000,
+            },
+        }
+        run_fetcher_once(client=_FakeHn(rankings, items))
+
+        class BatchAgent:
+            supports_batch_enrich = True
+
+            def process_stories_batch(self, batch_items):
+                return {
+                    713: {
+                        "titleZh": "唐纳德·克努uth《字母 S》（1980）",
+                        "topic": "science-culture",
+                        "aiSummary": "克努uth解释字母 S 的数学构造。",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    },
+                    714: {
+                        "titleZh": "一篇数据库小笔记",
+                        "topic": "database",
+                        "aiSummary": "由于输入未提供正文或评论，仅凭标题可判断这可能是一篇数据库相关笔记。",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    },
+                    715: {
+                        "titleZh": "干净故事",
+                        "topic": "web",
+                        "aiSummary": "干净摘要",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    },
+                }
+
+            def process_story(self, *_):
+                raise AssertionError("batch quality review should not retry singles")
+
+            def write_digest_intro(self, *_):
+                return ""
+
+        class BatchRepairingReviewer:
+            def __init__(self):
+                self.batch_calls = []
+                self.single_calls = []
+
+            def review_story_outputs_batch(self, items):
+                self.batch_calls.append(items)
+                reviews = []
+                for item in items:
+                    sid = int(item["story_row"]["id"])
+                    repaired = dict(item["processed"])
+                    if sid == 713:
+                        repaired["titleZh"] = "唐纳德·克努斯《字母 S》（1980）"
+                        repaired["aiSummary"] = "克努斯解释字母 S 的数学构造。"
+                    elif sid == 714:
+                        repaired["aiSummary"] = "这篇笔记围绕数据库主题展开，适合关注数据系统实现细节的读者。"
+                    reviews.append(
+                        {
+                            "id": sid,
+                            "approved": True,
+                            "action": "repair",
+                            "reason": f"repaired {sid}",
+                            "repaired": repaired,
+                        }
+                    )
+                return reviews
+
+            def review_story_output(self, story_row, processed, issues):
+                self.single_calls.append((story_row, processed, issues))
+                raise AssertionError("single quality review should not be used")
+
+        old_workers = settings.ENRICH_WORKER_COUNT
+        old_batch = settings.ENRICH_BATCH_SIZE
+        old_quality_batch = settings.AI_QUALITY_REVIEW_BATCH_SIZE
+        try:
+            settings.ENRICH_WORKER_COUNT = 1  # type: ignore[assignment]
+            settings.ENRICH_BATCH_SIZE = 3  # type: ignore[assignment]
+            settings.AI_QUALITY_REVIEW_BATCH_SIZE = 4  # type: ignore[assignment]
+            reviewer = BatchRepairingReviewer()
+            summary = run_enricher_once(
+                client=_FakeHn({}, {}),
+                ai_agent=BatchAgent(),
+                quality_reviewer=reviewer,
+            )
+        finally:
+            settings.ENRICH_WORKER_COUNT = old_workers  # type: ignore[assignment]
+            settings.ENRICH_BATCH_SIZE = old_batch  # type: ignore[assignment]
+            settings.AI_QUALITY_REVIEW_BATCH_SIZE = old_quality_batch  # type: ignore[assignment]
+
+        self.assertEqual(summary["done"], 3)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(len(reviewer.batch_calls), 1)
+        self.assertEqual([int(item["story_row"]["id"]) for item in reviewer.batch_calls[0]], [713, 714])
+        self.assertEqual(reviewer.single_calls, [])
+
+        conn = db.connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, title_zh, ai_summary, enrich_status FROM stories ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual([r["enrich_status"] for r in rows], ["done", "done", "done"])
+        self.assertEqual(rows[0]["title_zh"], "唐纳德·克努斯《字母 S》（1980）")
+        self.assertEqual(rows[1]["ai_summary"], "这篇笔记围绕数据库主题展开，适合关注数据系统实现细节的读者。")
+        self.assertEqual(rows[2]["title_zh"], "干净故事")
+
     def test_round_quality_repair_completes_without_enrich_alert(self):
         rankings = {"top": [721], "new": [], "best": [], "ask": [], "show": [], "job": []}
         items = {
@@ -12369,6 +12510,71 @@ class CodexFirstAiAgentTests(unittest.TestCase):
             ai_agent_module._AI_QUALITY_REVIEW_OUTPUT_SCHEMA,
         )
 
+    def test_quality_reviewer_batches_codex_reviews(self):
+        class GoodCodex:
+            def __init__(self):
+                self.calls = []
+
+            def complete_json(self, **kwargs):
+                self.calls.append(kwargs)
+                payload = json.loads(kwargs["user_content"])
+                return {
+                    "reviews": [
+                        {
+                            "id": int(item["source"]["id"]),
+                            "approved": True,
+                            "action": "approve",
+                            "reason": "false positive",
+                            "repaired": item["generated"],
+                        }
+                        for item in payload["items"]
+                    ],
+                }
+
+        codex = GoodCodex()
+        old_codex_enabled = settings.CODEX_ENABLED
+        try:
+            settings.CODEX_ENABLED = True  # type: ignore[assignment]
+            reviewer = ai_agent_module.AiOutputQualityReviewer(
+                codex_client=codex,  # type: ignore[arg-type]
+            )
+            out = reviewer.review_story_outputs_batch(
+                [
+                    {
+                        "story_row": {**self._story_row(), "id": 101},
+                        "processed": {
+                            "titleZh": "中文标题一",
+                            "aiSummary": "摘要一",
+                            "discussionThemes": [],
+                            "insights": [],
+                            "terms": [],
+                        },
+                        "issues": ["heuristic issue"],
+                    },
+                    {
+                        "story_row": {**self._story_row(), "id": 102},
+                        "processed": {
+                            "titleZh": "中文标题二",
+                            "aiSummary": "摘要二",
+                            "discussionThemes": [],
+                            "insights": [],
+                            "terms": [],
+                        },
+                        "issues": ["heuristic issue"],
+                    },
+                ]
+            )
+        finally:
+            settings.CODEX_ENABLED = old_codex_enabled  # type: ignore[assignment]
+
+        self.assertEqual([item["id"] for item in out], [101, 102])
+        self.assertEqual(len(codex.calls), 1)
+        self.assertEqual(codex.calls[0]["purpose"], "quality-review-batch")
+        self.assertEqual(
+            codex.calls[0]["output_schema"],
+            ai_agent_module._AI_QUALITY_REVIEW_BATCH_OUTPUT_SCHEMA,
+        )
+
     def test_quality_reviewer_falls_back_to_ai_provider_after_codex_failure(self):
         class FailingCodex:
             def __init__(self):
@@ -12470,6 +12676,7 @@ class CodexFirstAiAgentTests(unittest.TestCase):
         assert_strict_objects(ai_agent_module._DIGEST_SELECTION_OUTPUT_SCHEMA)
         assert_strict_objects(ai_agent_module._DIGEST_INTRO_OUTPUT_SCHEMA)
         assert_strict_objects(ai_agent_module._AI_QUALITY_REVIEW_OUTPUT_SCHEMA)
+        assert_strict_objects(ai_agent_module._AI_QUALITY_REVIEW_BATCH_OUTPUT_SCHEMA)
 
     def test_codex_first_usage_summary_accepts_purpose_filter(self):
         class UsageClient:

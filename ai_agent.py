@@ -242,6 +242,29 @@ _AI_QUALITY_REVIEW_OUTPUT_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
 }
 
+_AI_QUALITY_REVIEW_BATCH_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "reviews": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    **_AI_QUALITY_REVIEW_OUTPUT_SCHEMA["properties"],
+                },
+                "required": [
+                    "id",
+                    *_AI_QUALITY_REVIEW_OUTPUT_SCHEMA["required"],
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["reviews"],
+    "additionalProperties": False,
+}
+
 _AI_QUALITY_REVIEW_SYSTEM_PROMPT = (
     "You are a strict quality gate and repair editor for a Chinese-language "
     "technology and global news reader. Review generated reader-facing Chinese editorial "
@@ -266,6 +289,12 @@ _AI_QUALITY_REVIEW_SYSTEM_PROMPT = (
     "reject, approved false, and copy the generated reader-facing fields into "
     "repaired unchanged. Return one strict JSON object "
     "matching the schema."
+)
+_AI_QUALITY_REVIEW_BATCH_SYSTEM_PROMPT = (
+    _AI_QUALITY_REVIEW_SYSTEM_PROMPT
+    + " For batch input, review every item independently and return exactly one "
+    "review for each input item in reviews, preserving the source id. Do not omit "
+    "items, merge items, or let one item's repair affect another item."
 )
 _AI_QUALITY_REVIEW_OUTPUT_TOKENS = 4000
 _AI_QUALITY_REVIEW_REASONING_EFFORT = "medium"
@@ -2027,6 +2056,30 @@ def validate_ai_quality_review(raw: Any) -> Dict[str, Any]:
     }
 
 
+def validate_ai_quality_review_batch(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        raise ValueError("AI quality review batch must be a JSON object")
+    reviews_raw = raw.get("reviews")
+    if not isinstance(reviews_raw, list):
+        raise ValueError("AI quality review batch requires reviews array")
+    out: List[Dict[str, Any]] = []
+    seen: set[int] = set()
+    for item in reviews_raw:
+        if not isinstance(item, dict):
+            raise ValueError("AI quality review batch items must be objects")
+        try:
+            story_id = int(item.get("id"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("AI quality review batch item missing integer id") from exc
+        if story_id in seen:
+            raise ValueError(f"AI quality review batch duplicate id {story_id}")
+        seen.add(story_id)
+        reviewed = validate_ai_quality_review(item)
+        reviewed["id"] = story_id
+        out.append(reviewed)
+    return out
+
+
 def validate_gdelt_safety_review(
     raw: Any,
     *,
@@ -3420,12 +3473,12 @@ class AiOutputQualityReviewer:
         self.codex_client = codex_client or CodexCliJsonClient()
         self.fallback_agent = fallback_agent
 
-    def _payload(
+    def _payload_item(
         self,
         story_row: Mapping[str, Any],
         processed: Mapping[str, Any],
         issues: Sequence[str],
-    ) -> str:
+    ) -> Dict[str, Any]:
         source = {
             "id": _mapping_get(story_row, "id", None),
             "kind": _mapping_get(story_row, "kind", "") or "story",
@@ -3440,16 +3493,47 @@ class AiOutputQualityReviewer:
             "insights": processed.get("insights") or [],
             "terms": processed.get("terms") or [],
         }
+        return {
+            "source": source,
+            "generated": generated,
+            "heuristicIssues": list(issues),
+        }
+
+    def _payload(
+        self,
+        story_row: Mapping[str, Any],
+        processed: Mapping[str, Any],
+        issues: Sequence[str],
+    ) -> str:
+        return json.dumps(
+            self._payload_item(story_row, processed, issues),
+            ensure_ascii=False,
+        )
+
+    def _batch_payload(self, items: Sequence[Mapping[str, Any]]) -> str:
         return json.dumps(
             {
-                "source": source,
-                "generated": generated,
-                "heuristicIssues": list(issues),
+                "items": [
+                    self._payload_item(
+                        item["story_row"],
+                        item["processed"],
+                        item["issues"],
+                    )
+                    for item in items
+                ]
             },
             ensure_ascii=False,
         )
 
-    def _complete_with_fallback(self, user_content: str) -> Dict[str, Any]:
+    def _complete_with_fallback(
+        self,
+        user_content: str,
+        *,
+        purpose: str,
+        system_prompt: str,
+        output_schema: Mapping[str, Any],
+        max_tokens: int,
+    ) -> Dict[str, Any]:
         if self.fallback_agent is None:
             raise AiOutputQualityReviewError(
                 "Codex CLI quality review failed and no AI provider fallback is configured"
@@ -3460,11 +3544,11 @@ class AiOutputQualityReviewer:
                 "AI provider fallback cannot perform JSON quality review"
             )
         return method(
-            purpose="quality-review",
-            system_prompt=_AI_QUALITY_REVIEW_SYSTEM_PROMPT,
+            purpose=purpose,
+            system_prompt=system_prompt,
             user_content=user_content,
-            output_schema=_AI_QUALITY_REVIEW_OUTPUT_SCHEMA,
-            max_tokens=_AI_QUALITY_REVIEW_OUTPUT_TOKENS,
+            output_schema=output_schema,
+            max_tokens=max_tokens,
             temperature=0.1,
         )
 
@@ -3494,7 +3578,13 @@ class AiOutputQualityReviewer:
                     exc,
                 )
         try:
-            raw = self._complete_with_fallback(user_content)
+            raw = self._complete_with_fallback(
+                user_content,
+                purpose="quality-review",
+                system_prompt=_AI_QUALITY_REVIEW_SYSTEM_PROMPT,
+                output_schema=_AI_QUALITY_REVIEW_OUTPUT_SCHEMA,
+                max_tokens=_AI_QUALITY_REVIEW_OUTPUT_TOKENS,
+            )
             return validate_ai_quality_review(raw)
         except Exception as exc:  # noqa: BLE001
             if codex_error is not None:
@@ -3505,6 +3595,52 @@ class AiOutputQualityReviewer:
                 ) from exc
             raise AiOutputQualityReviewError(
                 f"AI output quality review failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    def review_story_outputs_batch(
+        self,
+        items: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not items:
+            return []
+        user_content = self._batch_payload(items)
+        output_tokens = _AI_QUALITY_REVIEW_OUTPUT_TOKENS * max(1, len(items))
+        codex_error: Optional[Exception] = None
+        if settings.CODEX_ENABLED:
+            try:
+                raw = self.codex_client.complete_json(
+                    purpose="quality-review-batch",
+                    system_prompt=_AI_QUALITY_REVIEW_BATCH_SYSTEM_PROMPT,
+                    user_content=user_content,
+                    output_schema=_AI_QUALITY_REVIEW_BATCH_OUTPUT_SCHEMA,
+                    reasoning_effort=_AI_QUALITY_REVIEW_REASONING_EFFORT,
+                )
+                return validate_ai_quality_review_batch(raw)
+            except (CodexCliError, subprocess.SubprocessError, OSError, ValueError) as exc:
+                codex_error = exc
+                log.warning(
+                    "Codex CLI batch quality review failed; trying AI provider fallback: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+        try:
+            raw = self._complete_with_fallback(
+                user_content,
+                purpose="quality-review-batch",
+                system_prompt=_AI_QUALITY_REVIEW_BATCH_SYSTEM_PROMPT,
+                output_schema=_AI_QUALITY_REVIEW_BATCH_OUTPUT_SCHEMA,
+                max_tokens=output_tokens,
+            )
+            return validate_ai_quality_review_batch(raw)
+        except Exception as exc:  # noqa: BLE001
+            if codex_error is not None:
+                raise AiOutputQualityReviewError(
+                    "AI output quality batch review failed with Codex CLI and "
+                    f"provider fallback: codex={type(codex_error).__name__}: "
+                    f"{codex_error}; fallback={type(exc).__name__}: {exc}"
+                ) from exc
+            raise AiOutputQualityReviewError(
+                f"AI output quality batch review failed: {type(exc).__name__}: {exc}"
             ) from exc
 
 
@@ -3830,6 +3966,7 @@ __all__ = [
     "GdeltArticleSafetyReviewer",
     "keyword_intake_safety_decisions",
     "validate_ai_quality_review",
+    "validate_ai_quality_review_batch",
     "validate_gdelt_safety_review",
     "validate_ai_output",
     "validate_batch_ai_output",
