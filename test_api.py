@@ -12866,6 +12866,162 @@ class CodexFirstAiAgentTests(unittest.TestCase):
             codex.calls[0]["system_prompt"],
         )
 
+    def test_codex_first_batch_size_ignores_fallback_provider_cap(self):
+        class CappedFallback(FallbackAiAgent):
+            def __init__(self):
+                self.recommendation_calls = []
+
+            def recommended_enrich_batch_size(self, requested):
+                self.recommendation_calls.append(requested)
+                return 2
+
+        agent = ai_agent_module.CodexFirstAiAgent(
+            codex_client=SimpleNamespace(model="codex-test", timeout=1.0),
+            fallback_agent=CappedFallback(),
+        )
+
+        self.assertEqual(agent.recommended_enrich_batch_size(8), 8)
+        self.assertEqual(agent.fallback_agent.recommendation_calls, [])
+
+    def test_codex_batch_failure_splits_fallback_to_provider_cap(self):
+        class FailingCodex:
+            model = "codex-test"
+            timeout = 1.0
+
+            def complete_json(self, **kwargs):
+                raise ai_agent_module.CodexCliError("codex down")
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint, *, purposes=None):
+                return checkpoint, {}
+
+        class CappedFallback(FallbackAiAgent):
+            def __init__(self):
+                self.recommendation_calls = []
+                self.batch_ids = []
+
+            def recommended_enrich_batch_size(self, requested):
+                self.recommendation_calls.append(requested)
+                return 2
+
+            def process_stories_batch(self, items, topic_catalog=None):
+                ids = [int(item["story"]["id"]) for item in items]
+                self.batch_ids.append(ids)
+                return {
+                    sid: {
+                        "titleZh": f"fallback title {sid}",
+                        "topic": "web",
+                        "topicName": "综合技术",
+                        "aiSummary": f"fallback summary {sid}",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    }
+                    for sid in ids
+                }
+
+        items = [
+            {
+                "story": {
+                    **self._story_row(),
+                    "id": sid,
+                    "title_en": f"Story {sid}",
+                },
+                "comments": [],
+            }
+            for sid in (101, 102, 103, 104, 105, 106, 107, 108)
+        ]
+        fallback = CappedFallback()
+        agent = ai_agent_module.CodexFirstAiAgent(
+            codex_client=FailingCodex(),  # type: ignore[arg-type]
+            fallback_agent=fallback,
+        )
+
+        out = agent.process_stories_batch(items, [])
+
+        self.assertEqual(fallback.recommendation_calls, [8])
+        self.assertEqual(
+            fallback.batch_ids,
+            [[101, 102], [103, 104], [105, 106], [107, 108]],
+        )
+        self.assertEqual(sorted(out), [101, 102, 103, 104, 105, 106, 107, 108])
+        self.assertEqual(out[108]["titleZh"], "fallback title 108")
+
+    def test_codex_batch_missing_id_falls_back_instead_of_accepting_partial(self):
+        class PartialCodex:
+            model = "codex-test"
+            timeout = 1.0
+
+            def complete_json(self, **kwargs):
+                return {
+                    "results": [
+                        {
+                            "id": 101,
+                            "titleZh": "标题 A",
+                            "topicId": "web",
+                            "topicName": "综合技术",
+                            "aiSummary": "摘要 A",
+                            "discussionThemes": [],
+                            "insights": [],
+                            "terms": [],
+                        }
+                    ]
+                }
+
+            def usage_checkpoint(self):
+                return 0
+
+            def usage_summary_since(self, checkpoint, *, purposes=None):
+                return checkpoint, {}
+
+        class CappedFallback(FallbackAiAgent):
+            def __init__(self):
+                self.batch_ids = []
+
+            def recommended_enrich_batch_size(self, requested):
+                return 2
+
+            def process_stories_batch(self, items, topic_catalog=None):
+                ids = [int(item["story"]["id"]) for item in items]
+                self.batch_ids.append(ids)
+                return {
+                    sid: {
+                        "titleZh": f"fallback title {sid}",
+                        "topic": "web",
+                        "topicName": "综合技术",
+                        "aiSummary": f"fallback summary {sid}",
+                        "discussionThemes": [],
+                        "insights": [],
+                        "terms": [],
+                    }
+                    for sid in ids
+                }
+
+        items = [
+            {
+                "story": {
+                    **self._story_row(),
+                    "id": sid,
+                    "title_en": f"Story {sid}",
+                },
+                "comments": [],
+            }
+            for sid in (101, 102, 103, 104)
+        ]
+        fallback = CappedFallback()
+        agent = ai_agent_module.CodexFirstAiAgent(
+            codex_client=PartialCodex(),  # type: ignore[arg-type]
+            fallback_agent=fallback,
+        )
+
+        out = agent.process_stories_batch(items, [])
+
+        self.assertEqual(fallback.batch_ids, [[101, 102], [103, 104]])
+        self.assertEqual(sorted(out), [101, 102, 103, 104])
+        self.assertEqual(out[102]["titleZh"], "fallback title 102")
+
     def test_codex_digest_uses_codex_first_then_falls_back(self):
         class FakeCodex:
             model = "codex-test"

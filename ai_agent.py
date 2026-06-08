@@ -2231,10 +2231,18 @@ class CodexFirstAiAgent(AiAgent):
         return int(getattr(self.fallback_agent, "config_count", 0) or 0)
 
     def recommended_enrich_batch_size(self, requested: int) -> int:
+        return max(1, int(requested))
+
+    def _fallback_enrich_batch_size(self, requested: int) -> int:
+        requested_n = max(1, int(requested))
         fn = getattr(self.fallback_agent, "recommended_enrich_batch_size", None)
         if callable(fn):
-            return int(fn(requested))
-        return max(1, int(requested))
+            try:
+                return max(1, min(requested_n, int(fn(requested_n))))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("fallback AI batch size recommendation failed: %s", exc)
+                return 1
+        return requested_n
 
     def _topic_catalog_json(
         self,
@@ -2297,6 +2305,32 @@ class CodexFirstAiAgent(AiAgent):
         )
         method = getattr(self.fallback_agent, method_name)
         return method(*args, **kwargs)
+
+    def _fallback_process_stories_batch(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        topic_catalog: Sequence[TopicEntry] | None,
+        *,
+        error: Exception,
+    ) -> Dict[int, Optional[Dict[str, Any]]]:
+        item_list = list(items)
+        fallback_batch_size = self._fallback_enrich_batch_size(len(item_list))
+        log.warning(
+            "Codex CLI process_stories_batch failed; falling back to existing AI agent "
+            "in batches of %d: %s: %s",
+            fallback_batch_size,
+            type(error).__name__,
+            str(error),
+        )
+        method = getattr(self.fallback_agent, "process_stories_batch")
+        if fallback_batch_size >= len(item_list):
+            return method(item_list, topic_catalog)
+
+        merged: Dict[int, Optional[Dict[str, Any]]] = {}
+        for start in range(0, len(item_list), fallback_batch_size):
+            chunk = item_list[start : start + fallback_batch_size]
+            merged.update(method(chunk, topic_catalog))
+        return merged
 
     def _single_system_prompt(
         self,
@@ -2382,15 +2416,20 @@ class CodexFirstAiAgent(AiAgent):
                 output_schema=_BATCH_ENRICH_OUTPUT_SCHEMA,
                 reasoning_effort=_CODEX_INGEST_REASONING_EFFORT,
             )
-            return validate_batch_ai_output(
+            validated = validate_batch_ai_output(
                 raw,
                 story_rows=[item["story"] for item in items],
                 existing_topics=topic_catalog,
                 strict_topic=True,
             )
+            expected_ids = {int(item["story"]["id"]) for item in items}
+            missing_ids = expected_ids.difference(validated.keys())
+            if missing_ids:
+                missing_text = ",".join(str(sid) for sid in sorted(missing_ids))
+                raise ValueError(f"Codex batch enrich omitted story ids: {missing_text}")
+            return validated
         except (CodexCliError, subprocess.SubprocessError, OSError, ValueError) as exc:
-            return self._fallback(
-                "process_stories_batch",
+            return self._fallback_process_stories_batch(
                 items,
                 topic_catalog,
                 error=exc,
